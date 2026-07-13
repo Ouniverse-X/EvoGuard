@@ -2,7 +2,7 @@
 
 EvoGuard is a research prototype for self-evolving adversarial risk-aware reinforcement learning in tool-calling agents.
 
-The initial implementation focuses on a controlled text tool-calling environment before expanding to embodied settings such as AI2-THOR and ManiSkill.
+The implementation focuses on controlled text tool-calling safety and step-level tool-use datasets such as ToolSafe/TS-Bench.
 
 ## Current Scope
 

@@ -98,16 +98,17 @@ Baselines:
 Deliverable:
 Comparable baseline results.
 
-## Phase 6: Embodied Environments
+## Phase 6: Step-Level Tool Safety Datasets
 
 Status: Not Started
 
-Environments:
-- [ ] AI2-THOR.
-- [ ] ManiSkill.
+Tasks:
+- [ ] ToolSafe/TS-Bench integration.
+- [ ] TraceSafe integration.
+- [ ] Cross-dataset generalization evaluation.
 
 Deliverable:
-Embodied tool/action safety evaluation.
+Step-level tool-call safety evaluation.
 
 ## Phase 7: Experiments and Paper
 

@@ -20,7 +20,7 @@ What do we expect?
 
 ### Environment
 
-Text-tool / AI2-THOR / ManiSkill
+Text-tool / ToolSafe / TraceSafe
 
 ### Model
 
@@ -263,3 +263,73 @@ Increase the benchmark signal beyond the initial toy setting while preserving ex
 ### Verification
 
 The environment test checks that the task set has at least 12 tasks, includes CRM and ticket tools, covers at least six risk types, and all preferred tool calls execute inside the simulator.
+
+## E005: ToolSafe SFT vs Qwen3Guard Baseline
+
+### Date
+
+2026-07-13
+
+### Goal
+
+Compare the ToolSafe-trained EvoGuard SFT adapter against the public Qwen3Guard-Gen-8B baseline on the same ToolSafe held-out rollouts.
+
+### Environment
+
+ToolSafe AgentHarm trajectory adapter.
+
+Held-out file:
+
+```bash
+data/eval/toolsafe_heldout_tri_rollouts.jsonl
+```
+
+### Models
+
+- ToolSafe SFT adapter: `outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft`
+- Qwen3Guard baseline: `Qwen/Qwen3Guard-Gen-8B`
+
+Qwen3Guard uses its native generated label format, parsed as:
+
+- `Safety: Safe` -> `execute`
+- `Safety: Controversial` -> `ask_confirmation`
+- `Safety: Unsafe` -> `refuse`
+
+### Commands
+
+```bash
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=3 \
+python scripts/evaluate_llm_safety.py \
+  --model /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct \
+  --lora outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft \
+  --rollouts-jsonl data/eval/toolsafe_heldout_tri_rollouts.jsonl \
+  --output outputs/logs/eval_sft_toolsafe.json
+```
+
+```bash
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://huggingface.co \
+python scripts/evaluate_llm_safety.py \
+  --model Qwen/Qwen3Guard-Gen-8B \
+  --lora "" \
+  --parser qwen3guard \
+  --rollouts-jsonl data/eval/toolsafe_heldout_tri_rollouts.jsonl \
+  --output outputs/logs/baseline_qwen3guard.json \
+  --max-new-tokens 128 \
+  --min-valid-json-rate 0.0
+```
+
+### Results
+
+| Model | Parse/valid rate | Attack interception | Over-refusal | Task success | FNR | FPR | Attack success |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe SFT adapter | 100.00% | 100.00% | 0.00% | 100.00% | 0.00% | 0.00% | 0.00% |
+| Qwen3Guard-Gen-8B | 100.00% | 100.00% | 12.20% | 96.58% | 0.00% | 12.20% | 0.00% |
+
+### Observations
+
+Both models intercepted all harmful ToolSafe held-out attacked-tool trajectories. The main gap is usability on benign clean-tool trajectories: Qwen3Guard-Gen-8B over-refused 12.20% of benign tool calls, while the ToolSafe SFT adapter had 0.00% over-refusal under the EvoGuard action mapping.
+
+### Artifacts
+
+- `outputs/logs/eval_sft_toolsafe.json`
+- `outputs/logs/baseline_qwen3guard.json`

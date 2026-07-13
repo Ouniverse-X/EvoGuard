@@ -1,0 +1,18 @@
+model:
+  model_name_or_path: /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct
+  sft_adapter_path: outputs/checkpoints/llm_safety_lora_qwen15b_smoke
+data:
+  rollout_jsonl: data/rollouts/train_tri_rollouts_round0.jsonl
+output:
+  output_dir: outputs/checkpoints/llm_safety_lora_qwen15b_rl
+training:
+  max_prompt_length: 768
+  max_new_tokens: 64
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.00005
+  num_train_epochs: 0.03
+  temperature: 0.7
+  bf16: true
+script:
+  command: SFT_ADAPTER=outputs/checkpoints/llm_safety_lora_qwen15b_smoke GPU_ID=3 scripts/training/run_server_qwen15b_rl.sh

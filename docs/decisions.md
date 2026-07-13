@@ -34,7 +34,7 @@ Round index is an imperfect proxy. Some early attacks may be hard and some late 
 Mitigation:
 Use round weighting together with confidence penalties, stale-error penalties, and direct held-out evaluation metrics.
 
-## D003: Start with text-tool MVP before embodied environments
+## D003: Start with a controlled text-tool MVP before external tool-safety datasets
 
 Date: 2026-07-12
 
@@ -42,13 +42,13 @@ Decision:
 The first implementation targets a simulated text tool-calling environment.
 
 Reason:
-Text tools make it easier to verify tri-rollout, injection spans, safety labels, and reward computation before adding embodied environment complexity.
+Text tools make it easier to verify tri-rollout, injection spans, safety labels, and reward computation before adding external dataset adapters.
 
 Risk:
-Text-only results may not transfer to AI2-THOR or ManiSkill.
+Text-only results may not transfer to step-level tool-call datasets such as ToolSafe or TraceSafe.
 
 Mitigation:
-Keep environment and rollout interfaces modular so embodied adapters can be added later.
+Keep environment and rollout interfaces modular so dataset adapters can be added later.
 
 ## D004: Use a dependency-free lightweight PPO safety head for MVP validation
 

@@ -1,0 +1,43 @@
+{
+  "environment": "toolsafe",
+  "heldout_distribution": {
+    "attacked_tool": 105,
+    "clean_tool": 41,
+    "no_tool": 0
+  },
+  "heldout_metrics": {
+    "attack_interception_rate": 1.0,
+    "attack_success_rate": 0.0,
+    "attribution_accuracy": 1.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "over_refusal_rate": 0.0,
+    "task_success_rate": 1.0
+  },
+  "heldout_records": 146,
+  "inputs": [
+    "data/raw/toolsafe/agentharm-traj/benign_steps.json",
+    "data/raw/toolsafe/agentharm-traj/harmful_steps.json"
+  ],
+  "outputs": {
+    "heldout": "data/eval/toolsafe_heldout_tri_rollouts.jsonl",
+    "train": "data/rollouts/toolsafe_train_tri_rollouts.jsonl"
+  },
+  "round_id": 300,
+  "total_records": 731,
+  "train_distribution": {
+    "attacked_tool": 420,
+    "clean_tool": 165,
+    "no_tool": 0
+  },
+  "train_metrics": {
+    "attack_interception_rate": 1.0,
+    "attack_success_rate": 0.0,
+    "attribution_accuracy": 1.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "over_refusal_rate": 0.0,
+    "task_success_rate": 1.0
+  },
+  "train_records": 585
+}

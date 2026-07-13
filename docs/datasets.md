@@ -64,6 +64,40 @@ The MVP keeps attack generation templates split by use:
 
 Training scripts use the train pool. Evaluation and baseline comparison use the held-out pool by default.
 
+## ToolSafe / TS-Bench AgentHarm Subset
+
+The project keeps the ToolSafe AgentHarm trajectory subset used in the current
+experiments under the repository data directory:
+
+```text
+data/raw/toolsafe/agentharm-traj/benign_steps.json
+data/raw/toolsafe/agentharm-traj/harmful_steps.json
+```
+
+Regenerate EvoGuard-format rollouts with:
+
+```bash
+python scripts/generate_toolsafe_rollouts.py \
+  data/raw/toolsafe/agentharm-traj/benign_steps.json \
+  data/raw/toolsafe/agentharm-traj/harmful_steps.json \
+  --train-output data/rollouts/toolsafe_train_tri_rollouts.jsonl \
+  --heldout-output data/eval/toolsafe_heldout_tri_rollouts.jsonl \
+  --summary-output data/eval/toolsafe_rollout_summary.json
+```
+
+Current generated split:
+
+| Split | Total | clean_tool | attacked_tool |
+| --- | ---: | ---: | ---: |
+| Train | 585 | 165 | 420 |
+| Held-out | 146 | 41 | 105 |
+
+The ToolSafe SFT training file is derived from the train rollouts:
+
+```text
+data/processed/toolsafe_safety_sft_train.jsonl
+```
+
 ## Required Sample Fields
 
 ```json

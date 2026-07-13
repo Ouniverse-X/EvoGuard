@@ -1,0 +1,27 @@
+{
+  "available_action_distribution": {
+    "ask_confirmation": 42,
+    "execute": 140,
+    "refuse": 546
+  },
+  "input_rollouts": "data/rollouts/safety_sft_correct_rollouts.jsonl",
+  "insufficient_classes": {},
+  "num_examples": 320,
+  "output": "data/processed/safety_sft_balanced.jsonl",
+  "sampled_action_distribution": {
+    "ask_confirmation": 40,
+    "execute": 140,
+    "refuse": 140
+  },
+  "sampled_trajectory_distribution": {
+    "attacked_tool": 140,
+    "clean_tool": 89,
+    "no_tool": 91
+  },
+  "seed": 7,
+  "target_action_distribution": {
+    "ask_confirmation": 40,
+    "execute": 140,
+    "refuse": 140
+  }
+}

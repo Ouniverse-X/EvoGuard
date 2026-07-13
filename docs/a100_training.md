@@ -106,3 +106,52 @@ GRAD_ACCUM=8 \
 OUTPUT_DIR=outputs/checkpoints/llm_safety_lora_qwen15b_full \
 scripts/training/run_server_qwen15b_lora.sh
 ```
+
+## 5. Reward-Based RL Stage
+
+After SFT warm start, run the reward-based LoRA stage over tri-trajectory rollout
+records. This stage reads:
+
+```text
+data/rollouts/train_tri_rollouts_round0.jsonl
+```
+
+It samples safety JSON decisions from the model, converts them back into
+`TrajectoryRecord` decisions, computes the EvoGuard reward, and applies an
+advantage-weighted policy-gradient update to the LoRA adapter.
+
+Smoke run:
+
+```bash
+GPU_ID=3 \
+EPOCHS=0.03 \
+BATCH=1 \
+GRAD_ACCUM=1 \
+ADV_BASELINE=zero \
+SFT_ADAPTER=outputs/checkpoints/llm_safety_lora_qwen15b_smoke \
+OUTPUT_DIR=outputs/checkpoints/llm_safety_lora_qwen15b_rl_smoke \
+scripts/training/run_server_qwen15b_rl.sh
+```
+
+Longer run:
+
+```bash
+GPU_ID=3 \
+EPOCHS=3 \
+BATCH=2 \
+GRAD_ACCUM=8 \
+ADV_BASELINE=zero \
+SFT_ADAPTER=outputs/checkpoints/llm_safety_lora_qwen15b_full \
+OUTPUT_DIR=outputs/checkpoints/llm_safety_lora_qwen15b_rl_full \
+scripts/training/run_server_qwen15b_rl.sh
+```
+
+RL metrics are written to:
+
+```text
+outputs/checkpoints/llm_safety_lora_qwen15b_rl_full/rl_metrics.json
+```
+
+Current limitation: the smoke adapter may still emit schema-invalid JSON, such
+as boolean `action` values. Use a stronger SFT warm start or longer SFT run
+before expecting stable RL behavior.

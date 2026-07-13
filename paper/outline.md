@@ -19,7 +19,7 @@ Contributions:
 - Dynamic prompt-driven attack generation loop.
 - Tri-trajectory tool safety rollout.
 - Risk-aware reward with confidence, round, stale-error, and attribution terms.
-- Controlled text-tool benchmark and planned embodied extension.
+- Controlled text-tool benchmark with step-level tool-call safety dataset evaluation.
 
 ## Method
 

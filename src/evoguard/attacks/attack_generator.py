@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from evoguard.attacks.prompt_templates import HELDOUT_ATTACK_TEMPLATES, TRAIN_ATTACK_TEMPLATES
+from evoguard.attacks.prompt_templates import (
+    HARD_HELDOUT_ATTACK_TEMPLATES,
+    HELDOUT_ATTACK_TEMPLATES,
+    TRAIN_ATTACK_TEMPLATES,
+)
 from evoguard.types import AttackSample, SafetyAction, Task, TrajectoryRecord
 
 
@@ -73,4 +77,6 @@ def _templates_for_split(split: str) -> dict[str, str]:
         return TRAIN_ATTACK_TEMPLATES
     if split in {"eval", "heldout", "test"}:
         return HELDOUT_ATTACK_TEMPLATES
+    if split in {"hard_heldout", "hard_eval", "hard_test"}:
+        return HARD_HELDOUT_ATTACK_TEMPLATES
     raise ValueError(f"Unknown attack split: {split}")

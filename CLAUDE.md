@@ -104,5 +104,5 @@ Phase 2: Implement attack generator and tri-rollout.
 Phase 3: Implement reward functions.
 Phase 4: Implement PPO/GRPO training loop.
 Phase 5: Add static baselines.
-Phase 6: Add AI2-THOR and ManiSkill environments.
+Phase 6: Add step-level tool-call safety datasets and stronger baselines.
 Phase 7: Run ablations and write paper.

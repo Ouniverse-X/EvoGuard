@@ -5,7 +5,7 @@
 - Prompt-driven attack quality depends on the generator model or templates.
 - Attack round is only a proxy for attack difficulty.
 - Safety can be improved by over-refusing if rewards and metrics are poorly designed.
-- Text-tool results may not transfer directly to embodied environments.
+- Results from one tool-call safety dataset may not transfer directly to other agent/tool distributions.
 
 ## Safety Constraints
 
@@ -17,5 +17,5 @@
 
 - Always report task success, attack interception, and over-refusal together.
 - Keep train and eval attack pools separated.
-- Use held-out attack styles and cross-environment evaluation when possible.
+- Use held-out attack styles and cross-dataset evaluation when possible.
 - Record major design choices in `docs/decisions.md`.

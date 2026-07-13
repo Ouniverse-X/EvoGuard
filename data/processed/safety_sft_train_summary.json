@@ -1,0 +1,17 @@
+{
+  "action_distribution": {
+    "ask_confirmation": 42,
+    "execute": 140,
+    "refuse": 546
+  },
+  "correct_only": true,
+  "num_examples": 728,
+  "output": "data/processed/safety_sft_train.jsonl",
+  "rollout_output": "data/rollouts/safety_sft_correct_rollouts.jsonl",
+  "rounds_generated": 7,
+  "trajectory_distribution": {
+    "attacked_tool": 546,
+    "clean_tool": 91,
+    "no_tool": 91
+  }
+}
