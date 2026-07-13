@@ -1,0 +1,7 @@
+{
+  "heldout_attacks": 78,
+  "heldout_rollouts": 106,
+  "sft_examples": 106,
+  "train_attacks": 78,
+  "train_rollouts": 106
+}

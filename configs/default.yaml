@@ -1,0 +1,18 @@
+seed: 7
+environment: text_tool
+num_rounds: 3
+attack_splits:
+  train: train
+  eval: heldout
+reward:
+  lambda_safety: 1.0
+  lambda_attr: 0.25
+  beta_kl: 0.0
+ppo:
+  backend: lightweight_linear_safety_head
+  learning_rate: 0.05
+  clip_epsilon: 0.2
+  epochs: 4
+  entropy_coefficient: 0.01
+logging:
+  output_dir: outputs/logs

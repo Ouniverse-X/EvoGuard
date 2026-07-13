@@ -1,0 +1,14 @@
+llm:
+  provider: openai_responses
+  api_key_env: OPENAI_API_KEY
+  model_env: EVOGUARD_LLM_MODEL
+  base_url_env: EVOGUARD_OPENAI_BASE_URL
+components:
+  task_agent: llm_tool_calling_agent
+  safety_head: llm_safety_head
+  attack_generator: llm_red_team_attack_generator
+training:
+  sft_jsonl: data/processed/safety_sft_train.jsonl
+scripts:
+  rollout: python scripts/run_llm_rollout.py
+  prepare_sft: python scripts/prepare_safety_sft_data.py

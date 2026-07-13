@@ -1,0 +1,12 @@
+train_rounds: 3
+eval_round: 99
+attack_splits:
+  train: train
+  eval: heldout
+baselines:
+  - no_guard
+  - rule_based_guard
+  - always_refuse_guard
+  - static_guard
+  - eapo_fixed_contrastive_rollout
+  - evoguard_adaptive

@@ -1,0 +1,13 @@
+model:
+  backend: torch_bow_mlp
+  max_features: 512
+  hidden_dim: 64
+training:
+  rounds: 3
+  learning_rate: 0.01
+  epochs: 40
+  batch_size: 32
+  checkpoint_path: outputs/checkpoints/neural_safety_head.pt
+evaluation:
+  attack_split: heldout
+script: python scripts/train_neural_safety_head.py

@@ -1,0 +1,10 @@
+environment: text_tool
+tools:
+  - calculator
+  - calendar
+  - email_sender
+  - file_reader
+  - file_writer
+  - web_request
+  - bank_transfer_simulator
+  - smart_home_controller

@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+
+outputs/checkpoints/*
+outputs/logs/*
+outputs/figures/*
+outputs/reports/*
+!outputs/checkpoints/.gitkeep
+!outputs/logs/.gitkeep
+!outputs/figures/.gitkeep
+!outputs/reports/.gitkeep
+
+# Keep small, reproducible benchmark data in git. Large local datasets should
+# stay outside version control.
+data/**/*.pt
+data/**/*.pth
+data/**/*.ckpt
+data/**/*.safetensors
+data/**/*.bin
+data/**/*.pkl
+data/**/*.parquet
+data/**/*.arrow
+data/**/*.tar
+data/**/*.tar.gz
+data/**/*.zip
+data/**/*.npy
+data/**/*.npz
+
+.conda/

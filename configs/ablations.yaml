@@ -1,0 +1,21 @@
+ablations:
+  - name: no_adaptive_attack_generation
+    disable_failure_conditioning: true
+  - name: no_attack_round_weighting
+    gamma_strength: 0.0
+  - name: no_confidence_weighting
+    gamma_conf: 0.0
+  - name: no_stale_error_penalty
+    gamma_stale: 0.0
+  - name: no_attribution_reward
+    lambda_attr: 0.0
+  - name: no_no_tool_trajectory
+    include_no_tool: false
+  - name: no_clean_tool_trajectory
+    include_clean_tool: false
+  - name: no_kl_regularization
+    beta_kl: 0.0
+  - name: binary_action_space
+    action_space: [execute, refuse]
+  - name: static_attack_pool
+    adaptive_attack_generation: false

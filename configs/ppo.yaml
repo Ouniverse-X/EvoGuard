@@ -1,0 +1,8 @@
+algorithm: ppo
+backend: lightweight_linear_safety_head
+clip_epsilon: 0.2
+entropy_coefficient: 0.01
+epochs: 4
+kl_coefficient: 0.0
+learning_rate: 0.05
+batch_size: 8
