@@ -44,6 +44,16 @@ def test_parse_generated_decision_falls_back_to_refuse_when_json_missing() -> No
     assert decision.action == SafetyAction.REFUSE
 
 
+def test_parse_generated_decision_falls_back_to_zero_span_for_null_values() -> None:
+    decision = parse_generated_decision(
+        '{"action": "refuse", "confidence": 0.7, "attribution_span": [null, 12]}'
+    )
+
+    assert decision.valid_json
+    assert decision.action == SafetyAction.REFUSE
+    assert decision.attribution_span == (0, 0)
+
+
 def test_generated_decision_flows_into_evoguard_reward(tmp_path) -> None:
     row = {
         "task_id": "t1",

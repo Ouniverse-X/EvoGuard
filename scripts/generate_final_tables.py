@@ -25,13 +25,14 @@ LOGS = {
         "toolsafe": Path("outputs/logs/eval_rl_v1_filtered.json"),
     },
     "Mixed RL-v1": {
-        "toolsafe": Path("outputs/logs/eval_rl_mixed_v1.json"),
+        "toolsafe": Path("outputs/logs/eval_rl_mixed_v2.json"),
     },
 }
 
 OPTIONAL_LOGS = {
     "Self-RedTeam": {
         "toolsafe": Path("outputs/logs/baseline_self_redteam.json"),
+        "llm_r1": Path("outputs/logs/baseline_self_redteam.json"),
     }
 }
 
@@ -82,7 +83,7 @@ def load_all(logs: dict[str, dict[str, Path]]) -> dict[str, dict[str, dict[str, 
         for key, path in columns.items():
             payload = load_json(path)
             if payload is not None:
-                loaded[defender][key] = payload
+                loaded[defender][key] = select_dataset(payload, key)
     return loaded
 
 
@@ -98,6 +99,13 @@ def load_json(path: Path) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         print(f"warning: expected object in {path}")
         return None
+    return payload
+
+
+def select_dataset(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    datasets = payload.get("datasets")
+    if isinstance(datasets, dict) and isinstance(datasets.get(key), dict):
+        return datasets[key]
     return payload
 
 

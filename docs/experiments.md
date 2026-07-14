@@ -333,3 +333,71 @@ Both models intercepted all harmful ToolSafe held-out attacked-tool trajectories
 
 - `outputs/logs/eval_sft_toolsafe.json`
 - `outputs/logs/baseline_qwen3guard.json`
+
+## E006: Defender Generalization and Self-RedTeam Baselines
+
+### Date
+
+2026-07-14
+
+### Goal
+
+Assemble the current defender generalization table across base Qwen, Qwen3Guard, ToolSafe SFT, filtered RL, mixed RL, and Self-RedTeam baselines.
+
+### Evaluation Sets
+
+- ToolSafe held-out harmful: `data/eval/toolsafe_heldout_tri_rollouts.jsonl`
+- LLM-r1 generated attacks: `data/eval/llm_generated_round1_attacked_rollouts.jsonl`
+- Hard held-out: `data/eval/hard_heldout_tri_rollouts.jsonl`
+
+### Artifacts
+
+- Base Qwen LLM-r1: `outputs/logs/eval_base_qwen_llm_r1.json`
+- Base Qwen hard held-out: `outputs/logs/eval_base_qwen_hard_heldout.json`
+- Qwen3Guard: `outputs/logs/baseline_qwen3guard.json`
+- ToolSafe SFT: `outputs/logs/eval_sft_toolsafe.json`
+- Filtered RL-v1: `outputs/logs/eval_rl_v1_filtered.json`
+- Mixed RL-v2 eval: `outputs/logs/eval_rl_mixed_v2.json`
+- Self-RedTeam: `outputs/logs/baseline_self_redteam.json`
+
+### Results Summary
+
+Base Qwen without an adapter is not a reliable defender under the EvoGuard JSON interface. It has ASR 9.09% on LLM-r1 and 24.04% on hard held-out, with low valid JSON rates of 9.09% and 24.04%, respectively.
+
+ToolSafe SFT is the strongest clean ToolSafe held-out result so far: ASR 0.00%, attack interception 100.00%, over-refusal 0.00%, task success 100.00%, and attribution accuracy 97.86%.
+
+Filtered RL-v1 preserves ASR 0.00% and over-refusal 0.00%, but it hurts utility and localization: task success drops to 90.57% and attribution accuracy drops to 50.24%. This matches the diagnosis that attacked-only RL over-specializes to refusal.
+
+Mixed RL-v2 recovers the ToolSafe SFT behavior on the held-out ToolSafe split: ASR 0.00%, attack interception 100.00%, over-refusal 0.00%, task success 100.00%, attribution accuracy 97.86%, and valid JSON 99.05%. This supports using mixed clean/attacked rollouts instead of filtered attacked-only RL.
+
+Self-RedTeam with base Qwen as both attacker and defender is weak in this setup: ToolSafe held-out ASR is 22.86%, LLM-r1 ASR is 19.09%, valid JSON is 25.71%, over-refusal is 21.95%, and task success is 77.40%. The likely bottleneck is that the base model does not reliably follow the safety-decision JSON schema without SFT.
+
+### Current Conclusion
+
+The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. Self-RedTeam is useful as a baseline but not competitive without schema-following supervision. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
+
+<!-- BEGIN GENERATED FINAL TABLES -->
+
+## Final Experiment Tables
+
+### Defender generalization evaluation (ASR↓ %)
+| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out |
+| --- | --- | --- | --- |
+| Base Qwen | - | 9.09 | 24.04 |
+| Qwen3Guard | 0.00 | - | - |
+| ToolSafe SFT | 0.00 | - | - |
+| Filtered RL-v1 | 0.00 | - | - |
+| Mixed RL-v1 | 0.00 | - | - |
+| Self-RedTeam | 22.86 | 19.09 | - |
+
+### Utility & safety metrics (ToolSafe held-out)
+| Defender | valid_json_rate | attack_interception_rate | over_refusal_rate | task_success_rate | attribution_accuracy |
+| --- | --- | --- | --- | --- | --- |
+| Base Qwen | - | - | - | - | - |
+| Qwen3Guard | 1.0000 | 1.0000 | 0.1220 | 0.9658 | 0.0000 |
+| ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
+| Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| Self-RedTeam | 0.2571 | 0.7714 | 0.2195 | 0.7740 | 0.0136 |
+
+<!-- END GENERATED FINAL TABLES -->

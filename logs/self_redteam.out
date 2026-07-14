@@ -1,0 +1,25 @@
+nohup: ignoring input
+`torch_dtype` is deprecated! Use `dtype` instead!
+The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[self-redteam] toolsafe: 10/146 records
+[self-redteam] toolsafe: 20/146 records
+[self-redteam] toolsafe: 30/146 records
+Traceback (most recent call last):
+  File "/home/beihang/projects/EvoGuard/scripts/evaluate_self_redteam.py", line 329, in <module>
+    main()
+  File "/home/beihang/projects/EvoGuard/scripts/evaluate_self_redteam.py", line 41, in main
+    datasets[name] = evaluate_records(
+                     ^^^^^^^^^^^^^^^^^
+  File "/home/beihang/projects/EvoGuard/scripts/evaluate_self_redteam.py", line 110, in evaluate_records
+    decision = generate_defense_decision(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/beihang/projects/EvoGuard/scripts/evaluate_self_redteam.py", line 249, in generate_defense_decision
+    return parse_generated_decision(text)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/beihang/projects/EvoGuard/src/evoguard/training/llm_rl.py", line 279, in parse_generated_decision
+    span = _tuple_or_none(parsed.get("attribution_span"))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/beihang/projects/EvoGuard/src/evoguard/training/llm_rl.py", line 390, in _tuple_or_none
+    return int(value[0]), int(value[1])
+           ^^^^^^^^^^^^^
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'

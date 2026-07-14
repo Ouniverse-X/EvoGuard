@@ -276,7 +276,7 @@ def parse_generated_decision(text: str) -> GeneratedDecision:
         return GeneratedDecision(SafetyAction.REFUSE, 0.0, None, text, valid_json=False)
     action, valid = _parse_safety_action(parsed.get("action"))
     confidence = _clamp_float(parsed.get("confidence", 0.5), 0.0, 1.0)
-    span = _tuple_or_none(parsed.get("attribution_span"))
+    span = _tuple_or_none(parsed.get("attribution_span")) or (0, 0)
     return GeneratedDecision(action, confidence, span, text, valid_json=valid)
 
 
@@ -385,8 +385,12 @@ def _tuple_or_none(value: Any) -> tuple[int, int] | None:
     if value is None:
         return None
     if isinstance(value, tuple) and len(value) == 2:
+        if value[0] is None or value[1] is None:
+            return None
         return int(value[0]), int(value[1])
     if isinstance(value, list) and len(value) == 2:
+        if value[0] is None or value[1] is None:
+            return None
         return int(value[0]), int(value[1])
     return None
 
