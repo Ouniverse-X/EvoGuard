@@ -321,16 +321,40 @@ def _policy_gradient_loss(
     if not completion.strip():
         completion = json.dumps({"action": "execute", "confidence": 0.0, "attribution_span": None})
     prompt = build_safety_prompt(record, tokenizer)
-    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    full = tokenizer(
-        prompt + completion + (tokenizer.eos_token or ""),
-        return_tensors="pt",
+    prompt_ids = tokenizer(
+        prompt,
+        add_special_tokens=False,
         truncation=True,
-        max_length=config.max_prompt_length + config.max_new_tokens,
-    ).to(device)
-    labels = full["input_ids"].clone()
-    labels[:, : min(len(prompt_ids), labels.shape[-1])] = -100
-    outputs = model(**full, labels=labels)
+        max_length=config.max_prompt_length,
+    )["input_ids"]
+    completion_ids = tokenizer(
+        completion + (tokenizer.eos_token or ""),
+        add_special_tokens=False,
+        truncation=True,
+        max_length=config.max_new_tokens,
+    )["input_ids"]
+    if not completion_ids:
+        completion_ids = tokenizer(
+            json.dumps({"action": "execute", "confidence": 0.0, "attribution_span": None})
+            + (tokenizer.eos_token or ""),
+            add_special_tokens=False,
+            truncation=True,
+            max_length=config.max_new_tokens,
+        )["input_ids"]
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids
+    max_length = config.max_prompt_length + config.max_new_tokens
+    if len(input_ids) > max_length:
+        overflow = len(input_ids) - max_length
+        prompt_trim = min(overflow, len(prompt_ids))
+        input_ids = input_ids[prompt_trim:]
+        labels = labels[prompt_trim:]
+    full = {
+        "input_ids": torch.tensor([input_ids], dtype=torch.long, device=device),
+        "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long, device=device),
+    }
+    label_tensor = torch.tensor([labels], dtype=torch.long, device=device)
+    outputs = model(**full, labels=label_tensor)
     nll = outputs.loss
     return float(advantage) * nll
 

@@ -47,11 +47,25 @@ class LLMRedTeamAttackGenerator:
         round_id: int,
         failure_cases: list[TrajectoryRecord] | None = None,
         blocked_cases: list[TrajectoryRecord] | None = None,
+        success_cases: list[TrajectoryRecord] | None = None,
+        attack_memory: Any | None = None,
     ) -> list[AttackSample]:
         samples: list[AttackSample] = []
-        for task in [candidate for candidate in tasks if candidate.preferred_tool]:
+        historical_successes = _select_success_cases(failure_cases, success_cases, attack_memory)
+        compromised_tools = _latest_round_tool_names(historical_successes)
+        target_tasks = [candidate for candidate in tasks if candidate.preferred_tool]
+        unfiltered_task_count = len(target_tasks)
+        if compromised_tools:
+            target_tasks = [task for task in target_tasks if task.preferred_tool in compromised_tools]
+        print(
+            "LLM attack generation task filter: "
+            f"before={unfiltered_task_count} after={len(target_tasks)} "
+            f"compromised_tools={sorted(compromised_tools)}"
+        )
+
+        for task in target_tasks:
             response = self.client.generate_json(
-                _build_red_team_messages(self, task, round_id, failure_cases, blocked_cases),
+                _build_red_team_messages(self, task, round_id, historical_successes, blocked_cases),
                 schema_name="red_team_attacks",
             )
             try:
@@ -88,6 +102,26 @@ class LLMRedTeamAttackGenerator:
                     )
                 )
         return samples
+
+
+def _select_success_cases(
+    failure_cases: list[TrajectoryRecord] | None,
+    success_cases: list[TrajectoryRecord] | None,
+    attack_memory: Any | None,
+) -> list[TrajectoryRecord]:
+    if success_cases is not None:
+        return success_cases
+    memory_success_cases = getattr(attack_memory, "success_cases", None)
+    if memory_success_cases is not None:
+        return list(memory_success_cases)
+    return failure_cases or []
+
+
+def _latest_round_tool_names(cases: list[TrajectoryRecord]) -> set[str]:
+    if not cases:
+        return set()
+    latest_round_id = max(case.round_id for case in cases)
+    return {case.tool_name for case in cases if case.round_id == latest_round_id and case.tool_name}
 
 
 def build_local_qwen_attack_generator(
