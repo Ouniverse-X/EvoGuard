@@ -61,23 +61,20 @@ def main() -> None:
         print(f"[coevo-llm] round={round_id} loading defender adapter={current_adapter}", flush=True)
         model, tokenizer, torch = load_defender(args.model, current_adapter)
         try:
-            candidate_attacks = attack_generator.generate(
-                tasks,
-                round_id=round_id,
-                attack_memory=memory,
+            candidate_attacks, attacked_records, successful_records, blocked_records, escalation_attempts = (
+                generate_and_evaluate_redteam(
+                    attack_generator=attack_generator,
+                    model=model,
+                    tokenizer=tokenizer,
+                    tasks=tasks,
+                    env=env,
+                    memory=memory,
+                    round_id=round_id,
+                    max_prompt_length=args.max_prompt_length,
+                    max_new_tokens=args.max_new_tokens,
+                    redteam_escalation_rounds=args.redteam_escalation_rounds,
+                )
             )
-            attacked_records = evaluate_attacks(
-                model,
-                tokenizer,
-                candidate_attacks,
-                env,
-                max_prompt_length=args.max_prompt_length,
-                max_new_tokens=args.max_new_tokens,
-            )
-            successful_records = extract_failures(attacked_records)
-            blocked_records = [record for record in attacked_records if record not in successful_records]
-            memory.add_success_cases(round_id, successful_records)
-            memory.add_blocked_cases(round_id, blocked_records)
             successful_ids = {
                 str(record.metadata.get("attack_id"))
                 for record in successful_records
@@ -118,8 +115,10 @@ def main() -> None:
             mean_reward = sum(item["total"] for item in reward_batch) / max(1, len(reward_batch))
 
             rollout_path = rollout_dir / f"round_{round_id}_train_rollouts.jsonl"
+            candidate_attacks_path = rollout_dir / f"round_{round_id}_candidate_attacks.jsonl"
             attacks_path = rollout_dir / f"round_{round_id}_successful_attacks.jsonl"
             write_jsonl(rollout_path, [record.to_dict() for record in train_records])
+            write_jsonl(candidate_attacks_path, [attack_to_dict(attack) for attack in candidate_attacks])
             write_jsonl(attacks_path, [attack_to_dict(attack) for attack in successful_attacks])
         finally:
             del model
@@ -177,6 +176,7 @@ def main() -> None:
             "input_adapter": rl_config.sft_adapter_path,
             "output_adapter": current_adapter,
             "candidate_attacks": len(candidate_attacks),
+            "redteam_escalation_attempts": escalation_attempts,
             "successful_attacks": len(successful_records),
             "blocked_attacks": len(blocked_records),
             "attack_success_rate": len(successful_records) / max(1, len(attacked_records)),
@@ -187,6 +187,7 @@ def main() -> None:
             "heldout_metrics": heldout_metrics,
             "artifacts": {
                 "train_rollouts": str(rollout_path),
+                "candidate_attacks": str(candidate_attacks_path),
                 "successful_attacks": str(attacks_path),
             },
         }
@@ -212,6 +213,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int, default=0)
     parser.add_argument("--attack-max-tokens", type=int, default=1400)
     parser.add_argument("--attack-temperature", type=float, default=0.8)
+    parser.add_argument(
+        "--redteam-escalation-rounds",
+        type=int,
+        default=2,
+        help="Extra same-round API attack generations to try when all candidates are blocked.",
+    )
     parser.add_argument("--max-prompt-length", type=int, default=LoraRLConfig.max_prompt_length)
     parser.add_argument("--max-new-tokens", type=int, default=LoraRLConfig.max_new_tokens)
     parser.add_argument("--per-device-train-batch-size", type=int, default=LoraRLConfig.per_device_train_batch_size)
@@ -226,6 +233,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-r", type=int, default=LoraRLConfig.lora_r)
     parser.add_argument("--lora-alpha", type=int, default=LoraRLConfig.lora_alpha)
     return parser.parse_args()
+
+
+def generate_and_evaluate_redteam(
+    *,
+    attack_generator: Any,
+    model: Any,
+    tokenizer: Any,
+    tasks: list[Task],
+    env: TextToolEnv,
+    memory: AttackMemory,
+    round_id: int,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    redteam_escalation_rounds: int,
+) -> tuple[list[AttackSample], list[TrajectoryRecord], list[TrajectoryRecord], list[TrajectoryRecord], int]:
+    all_attacks: list[AttackSample] = []
+    all_records: list[TrajectoryRecord] = []
+    all_successful: list[TrajectoryRecord] = []
+    all_blocked: list[TrajectoryRecord] = []
+    escalation_attempts = 0
+    max_attempts = max(1, 1 + redteam_escalation_rounds)
+
+    for attempt in range(max_attempts):
+        generation_round_id = round_id if attempt == 0 else round_id * 100 + attempt
+        attacks = attack_generator.generate(
+            tasks,
+            round_id=generation_round_id,
+            attack_memory=memory,
+        )
+        records = evaluate_attacks(
+            model,
+            tokenizer,
+            attacks,
+            env,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_new_tokens,
+        )
+        successful = extract_failures(records)
+        blocked = [record for record in records if record not in successful]
+        memory.add_success_cases(round_id, successful)
+        memory.add_blocked_cases(round_id, blocked)
+        all_attacks.extend(attacks)
+        all_records.extend(records)
+        all_successful.extend(successful)
+        all_blocked.extend(blocked)
+        if successful or not blocked:
+            break
+        if attempt + 1 < max_attempts:
+            escalation_attempts += 1
+            print(
+                "[coevo-llm] "
+                f"round={round_id} all {len(blocked)} attacks blocked; "
+                f"running red-team escalation {escalation_attempts}/{redteam_escalation_rounds}",
+                flush=True,
+            )
+
+    return all_attacks, all_records, all_successful, all_blocked, escalation_attempts
 
 
 def load_defender(model_name_or_path: str, adapter_path: str) -> tuple[Any, Any, Any]:
