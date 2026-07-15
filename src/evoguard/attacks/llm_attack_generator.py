@@ -88,15 +88,18 @@ class LLMRedTeamAttackGenerator:
         samples: list[AttackSample] = []
         historical_successes = _select_success_cases(failure_cases, success_cases, attack_memory)
         historical_blocked = _select_blocked_cases(blocked_cases, attack_memory)
-        compromised_tools = _latest_round_tool_names(historical_successes)
         target_tasks = [candidate for candidate in tasks if candidate.preferred_tool]
+        compromised_tools = _compromised_tool_names(historical_successes)
+        target_tools = {task.preferred_tool for task in target_tasks if task.preferred_tool}
+        reset_filter = bool(target_tools) and target_tools.issubset(compromised_tools)
+        effective_compromised_tools = set() if reset_filter else compromised_tools
         unfiltered_task_count = len(target_tasks)
-        if compromised_tools:
-            target_tasks = [task for task in target_tasks if task.preferred_tool in compromised_tools]
+        if effective_compromised_tools:
+            target_tasks = [task for task in target_tasks if task.preferred_tool in effective_compromised_tools]
         print(
             "LLM attack generation task filter: "
             f"before={unfiltered_task_count} after={len(target_tasks)} "
-            f"compromised_tools={sorted(compromised_tools)}"
+            f"compromised_tools={sorted(compromised_tools)} reset_filter={reset_filter}"
         )
 
         for task in target_tasks:
@@ -107,7 +110,7 @@ class LLMRedTeamAttackGenerator:
                     round_id,
                     historical_successes,
                     historical_blocked,
-                    compromised_tools,
+                    effective_compromised_tools,
                 ),
                 schema_name="red_team_attacks",
             )
@@ -209,11 +212,8 @@ def _record_attack_memory(
         attack_memory.add_blocked_cases(round_id, blocked_cases)
 
 
-def _latest_round_tool_names(cases: list[TrajectoryRecord]) -> set[str]:
-    if not cases:
-        return set()
-    latest_round_id = max(case.round_id for case in cases)
-    return {case.tool_name for case in cases if case.round_id == latest_round_id and case.tool_name}
+def _compromised_tool_names(cases: list[TrajectoryRecord]) -> set[str]:
+    return {case.tool_name for case in cases if case.tool_name}
 
 
 def build_api_attack_generator(

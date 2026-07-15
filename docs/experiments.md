@@ -374,6 +374,28 @@ python scripts/generate_attacks.py --split automated_jailbreak --output data/att
 python scripts/run_baselines.py --eval-attack-split automated_jailbreak
 ```
 
+For API-backed online adaptive red teaming, configure:
+
+```bash
+export EVOGUARD_ATTACK_API_KEY=...
+export EVOGUARD_ATTACK_BASE_URL=...
+export EVOGUARD_ATTACK_MODEL=...
+```
+
+Then run:
+
+```bash
+python scripts/run_online_redteam.py \
+  --defender rule_based_guard \
+  --rounds 3 \
+  --attacks-per-task 6 \
+  --attacks-output data/attacks/api_online_redteam_successes.jsonl \
+  --rollouts-output data/eval/api_online_redteam_rollouts.jsonl \
+  --summary-output outputs/logs/api_online_redteam_summary.json
+```
+
+This runner queries the attacker API, immediately evaluates each candidate against the selected `DefenseAgent`, stores successful attacks in memory, stores blocked attacks as negative feedback, and conditions the next generation step on both groups.
+
 ### Reporting
 
 Report the existing held-out results and the automated-jailbreak results as separate columns. The automated-jailbreak split should be described as controlled analogues of PAIR/TAP/GPTFuzzer for tool-use safety, not as full unrestricted harmful-content jailbreak reproduction.

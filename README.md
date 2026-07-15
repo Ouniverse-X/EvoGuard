@@ -9,6 +9,7 @@ The implementation focuses on controlled text tool-calling safety and step-level
 - Text tool-calling environment with simulated tools only.
 - Three trajectory types: no-tool, clean-tool, and attacked-tool.
 - Prompt-template attack generator with round metadata and injection spans.
+- API-backed online adaptive red-team runner with success/blocked feedback memory.
 - Rule-based and lightweight PPO trainable defense heads for MVP data flow.
 - Reward decomposition for task, safety, attribution, and KL terms.
 - Round-based training loop with a dependency-free clipped PPO update path.
@@ -23,6 +24,13 @@ python scripts/evaluate.py
 python scripts/run_baselines.py
 python scripts/run_ablations.py
 python scripts/plot_results.py
+```
+
+API-backed online red teaming uses an OpenAI-compatible attack model configured through
+`EVOGUARD_ATTACK_API_KEY`, `EVOGUARD_ATTACK_BASE_URL`, and `EVOGUARD_ATTACK_MODEL`:
+
+```bash
+python scripts/run_online_redteam.py --defender rule_based_guard --rounds 3
 ```
 
 `scripts/train_evoguard.py` uses the trainable safety head by default. It is a small linear policy updated with a lightweight clipped PPO objective over EvoGuard trajectory rewards.
