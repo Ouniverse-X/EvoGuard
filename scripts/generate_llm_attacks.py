@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate local-Qwen attack samples and attacked rollouts for EvoGuard eval."""
+"""Generate API-backed attack samples and attacked rollouts for EvoGuard eval."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from evoguard.attacks.llm_attack_generator import DEFAULT_LOCAL_QWEN_PATH, build_local_qwen_attack_generator
+from evoguard.attacks.llm_attack_generator import build_api_attack_generator
 from evoguard.envs.text_tool_env import TOOLS, TextToolEnv
 from evoguard.training.llm_rl import read_rollout_jsonl
 from evoguard.types import AttackSample, SafetyAction, TrajectoryRecord, TrajectoryType
@@ -19,14 +19,13 @@ from evoguard.types import AttackSample, SafetyAction, TrajectoryRecord, Traject
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_LOCAL_QWEN_PATH)
     parser.add_argument("--output", default="data/attacks/llm_generated_round1.jsonl")
     parser.add_argument("--rollouts-output", default="data/eval/llm_generated_round1_attacked_rollouts.jsonl")
     parser.add_argument("--round-id", type=int, default=1)
     parser.add_argument("--attacks-per-task", type=int, default=8)
     parser.add_argument("--min-total", type=int, default=100)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--max-tokens", type=int, default=1400)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--task-indices", default="", help="Comma-separated preferred-tool task indices. Empty means all.")
     parser.add_argument("--failure-cases-jsonl", default="")
     parser.add_argument("--blocked-cases-jsonl", default="")
@@ -41,11 +40,10 @@ def main() -> None:
     else:
         selected = tasks
 
-    generator = build_local_qwen_attack_generator(
-        args.model,
+    generator = build_api_attack_generator(
         attacks_per_task=args.attacks_per_task,
         tool_catalog=tool_catalog,
-        max_new_tokens=args.max_new_tokens,
+        max_tokens=args.max_tokens,
         temperature=args.temperature,
     )
     successful_cases = _load_history(args.failure_cases_jsonl, args.history_limit)
@@ -80,7 +78,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "model": args.model,
+                "model": "env:EVOGUARD_ATTACK_MODEL",
                 "attacks": len(attacks),
                 "output": str(attack_path),
                 "rollouts_output": str(rollout_path),

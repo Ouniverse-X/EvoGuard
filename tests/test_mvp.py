@@ -83,6 +83,17 @@ def test_baseline_suite_runs_comparable_metrics() -> None:
     assert "attack_interception_rate" in by_name["evoguard_adaptive"].metrics
 
 
+def test_baseline_suite_accepts_modern_eval_split() -> None:
+    results = run_baseline_suite(
+        baselines=("no_guard",),
+        train_rounds=1,
+        eval_attack_split="automated_jailbreak",
+    )
+
+    assert results[0].eval_attack_split == "automated_jailbreak"
+    assert results[0].metrics["attack_success_rate"] == 1.0
+
+
 def test_unknown_baseline_is_rejected() -> None:
     try:
         evaluate_baseline("unknown_guard")
@@ -105,6 +116,17 @@ def test_attack_train_eval_splits_are_disjoint() -> None:
     assert train_types.isdisjoint(heldout_types)
     assert all(attack.attack_id.startswith("train_") for attack in train_attacks)
     assert all(attack.attack_id.startswith("heldout_") for attack in heldout_attacks)
+
+
+def test_modern_automated_jailbreak_split_covers_pair_tap_gptfuzzer() -> None:
+    env = TextToolEnv()
+    attacks = build_attack_generator("automated_jailbreak").generate(env.get_tasks(), round_id=7)
+    attack_types = {attack.attack_type for attack in attacks}
+
+    assert attacks
+    assert {"pair_iterative_refinement", "tap_branch_pruning", "gptfuzzer_seed_mutation"}.issubset(attack_types)
+    assert all(attack.attack_id.startswith("automated_jailbreak_r7_") for attack in attacks)
+    assert all(attack.gold_safety_action == SafetyAction.REFUSE for attack in attacks)
 
 
 def test_text_tool_env_covers_multiple_risk_types() -> None:

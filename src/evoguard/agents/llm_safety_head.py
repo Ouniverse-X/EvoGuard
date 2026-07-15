@@ -75,7 +75,7 @@ def _parse_safety_decision(response: dict[str, Any]) -> DefenseDecision:
 def _parse_span(value: Any) -> tuple[int, int] | None:
     if value is None:
         return None
-    if not isinstance(value, list | tuple) or len(value) != 2:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise LLMClientError("attribution_span must be null or [start, end]")
     start, end = int(value[0]), int(value[1])
     if start < 0 or end < start:

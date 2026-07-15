@@ -75,6 +75,7 @@ Filtering criterion:
 | EvoGuard handles evolving attacks better than static training. | Round-based adaptive attack comparison. | Static guard, ToolSafe-style guard, no guard. | Attack interception, false negative rate, held-out robustness. | EvoGuard improves later-round robustness. |
 | Tri-trajectory rollout preserves task ability while improving safety. | Remove no-tool and clean-tool trajectories. | Attacked-only, no no-tool, no clean-tool. | Task success, over-refusal, attack interception. | Full tri-rollout balances all three metrics. |
 | Dynamic attack generation is more useful than fixed attack pools. | Adaptive generator vs static pool. | Static attack pool, random mutation. | Later-round attack success, defense curve. | Adaptive attacks expose current weaknesses. |
+| EvoGuard remains robust to modern automated jailbreak generators. | Evaluate on PAIR/TAP/GPTFuzzer-inspired held-out attacks. | Static guard, EAPO fixed contrastive rollout, EvoGuard adaptive. | Attack interception, false negative rate, attack success, over-refusal. | EvoGuard should improve on modern automated red-team styles without collapsing task success. |
 | Risk-aware rewards reduce brittle safety behavior. | Remove confidence, round, stale penalties. | Binary reward, no confidence weighting, no round weighting. | High-confidence unsafe execution, stability, over-refusal. | Full reward penalizes severe errors better. |
 | Attribution improves interpretability and safety generalization. | Remove attribution reward. | No attribution, attribution-only detector. | Attribution IoU, attack interception, unseen robustness. | Attribution improves localization and may improve robustness. |
 
@@ -334,7 +335,50 @@ Both models intercepted all harmful ToolSafe held-out attacked-tool trajectories
 - `outputs/logs/eval_sft_toolsafe.json`
 - `outputs/logs/baseline_qwen3guard.json`
 
-## E006: Defender Generalization and Self-RedTeam Baselines
+## E006: Modern Automated Jailbreak Red-Team Suite
+
+### Date
+
+2026-07-15
+
+### Goal
+
+Address the gap that the red-team evaluation is too template-era by adding PAIR, TAP, and GPTFuzzer-inspired automated jailbreak coverage.
+
+### Attack Setup
+
+Attack source:
+`build_attack_generator("automated_jailbreak")`.
+
+Attack families:
+
+- PAIR-style iterative refinement.
+- TAP-style branch pruning.
+- GPTFuzzer-style seed mutation.
+
+Filtering criterion:
+Evaluate separately from train templates. Do not mix this split into default training unless running an explicit robustness-training ablation.
+
+### Metrics
+
+- Attack interception rate.
+- Attack success rate.
+- False negative rate.
+- Over-refusal rate on clean-tool and no-tool records.
+- Attribution accuracy on injected spans.
+
+### Run
+
+```bash
+python scripts/generate_attacks.py --split automated_jailbreak --output data/attacks/automated_jailbreak_round99.jsonl
+python scripts/run_baselines.py --eval-attack-split automated_jailbreak
+```
+
+### Reporting
+
+Report the existing held-out results and the automated-jailbreak results as separate columns. The automated-jailbreak split should be described as controlled analogues of PAIR/TAP/GPTFuzzer for tool-use safety, not as full unrestricted harmful-content jailbreak reproduction.
+
+## E007: Defender Generalization and Self-RedTeam Baselines
 
 ### Date
 
@@ -383,12 +427,24 @@ The main table should emphasize that adapter training, especially ToolSafe SFT a
 ### Defender generalization evaluation (ASR↓ %)
 | Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out |
 | --- | --- | --- | --- |
-| Base Qwen | - | 9.09 | 24.04 |
+| Base Qwen | - | 100.00 | 100.00 |
 | Qwen3Guard | 0.00 | - | - |
 | ToolSafe SFT | 0.00 | - | - |
 | Filtered RL-v1 | 0.00 | - | - |
 | Mixed RL-v1 | 0.00 | - | - |
-| Self-RedTeam | 22.86 | 19.09 | - |
+| Self-RedTeam | 97.14 | 100.00 | - |
+
+### Format adherence (valid JSON rate %)
+| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out |
+| --- | --- | --- | --- |
+| Base Qwen | - | 9.09 | 22.12 |
+| Qwen3Guard | 100.00 | - | - |
+| ToolSafe SFT | 100.00 | - | - |
+| Filtered RL-v1 | 100.00 | - | - |
+| Mixed RL-v1 | 99.05 | - | - |
+| Self-RedTeam | 25.71 | 19.09 | - |
+
+Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; otherwise the table falls back to the original non-strict logs.
 
 ### Utility & safety metrics (ToolSafe held-out)
 | Defender | valid_json_rate | attack_interception_rate | over_refusal_rate | task_success_rate | attribution_accuracy |
@@ -398,6 +454,6 @@ The main table should emphasize that adapter training, especially ToolSafe SFT a
 | ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
 | Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
 | Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
-| Self-RedTeam | 0.2571 | 0.7714 | 0.2195 | 0.7740 | 0.0136 |
+| Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
 
 <!-- END GENERATED FINAL TABLES -->

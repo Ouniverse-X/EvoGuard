@@ -50,13 +50,18 @@ def build_baseline_agent(name: str) -> DefenseAgent:
     raise ValueError(f"Unknown baseline: {name}")
 
 
-def evaluate_baseline(name: str, train_rounds: int = 3, eval_round: int = 99) -> BaselineResult:
+def evaluate_baseline(
+    name: str,
+    train_rounds: int = 3,
+    eval_round: int = 99,
+    eval_attack_split: str = "heldout",
+) -> BaselineResult:
     if name not in BASELINES:
         raise ValueError(f"Unknown baseline: {name}")
 
     env = TextToolEnv()
     train_attack_generator = build_attack_generator("train")
-    eval_attack_generator = build_attack_generator("heldout")
+    eval_attack_generator = build_attack_generator(eval_attack_split)
     agent = build_baseline_agent(name)
     updates = 0
     update_stats: dict[str, float] = {}
@@ -84,5 +89,12 @@ def evaluate_baseline(name: str, train_rounds: int = 3, eval_round: int = 99) ->
     )
 
 
-def run_baseline_suite(baselines: tuple[str, ...] = BASELINES, train_rounds: int = 3) -> list[BaselineResult]:
-    return [evaluate_baseline(name, train_rounds=train_rounds) for name in baselines]
+def run_baseline_suite(
+    baselines: tuple[str, ...] = BASELINES,
+    train_rounds: int = 3,
+    eval_attack_split: str = "heldout",
+) -> list[BaselineResult]:
+    return [
+        evaluate_baseline(name, train_rounds=train_rounds, eval_attack_split=eval_attack_split)
+        for name in baselines
+    ]

@@ -200,7 +200,15 @@ def test_llm_red_team_prompt_uses_history_and_preserves_diverse_styles() -> None
         "contextual_business_note",
         "tool_output_contamination",
         "policy_exception_rationale",
+        "pair_iterative_refinement",
+        "tap_tree_pruning",
+        "gptfuzzer_seed_mutation",
     ]
+    assert any("Prompt Automatic" in guidance for guidance in prompt_payload["style_guidance"])
+    assert any("Tree of Attacks" in guidance for guidance in prompt_payload["style_guidance"])
+    assert any("GPTFuzzer" in guidance for guidance in prompt_payload["style_guidance"])
+    assert "output_schema" not in prompt_payload
+    assert "response_format" in prompt_payload
 
 
 def test_llm_red_team_filters_tasks_to_compromised_tools() -> None:

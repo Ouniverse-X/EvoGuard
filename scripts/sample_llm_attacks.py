@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Sample local-Qwen EvoGuard attack injections for human review."""
+"""Sample API-backed EvoGuard attack injections for human review."""
 
 from __future__ import annotations
 
@@ -13,20 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from evoguard.attacks.llm_attack_generator import (
     DEFAULT_ATTACK_STYLES,
-    DEFAULT_LOCAL_QWEN_PATH,
-    build_local_qwen_attack_generator,
+    build_api_attack_generator,
 )
 from evoguard.envs.text_tool_env import TOOLS, TextToolEnv
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_LOCAL_QWEN_PATH)
     parser.add_argument("--task-index", type=int, default=0)
     parser.add_argument("--round-id", type=int, default=0)
     parser.add_argument("--attacks-per-task", type=int, default=3)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
-    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--max-tokens", type=int, default=1400)
+    parser.add_argument("--temperature", type=float, default=0.8)
     args = parser.parse_args()
 
     env = TextToolEnv()
@@ -34,11 +32,10 @@ def main() -> None:
     tasks = [task for task in env.get_tasks() if task.preferred_tool]
     task = tasks[args.task_index]
 
-    generator = build_local_qwen_attack_generator(
-        args.model,
+    generator = build_api_attack_generator(
         attacks_per_task=args.attacks_per_task,
         tool_catalog=tool_catalog,
-        max_new_tokens=args.max_new_tokens,
+        max_tokens=args.max_tokens,
         temperature=args.temperature,
     )
     samples = generator.generate([task], round_id=args.round_id)
@@ -47,7 +44,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "model": args.model,
+                "model": "env:EVOGUARD_ATTACK_MODEL",
                 "task_id": task.task_id,
                 "task": task.user_task,
                 "target_tool": task.preferred_tool,

@@ -10,10 +10,24 @@ from typing import Any
 
 OUTPUT_PATH = Path("docs/experiments.md")
 
+
+def first_existing_log(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[-1]
+
+
 LOGS = {
     "Base Qwen": {
-        "llm_r1": Path("outputs/logs/eval_base_qwen_llm_r1.json"),
-        "hard": Path("outputs/logs/eval_base_qwen_hard_heldout.json"),
+        "llm_r1": first_existing_log(
+            Path("outputs/logs/eval_base_qwen_llm_r1_strict.json"),
+            Path("outputs/logs/eval_base_qwen_llm_r1.json"),
+        ),
+        "hard": first_existing_log(
+            Path("outputs/logs/eval_base_qwen_hard_strict.json"),
+            Path("outputs/logs/eval_base_qwen_hard_heldout.json"),
+        ),
     },
     "Qwen3Guard": {
         "toolsafe": Path("outputs/logs/baseline_qwen3guard.json"),
@@ -31,8 +45,14 @@ LOGS = {
 
 OPTIONAL_LOGS = {
     "Self-RedTeam": {
-        "toolsafe": Path("outputs/logs/baseline_self_redteam.json"),
-        "llm_r1": Path("outputs/logs/baseline_self_redteam.json"),
+        "toolsafe": first_existing_log(
+            Path("outputs/logs/baseline_self_redteam_strict.json"),
+            Path("outputs/logs/baseline_self_redteam.json"),
+        ),
+        "llm_r1": first_existing_log(
+            Path("outputs/logs/baseline_self_redteam_strict.json"),
+            Path("outputs/logs/baseline_self_redteam.json"),
+        ),
     }
 }
 
@@ -65,6 +85,8 @@ def main() -> None:
             "## Final Experiment Tables",
             "",
             render_generalization_table(loaded),
+            "",
+            render_valid_json_table(loaded),
             "",
             render_utility_table(loaded),
             "",
@@ -122,6 +144,24 @@ def render_generalization_table(loaded: dict[str, dict[str, dict[str, Any]]]) ->
     return "\n".join(lines)
 
 
+def render_valid_json_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
+    lines = ["### Format adherence (valid JSON rate %)"]
+    header = ["Defender", *[name for name, _ in GENERALIZATION_COLUMNS]]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    for defender, results in loaded.items():
+        row = [defender]
+        for _, key in GENERALIZATION_COLUMNS:
+            row.append(format_percent(valid_json_rate(results.get(key))))
+        lines.append(markdown_row(row))
+    lines.append("")
+    lines.append(
+        "Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; "
+        "otherwise the table falls back to the original non-strict logs."
+    )
+    return "\n".join(lines)
+
+
 def render_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
     lines = ["### Utility & safety metrics (ToolSafe held-out)"]
     header = ["Defender", *UTILITY_COLUMNS]
@@ -135,6 +175,13 @@ def render_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
             row.append(format_float(value))
         lines.append(markdown_row(row))
     return "\n".join(lines)
+
+
+def valid_json_rate(payload: dict[str, Any] | None) -> float | None:
+    if not payload:
+        return None
+    value = payload.get("valid_json_rate")
+    return float(value) if isinstance(value, int | float) else None
 
 
 def metric(payload: dict[str, Any] | None, key: str) -> float | None:

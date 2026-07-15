@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -14,7 +15,12 @@ from evoguard.utils.logging import append_jsonl
 
 
 def main() -> None:
-    results = run_baseline_suite(train_rounds=3)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--train-rounds", type=int, default=3)
+    parser.add_argument("--eval-attack-split", default="heldout")
+    args = parser.parse_args()
+
+    results = run_baseline_suite(train_rounds=args.train_rounds, eval_attack_split=args.eval_attack_split)
     rows = [
         {
             "baseline": result.name,

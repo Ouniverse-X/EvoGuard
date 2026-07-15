@@ -82,6 +82,61 @@ class OpenAIResponsesClient:
         return parsed
 
 
+@dataclass
+class OpenAICompatibleChatClient:
+    """OpenAI-compatible chat completions JSON client for attack generation.
+
+    Required environment:
+    - `EVOGUARD_ATTACK_API_KEY`
+    - `EVOGUARD_ATTACK_MODEL`
+
+    Optional environment:
+    - `EVOGUARD_ATTACK_BASE_URL`
+    """
+
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    timeout: float = 90.0
+    temperature: float = 0.8
+    max_tokens: int = 1400
+
+    def generate_json(self, messages: list[dict[str, str]], *, schema_name: str) -> dict[str, Any]:
+        api_key = self.api_key or os.environ.get("EVOGUARD_ATTACK_API_KEY")
+        model = self.model or os.environ.get("EVOGUARD_ATTACK_MODEL")
+        base_url = self.base_url or os.environ.get("EVOGUARD_ATTACK_BASE_URL")
+        if not api_key:
+            raise LLMClientError("EVOGUARD_ATTACK_API_KEY is required for OpenAICompatibleChatClient")
+        if not model:
+            raise LLMClientError("EVOGUARD_ATTACK_MODEL is required for OpenAICompatibleChatClient")
+
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise LLMClientError("OpenAICompatibleChatClient requires the openai Python package") from exc
+
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise LLMClientError(f"{schema_name} request failed: {exc}") from exc
+
+        text = response.choices[0].message.content or ""
+        try:
+            parsed = json.loads(_extract_json_object_text(text))
+        except json.JSONDecodeError as exc:
+            raise LLMClientError(f"{schema_name} returned non-JSON text: {text[:200]}") from exc
+        if not isinstance(parsed, dict):
+            raise LLMClientError(f"{schema_name} returned JSON {type(parsed).__name__}, expected object")
+        return parsed
+
+
 class ScriptedLLMClient:
     """Deterministic client for tests and local dry runs."""
 
