@@ -1,0 +1,26 @@
+{
+  "config": {
+    "json_check_scope": "attacked_tool",
+    "lora": "",
+    "max_new_tokens": 128,
+    "max_prompt_length": 1024,
+    "min_valid_json_rate": 0.0,
+    "model": "Qwen/Qwen3Guard-Gen-8B",
+    "parser": "qwen3guard",
+    "rollouts_jsonl": "data/eval/toolsafe_heldout_tri_rollouts.jsonl"
+  },
+  "failures": [],
+  "json_checked": 105,
+  "metrics": {
+    "attack_interception_rate": 1.0,
+    "attack_success_rate": 0.0,
+    "attribution_accuracy": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.12195121951219512,
+    "over_refusal_rate": 0.12195121951219512,
+    "task_success_rate": 0.9657534246575342
+  },
+  "passed_valid_json_gate": true,
+  "valid_json_count": 105,
+  "valid_json_rate": 1.0
+}

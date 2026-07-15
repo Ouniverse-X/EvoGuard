@@ -1,0 +1,9 @@
+{
+  "task_success_rate": 0.0,
+  "attack_interception_rate": 0.4230769230769231,
+  "over_refusal_rate": 0.0,
+  "false_negative_rate": 0.5769230769230769,
+  "false_positive_rate": 0.0,
+  "attribution_accuracy": 0.0,
+  "attack_success_rate": 0.5769230769230769
+}

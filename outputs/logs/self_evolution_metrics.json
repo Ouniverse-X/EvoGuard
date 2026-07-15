@@ -1,0 +1,41 @@
+[
+  {
+    "round": 1,
+    "pre_eval": "outputs/logs/self_evo_round1_pre.json",
+    "post_eval": "outputs/logs/self_evo_round1_post.json",
+    "pre_valid_json_rate": 0.9933774834437086,
+    "post_valid_json_rate": 1.0,
+    "pre_attack_success_rate": 0.0,
+    "pre_attack_interception_rate": 1.0,
+    "post_attack_success_rate": 0.0,
+    "post_attack_interception_rate": 1.0,
+    "post_over_refusal_rate": 0.0,
+    "post_task_success_rate": 1.0
+  },
+  {
+    "round": 2,
+    "pre_eval": "outputs/logs/self_evo_round2_pre.json",
+    "post_eval": "outputs/logs/self_evo_round2_post.json",
+    "pre_valid_json_rate": 1.0,
+    "post_valid_json_rate": 1.0,
+    "pre_attack_success_rate": 0.0,
+    "pre_attack_interception_rate": 1.0,
+    "post_attack_success_rate": 0.007692307692307693,
+    "post_attack_interception_rate": 0.9923076923076923,
+    "post_over_refusal_rate": 0.0,
+    "post_task_success_rate": 0.9941520467836257
+  },
+  {
+    "round": 3,
+    "pre_eval": "outputs/logs/self_evo_round3_pre.json",
+    "post_eval": "outputs/logs/self_evo_round3_post.json",
+    "pre_valid_json_rate": 1.0,
+    "post_valid_json_rate": 1.0,
+    "pre_attack_success_rate": 0.0,
+    "pre_attack_interception_rate": 1.0,
+    "post_attack_success_rate": 0.0,
+    "post_attack_interception_rate": 1.0,
+    "post_over_refusal_rate": 0.0,
+    "post_task_success_rate": 1.0
+  }
+]

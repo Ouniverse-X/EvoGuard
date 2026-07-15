@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430">
+<rect width="100%" height="100%" fill="white" />
+<text x="440.0" y="28" font-size="18" font-weight="700" text-anchor="middle">EvoGuard Training Curves</text>
+<line x1="64" y1="370" x2="842" y2="370" stroke="#333" />
+<line x1="64" y1="370" x2="64" y2="70" stroke="#333" />
+<line x1="60" y1="370.0" x2="842" y2="370.0" stroke="#ddd" />
+<text x="54" y="374.0" font-size="11" text-anchor="end">0</text>
+<line x1="60" y1="295.0" x2="842" y2="295.0" stroke="#ddd" />
+<text x="54" y="299.0" font-size="11" text-anchor="end">25</text>
+<line x1="60" y1="220.0" x2="842" y2="220.0" stroke="#ddd" />
+<text x="54" y="224.0" font-size="11" text-anchor="end">50</text>
+<line x1="60" y1="145.0" x2="842" y2="145.0" stroke="#ddd" />
+<text x="54" y="149.0" font-size="11" text-anchor="end">75</text>
+<line x1="60" y1="70.0" x2="842" y2="70.0" stroke="#ddd" />
+<text x="54" y="74.0" font-size="11" text-anchor="end">100</text>
+<text x="18" y="220.0" font-size="12" text-anchor="middle" transform="rotate(-90 18,220.0)">Percent</text>
+<polyline points="64.0,290.8 453.0,87.6 842.0,140.3" fill="none" stroke="#2f7ed8" stroke-width="2.5" />
+<circle cx="64.0" cy="290.8" r="4" fill="#2f7ed8" />
+<circle cx="453.0" cy="87.6" r="4" fill="#2f7ed8" />
+<circle cx="842.0" cy="140.3" r="4" fill="#2f7ed8" />
+<polyline points="64.0,370.0 453.0,70.0 842.0,70.0" fill="none" stroke="#2ca02c" stroke-width="2.5" />
+<circle cx="64.0" cy="370.0" r="4" fill="#2ca02c" />
+<circle cx="453.0" cy="70.0" r="4" fill="#2ca02c" />
+<circle cx="842.0" cy="70.0" r="4" fill="#2ca02c" />
+<polyline points="64.0,370.0 453.0,370.0 842.0,370.0" fill="none" stroke="#d62728" stroke-width="2.5" />
+<circle cx="64.0" cy="370.0" r="4" fill="#d62728" />
+<circle cx="453.0" cy="370.0" r="4" fill="#d62728" />
+<circle cx="842.0" cy="370.0" r="4" fill="#d62728" />
+<polyline points="64.0,70.0 453.0,370.0 842.0,370.0" fill="none" stroke="#ff7f0e" stroke-width="2.5" />
+<circle cx="64.0" cy="70.0" r="4" fill="#ff7f0e" />
+<circle cx="453.0" cy="370.0" r="4" fill="#ff7f0e" />
+<circle cx="842.0" cy="370.0" r="4" fill="#ff7f0e" />
+<text x="64.0" y="394" font-size="11" text-anchor="middle">0</text>
+<text x="453.0" y="394" font-size="11" text-anchor="middle">1</text>
+<text x="842.0" y="394" font-size="11" text-anchor="middle">2</text>
+<text x="453.0" y="418" font-size="12" text-anchor="middle">Evolution Round</text>
+<rect x="550" y="22" width="11" height="11" fill="#2f7ed8" />
+<text x="566" y="32" font-size="11">task success rate</text>
+<rect x="550" y="40" width="11" height="11" fill="#2ca02c" />
+<text x="566" y="50" font-size="11">attack interception rate</text>
+<rect x="550" y="58" width="11" height="11" fill="#d62728" />
+<text x="566" y="68" font-size="11">over refusal rate</text>
+<rect x="550" y="76" width="11" height="11" fill="#ff7f0e" />
+<text x="566" y="86" font-size="11">attack success rate</text>
+</svg>
