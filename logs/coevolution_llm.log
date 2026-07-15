@@ -1,0 +1,242 @@
+nohup: ignoring input
+[coevo-llm] round=1 loading defender adapter=outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  19%|█▉        | 64/338 [00:00<00:00, 609.12it/s]Loading weights:  37%|███▋      | 125/338 [00:00<00:00, 578.67it/s]Loading weights:  55%|█████▍    | 185/338 [00:00<00:00, 573.76it/s]Loading weights:  72%|███████▏  | 244/338 [00:00<00:00, 570.78it/s]Loading weights:  92%|█████████▏| 311/338 [00:00<00:00, 604.44it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 601.86it/s]
+LLM attack generation task filter: before=13 after=13 compromised_tools=[] reset_filter=False
+[coevo-llm] round=1 training LoRA -> outputs/checkpoints/coevolving_llm_defender/round_1
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 5398.01it/s]
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 41/338 [00:00<00:00, 398.95it/s]Loading weights:  30%|██▉       | 101/338 [00:00<00:00, 506.23it/s]Loading weights:  47%|████▋     | 160/338 [00:00<00:00, 531.42it/s]Loading weights:  65%|██████▌   | 221/338 [00:00<00:00, 547.79it/s]Loading weights:  83%|████████▎ | 281/338 [00:00<00:00, 558.46it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 545.63it/s]
+{
+  "round_id": 1,
+  "model": "/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct",
+  "input_adapter": "outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft",
+  "output_adapter": "outputs/checkpoints/coevolving_llm_defender/round_1",
+  "candidate_attacks": 39,
+  "successful_attacks": 0,
+  "blocked_attacks": 39,
+  "attack_success_rate": 0.0,
+  "train_records": 65,
+  "mean_reward": 1.5725829157435827,
+  "pre_update_metrics": {
+    "task_success_rate": 0.9538461538461539,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.4326040536751633,
+    "attack_success_rate": 0.0
+  },
+  "rl_stats": {
+    "updates": 17,
+    "samples": 65,
+    "valid_json_rate": 1.0,
+    "mean_reward": 1.555231849116286,
+    "mean_advantage": 1.555231849116286,
+    "mean_loss": 0.04560979190011075
+  },
+  "heldout_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.503934545823945,
+    "attack_success_rate": 0.0
+  },
+  "artifacts": {
+    "train_rollouts": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_1_train_rollouts.jsonl",
+    "successful_attacks": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_1_successful_attacks.jsonl"
+  }
+}
+[coevo-llm] round=2 loading defender adapter=outputs/checkpoints/coevolving_llm_defender/round_1
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 40/338 [00:00<00:00, 368.17it/s]Loading weights:  29%|██▉       | 99/338 [00:00<00:00, 471.67it/s]Loading weights:  48%|████▊     | 161/338 [00:00<00:00, 524.93it/s]Loading weights:  65%|██████▍   | 219/338 [00:00<00:00, 534.33it/s]Loading weights:  83%|████████▎ | 281/338 [00:00<00:00, 556.92it/s]Loading weights: 100%|█████████▉| 337/338 [00:00<00:00, 416.23it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 459.47it/s]
+LLM attack generation task filter: before=13 after=13 compromised_tools=[] reset_filter=False
+[coevo-llm] round=2 training LoRA -> outputs/checkpoints/coevolving_llm_defender/round_2
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 5916.44it/s]
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 41/338 [00:00<00:00, 396.47it/s]Loading weights:  30%|██▉       | 101/338 [00:00<00:00, 496.53it/s]Loading weights:  48%|████▊     | 161/338 [00:00<00:00, 541.27it/s]Loading weights:  65%|██████▌   | 220/338 [00:00<00:00, 539.98it/s]Loading weights:  83%|████████▎ | 281/338 [00:00<00:00, 560.58it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 558.08it/s]
+{
+  "round_id": 2,
+  "model": "/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct",
+  "input_adapter": "outputs/checkpoints/coevolving_llm_defender/round_1",
+  "output_adapter": "outputs/checkpoints/coevolving_llm_defender/round_2",
+  "candidate_attacks": 39,
+  "successful_attacks": 0,
+  "blocked_attacks": 39,
+  "attack_success_rate": 0.0,
+  "train_records": 65,
+  "mean_reward": 1.6563309960502115,
+  "pre_update_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.37553997366807346,
+    "attack_success_rate": 0.0
+  },
+  "rl_stats": {
+    "updates": 17,
+    "samples": 65,
+    "valid_json_rate": 1.0,
+    "mean_reward": 1.6518548084962992,
+    "mean_advantage": 1.6518548084962992,
+    "mean_loss": 0.011319777005449465
+  },
+  "heldout_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.5127045151611708,
+    "attack_success_rate": 0.0
+  },
+  "artifacts": {
+    "train_rollouts": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_2_train_rollouts.jsonl",
+    "successful_attacks": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_2_successful_attacks.jsonl"
+  }
+}
+[coevo-llm] round=3 loading defender adapter=outputs/checkpoints/coevolving_llm_defender/round_2
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 39/338 [00:00<00:00, 385.89it/s]Loading weights:  30%|██▉       | 100/338 [00:00<00:00, 510.34it/s]Loading weights:  46%|████▌     | 154/338 [00:00<00:00, 523.73it/s]Loading weights:  62%|██████▏   | 208/338 [00:00<00:00, 510.08it/s]Loading weights:  79%|███████▉  | 268/338 [00:00<00:00, 521.51it/s]Loading weights:  97%|█████████▋| 328/338 [00:00<00:00, 529.19it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 529.15it/s]
+LLM attack generation task filter: before=13 after=13 compromised_tools=[] reset_filter=False
+[coevo-llm] round=3 training LoRA -> outputs/checkpoints/coevolving_llm_defender/round_3
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 8992.09it/s]
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 41/338 [00:00<00:00, 386.34it/s]Loading weights:  30%|██▉       | 101/338 [00:00<00:00, 496.08it/s]Loading weights:  47%|████▋     | 159/338 [00:00<00:00, 515.13it/s]Loading weights:  65%|██████▌   | 220/338 [00:00<00:00, 541.62it/s]Loading weights:  83%|████████▎ | 279/338 [00:00<00:00, 556.71it/s]Loading weights:  99%|█████████▉| 335/338 [00:00<00:00, 556.71it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 540.32it/s]
+{
+  "round_id": 3,
+  "model": "/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct",
+  "input_adapter": "outputs/checkpoints/coevolving_llm_defender/round_2",
+  "output_adapter": "outputs/checkpoints/coevolving_llm_defender/round_3",
+  "candidate_attacks": 39,
+  "successful_attacks": 0,
+  "blocked_attacks": 39,
+  "attack_success_rate": 0.0,
+  "train_records": 65,
+  "mean_reward": 1.6494114305005385,
+  "pre_update_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.3294095366702578,
+    "attack_success_rate": 0.0
+  },
+  "rl_stats": {
+    "updates": 17,
+    "samples": 65,
+    "valid_json_rate": 1.0,
+    "mean_reward": 1.6446548276576078,
+    "mean_advantage": 1.6446548276576078,
+    "mean_loss": 0.003099940251181229
+  },
+  "heldout_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.5581424533083089,
+    "attack_success_rate": 0.0
+  },
+  "artifacts": {
+    "train_rollouts": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_3_train_rollouts.jsonl",
+    "successful_attacks": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_3_successful_attacks.jsonl"
+  }
+}
+[coevo-llm] round=4 loading defender adapter=outputs/checkpoints/coevolving_llm_defender/round_3
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  13%|█▎        | 44/338 [00:00<00:00, 436.63it/s]Loading weights:  30%|██▉       | 101/338 [00:00<00:00, 514.00it/s]Loading weights:  48%|████▊     | 161/338 [00:00<00:00, 547.30it/s]Loading weights:  65%|██████▌   | 220/338 [00:00<00:00, 551.68it/s]Loading weights:  83%|████████▎ | 280/338 [00:00<00:00, 566.33it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 561.31it/s]
+LLM attack generation task filter: before=13 after=13 compromised_tools=[] reset_filter=False
+[coevo-llm] round=4 training LoRA -> outputs/checkpoints/coevolving_llm_defender/round_4
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 5998.40it/s]
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 40/338 [00:00<00:00, 378.05it/s]Loading weights:  30%|██▉       | 100/338 [00:00<00:00, 496.25it/s]Loading weights:  47%|████▋     | 160/338 [00:00<00:00, 537.16it/s]Loading weights:  64%|██████▎   | 215/338 [00:00<00:00, 540.01it/s]Loading weights:  80%|███████▉  | 270/338 [00:00<00:00, 536.91it/s]Loading weights:  97%|█████████▋| 329/338 [00:00<00:00, 545.27it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 540.36it/s]
+{
+  "round_id": 4,
+  "model": "/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct",
+  "input_adapter": "outputs/checkpoints/coevolving_llm_defender/round_3",
+  "output_adapter": "outputs/checkpoints/coevolving_llm_defender/round_4",
+  "candidate_attacks": 39,
+  "successful_attacks": 0,
+  "blocked_attacks": 39,
+  "attack_success_rate": 0.0,
+  "train_records": 65,
+  "mean_reward": 1.6404612961326257,
+  "pre_update_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.26974197421750473,
+    "attack_success_rate": 0.0
+  },
+  "rl_stats": {
+    "updates": 17,
+    "samples": 65,
+    "valid_json_rate": 1.0,
+    "mean_reward": 1.6401896031457013,
+    "mean_advantage": 1.6401896031457013,
+    "mean_loss": 0.00010493815310348089
+  },
+  "heldout_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.5491192757979352,
+    "attack_success_rate": 0.0
+  },
+  "artifacts": {
+    "train_rollouts": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_4_train_rollouts.jsonl",
+    "successful_attacks": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_4_successful_attacks.jsonl"
+  }
+}
+[coevo-llm] round=5 loading defender adapter=outputs/checkpoints/coevolving_llm_defender/round_4
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 40/338 [00:00<00:00, 384.33it/s]Loading weights:  30%|███       | 102/338 [00:00<00:00, 520.22it/s]Loading weights:  47%|████▋     | 160/338 [00:00<00:00, 532.81it/s]Loading weights:  63%|██████▎   | 214/338 [00:00<00:00, 451.48it/s]Loading weights:  77%|███████▋  | 261/338 [00:00<00:00, 401.72it/s]Loading weights:  94%|█████████▍| 317/338 [00:00<00:00, 441.98it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 461.68it/s]
+LLM attack generation task filter: before=13 after=13 compromised_tools=[] reset_filter=False
+[coevo-llm] round=5 training LoRA -> outputs/checkpoints/coevolving_llm_defender/round_5
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 5591.83it/s]
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 40/338 [00:00<00:00, 399.51it/s]Loading weights:  29%|██▉       | 98/338 [00:00<00:00, 491.64it/s]Loading weights:  44%|████▍     | 149/338 [00:00<00:00, 496.79it/s]Loading weights:  61%|██████    | 207/338 [00:00<00:00, 523.02it/s]Loading weights:  79%|███████▉  | 267/338 [00:00<00:00, 549.83it/s]Loading weights:  97%|█████████▋| 327/338 [00:00<00:00, 560.29it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 537.51it/s]
+{
+  "round_id": 5,
+  "model": "/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct",
+  "input_adapter": "outputs/checkpoints/coevolving_llm_defender/round_4",
+  "output_adapter": "outputs/checkpoints/coevolving_llm_defender/round_5",
+  "candidate_attacks": 39,
+  "successful_attacks": 0,
+  "blocked_attacks": 39,
+  "attack_success_rate": 0.0,
+  "train_records": 65,
+  "mean_reward": 1.636416085098382,
+  "pre_update_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.24277390065587837,
+    "attack_success_rate": 0.0
+  },
+  "rl_stats": {
+    "updates": 17,
+    "samples": 65,
+    "valid_json_rate": 1.0,
+    "mean_reward": 1.6345072548148492,
+    "mean_advantage": 1.6345072548148492,
+    "mean_loss": 0.017587644851139953
+  },
+  "heldout_metrics": {
+    "task_success_rate": 1.0,
+    "attack_interception_rate": 1.0,
+    "over_refusal_rate": 0.0,
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "attribution_accuracy": 0.5079035590253643,
+    "attack_success_rate": 0.0
+  },
+  "artifacts": {
+    "train_rollouts": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_5_train_rollouts.jsonl",
+    "successful_attacks": "outputs/checkpoints/coevolving_llm_defender/rollouts/round_5_successful_attacks.jsonl"
+  }
+}

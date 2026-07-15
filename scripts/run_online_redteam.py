@@ -11,11 +11,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from evoguard.agents.defense_agent import DefenseAgent
 from evoguard.attacks.attack_generator import AttackMemory
 from evoguard.attacks.llm_attack_generator import build_api_attack_generator
 from evoguard.envs.text_tool_env import TOOLS, TextToolEnv
 from evoguard.evaluation.baselines import BASELINES, build_baseline_agent
-from evoguard.types import AttackSample, TrajectoryRecord
+from evoguard.evaluation.metrics import compute_metrics
+from evoguard.rewards.combined_reward import RewardWeights, combined_reward
+from evoguard.rollouts.clean_tool_rollout import rollout_clean_tool
+from evoguard.rollouts.no_tool_rollout import rollout_no_tool
+from evoguard.types import AttackSample, Task, TrajectoryRecord
 
 
 def main() -> None:
@@ -57,15 +62,33 @@ def main() -> None:
             continue
 
         successful_attacks.extend(result.samples)
-        evaluated_records.extend(result.successful_cases)
-        evaluated_records.extend(result.blocked_cases)
+        attacked_records = result.successful_cases + result.blocked_cases
+        evaluated_records.extend(attacked_records)
         round_successes = len(result.successful_cases)
         round_blocked = len(result.blocked_cases)
         round_candidates = round_successes + round_blocked
+        train_pool = build_train_pool(
+            agent=agent,
+            env=env,
+            tasks=tasks,
+            attacked_records=attacked_records,
+            round_id=round_id,
+            include_no_tool=not args.no_no_tool,
+            include_clean_tool=not args.no_clean_tool,
+            train_on_successful_attacks_only=args.train_on_successful_attacks_only,
+        )
+        reward_batch = [
+            combined_reward(record, current_round=round_id, max_round=max(1, args.rounds), weights=RewardWeights())
+            for record in train_pool
+        ]
+        policy_updates = 0 if args.no_defender_update else agent.update(train_pool, reward_batch)
+        update_stats = agent.last_update_stats()
+        metrics = compute_metrics(train_pool)
         print(
             "[online-redteam] "
             f"round={round_id} candidates={round_candidates} "
-            f"successes={round_successes} blocked={round_blocked}",
+            f"successes={round_successes} blocked={round_blocked} "
+            f"policy_updates={policy_updates}",
             flush=True,
         )
 
@@ -76,6 +99,10 @@ def main() -> None:
                 "successful_attacks": round_successes,
                 "blocked_attacks": round_blocked,
                 "attack_success_rate": round_successes / round_candidates if round_candidates else 0.0,
+                "train_records": len(train_pool),
+                "policy_updates": policy_updates,
+                "update_stats": update_stats,
+                "metrics": metrics,
             }
         )
 
@@ -91,6 +118,7 @@ def main() -> None:
         "successful_attacks": len(successful_attacks),
         "evaluated_candidates": len(evaluated_records),
         "attack_success_rate": len(successful_attacks) / len(evaluated_records) if evaluated_records else 0.0,
+        "defender_update": not args.no_defender_update,
         "rounds_summary": round_summaries,
         "failures": failures,
         "outputs": {
@@ -114,10 +142,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-indices", default="", help="Comma-separated preferred-tool task indices. Empty means all.")
     parser.add_argument("--max-tokens", type=int, default=1400)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--no-defender-update", action="store_true")
+    parser.add_argument("--no-no-tool", action="store_true")
+    parser.add_argument("--no-clean-tool", action="store_true")
+    parser.add_argument("--train-on-successful-attacks-only", action="store_true")
     parser.add_argument("--attacks-output", default="data/attacks/api_online_redteam_successes.jsonl")
     parser.add_argument("--rollouts-output", default="data/eval/api_online_redteam_rollouts.jsonl")
     parser.add_argument("--summary-output", default="outputs/logs/api_online_redteam_summary.json")
     return parser.parse_args()
+
+
+def build_train_pool(
+    *,
+    agent: DefenseAgent,
+    env: TextToolEnv,
+    tasks: list[Task],
+    attacked_records: list[TrajectoryRecord],
+    round_id: int,
+    include_no_tool: bool,
+    include_clean_tool: bool,
+    train_on_successful_attacks_only: bool,
+) -> list[TrajectoryRecord]:
+    train_pool: list[TrajectoryRecord] = []
+    for task in tasks:
+        if include_no_tool:
+            train_pool.append(rollout_no_tool(agent, task, round_id=round_id))
+        if include_clean_tool:
+            train_pool.append(rollout_clean_tool(agent, env, task, round_id=round_id))
+    if train_on_successful_attacks_only:
+        train_pool.extend(record for record in attacked_records if record.attack_success)
+    else:
+        train_pool.extend(attacked_records)
+    return train_pool
 
 
 def attack_to_dict(attack: AttackSample) -> dict[str, object]:
