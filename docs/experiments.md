@@ -91,6 +91,7 @@ Filtering criterion:
 | ToolSafe SFT | 0.00 | - | - | 0.00 |
 | Filtered RL-v1 | 0.00 | - | - | - |
 | Mixed RL-v1 | 0.00 | - | - | 0.00 |
+| TS-Guard | 1.90 | - | - | - |
 | Self-RedTeam (full) | 100.00 | 100.00 | - | - |
 | Self-RedTeam | 97.14 | 100.00 | - | - |
 
@@ -102,6 +103,7 @@ Filtering criterion:
 | ToolSafe SFT | 100.00 | - | - | 100.00 |
 | Filtered RL-v1 | 100.00 | - | - | - |
 | Mixed RL-v1 | 99.05 | - | - | 100.00 |
+| TS-Guard | 98.10 | - | - | - |
 | Self-RedTeam (full) | 0.00 | 0.00 | - | - |
 | Self-RedTeam | 25.71 | 19.09 | - | - |
 
@@ -115,6 +117,7 @@ Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam
 | ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
 | Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
 | Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| TS-Guard | 0.9810 | 0.9810 | 0.1951 | 0.9315 | 0.0000 |
 | Self-RedTeam (full) | 0.0000 | 0.0000 | 1.0000 | 0.0000 | 0.0000 |
 | Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
 
@@ -505,7 +508,7 @@ Assemble the current defender generalization table across base Qwen, Qwen3Guard,
 - Self-RedTeam: `outputs/logs/baseline_self_redteam.json`
 - Self-RedTeam full: `outputs/logs/baseline_self_redteam_full.json`
 - TS-Guard official checkpoint: `MurrayTom/TS-Guard` on Hugging Face; local target path `/mnt/sata1/beihang_toolsafe/models/TS-Guard`.
-- TS-Guard strict eval target: `outputs/logs/baseline_ts_guard.json` once the checkpoint is available locally.
+- TS-Guard strict eval: `outputs/logs/baseline_ts_guard.json`
 
 ### Results Summary
 
@@ -532,14 +535,23 @@ python scripts/evaluate_llm_safety.py \
   --parser ts_guard \
   --rollouts-jsonl data/eval/toolsafe_heldout_tri_rollouts.jsonl \
   --output outputs/logs/baseline_ts_guard.json \
-  --strict
+  --strict \
+  --max-prompt-length 2048 \
+  --max-new-tokens 512 \
+  --min-valid-json-rate 0.0
 ```
 
-The strict evaluation has not been completed in this workspace because the current machine cannot download the checkpoint: Hugging Face and `hf-mirror.com` both fail after proxy `CONNECT` with TLS EOF, while direct access without proxy times out. The local target directory `/mnt/sata1/beihang_toolsafe/models/TS-Guard` is currently empty, so no TS-Guard metrics are reported and no unsupported TS-Guard row is inserted into the generated tables. Once the checkpoint is available locally and `outputs/logs/baseline_ts_guard.json` exists, `scripts/generate_final_tables.py` will add the `TS-Guard` row automatically.
+The checkpoint was downloaded through the working local proxy endpoint `127.0.0.1:17891`; the default `127.0.0.1:7890` endpoint failed after proxy `CONNECT` with TLS EOF. The first strict run with `max_new_tokens=96` undercounted TS-Guard because outputs were truncated before the official three-label footer. The final run uses `max_new_tokens=512`.
+
+| Defender | Valid JSON | Strict ASR | Attack interception | Task success | FNR | FPR | Over-refusal | Attribution |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TS-Guard | 98.10% | 1.90% | 98.10% | 93.15% | 1.90% | 19.51% | 19.51% | 0.00% |
+
+TS-Guard is a strong public ToolSafe-family baseline under this interface: it nearly matches ToolSafe SFT on harmful interception but has substantially higher over-refusal on clean tool calls. Attribution remains 0.00% because TS-Guard does not emit EvoGuard injection spans.
 
 ### Current Conclusion
 
-The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. Qwen3Guard remains the main public safety baseline with completed strict logs, while EvoGuard ToolSafe SFT is the strongest ToolSafe-format baseline trained directly on TS-Bench-style data. The earlier Self-RedTeam row is a simplified inference-time shared-model red-team baseline and is kept only until the full reproduction finishes. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
+The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. TS-Guard is the closest official ToolSafe-family public baseline and is far stronger than generic Qwen3Guard on ToolSafe held-out, but EvoGuard ToolSafe SFT still has lower ASR and much lower over-refusal on the same action interface. The earlier Self-RedTeam row is a simplified inference-time shared-model red-team baseline and is kept only until the full reproduction finishes. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
 
 ### Full Self-RedTeam Reproduction
 
