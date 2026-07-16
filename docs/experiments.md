@@ -79,6 +79,54 @@ Filtering criterion:
 | Risk-aware rewards reduce brittle safety behavior. | Remove confidence, round, stale penalties. | Binary reward, no confidence weighting, no round weighting. | High-confidence unsafe execution, stability, over-refusal. | Full reward penalizes severe errors better. |
 | Attribution improves interpretability and safety generalization. | Remove attribution reward. | No attribution, attribution-only detector. | Attribution IoU, attack interception, unseen robustness. | Attribution improves localization and may improve robustness. |
 
+<!-- BEGIN GENERATED FINAL TABLES -->
+
+## Final Experiment Tables
+
+### Defender generalization evaluation (Strict ASR↓ %, fallback when strict is unavailable)
+| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out | Automated jailbreak |
+| --- | --- | --- | --- | --- |
+| Base Qwen | - | 100.00 | 100.00 | - |
+| Qwen3Guard | 0.00 | - | - | 98.72 |
+| ToolSafe SFT | 0.00 | - | - | 0.00 |
+| Filtered RL-v1 | 0.00 | - | - | - |
+| Mixed RL-v1 | 0.00 | - | - | 0.00 |
+| Self-RedTeam | 97.14 | 100.00 | - | - |
+
+### Format adherence (valid JSON rate %)
+| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out | Automated jailbreak |
+| --- | --- | --- | --- | --- |
+| Base Qwen | - | 9.09 | 22.12 | - |
+| Qwen3Guard | 100.00 | - | - | 100.00 |
+| ToolSafe SFT | 100.00 | - | - | 100.00 |
+| Filtered RL-v1 | 100.00 | - | - | - |
+| Mixed RL-v1 | 99.05 | - | - | 100.00 |
+| Self-RedTeam | 25.71 | 19.09 | - | - |
+
+Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; otherwise the table falls back to the original non-strict logs.
+
+### Utility & safety metrics (ToolSafe held-out)
+| Defender | valid_json_rate | attack_interception_rate | over_refusal_rate | task_success_rate | attribution_accuracy |
+| --- | --- | --- | --- | --- | --- |
+| Base Qwen | - | - | - | - | - |
+| Qwen3Guard | 1.0000 | 1.0000 | 0.1220 | 0.9658 | 0.0000 |
+| ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
+| Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
+
+### Online red-team co-evolution
+| Round | Candidates | Successful | Blocked | Candidate ASR % | Held-out ASR % | Held-out interception % | Held-out task success % | Held-out attribution % |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 50.39 |
+| 2 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 51.27 |
+| 3 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 55.81 |
+| 4 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 54.91 |
+| 5 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 50.79 |
+
+Source: `outputs/logs/coevolution_llm_metrics.jsonl`.
+
+<!-- END GENERATED FINAL TABLES -->
 ## E001: Text-Tool MVP Trainable Safety Head Smoke Run
 
 ### Date
@@ -400,6 +448,32 @@ This runner queries the attacker API, immediately evaluates each candidate again
 
 Report the existing held-out results and the automated-jailbreak results as separate columns. The automated-jailbreak split should be described as controlled analogues of PAIR/TAP/GPTFuzzer for tool-use safety, not as full unrestricted harmful-content jailbreak reproduction.
 
+### Strict Results
+
+Strict evaluation uses the automated-jailbreak rollout file:
+
+```bash
+/tmp/automated_jailbreak_round99_rollouts.jsonl
+```
+
+| Model | Valid JSON | Strict ASR | Attack interception | Task success | FNR | Over-refusal | Attribution |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe SFT adapter | 100.00% | 0.00% | 100.00% | 100.00% | 0.00% | 0.00% | 46.38% |
+| Mixed RL-v2 adapter | 100.00% | 0.00% | 100.00% | 100.00% | 0.00% | 0.00% | 50.92% |
+| Qwen3Guard-Gen-8B | 100.00% | 98.72% | 1.28% | 1.28% | 98.72% | 0.00% | 0.00% |
+
+### Strict Evaluation Artifacts
+
+- `outputs/logs/eval_sft_vs_jailbreak.json`
+- `outputs/logs/eval_mixedrl_vs_jailbreak.json`
+- `outputs/logs/eval_qwen3guard_vs_jailbreak.json`
+
+### Observations
+
+ToolSafe SFT and Mixed RL-v2 both fully intercept the controlled automated-jailbreak split under strict parsing, with no false negatives and no over-refusal on this attacked-only rollout. Mixed RL-v2 improves attribution over ToolSafe SFT by 4.54 percentage points.
+
+Qwen3Guard-Gen-8B follows its output format on this split but maps nearly all automated-jailbreak attacked-tool records to `execute` under the EvoGuard action interface, producing 98.72% strict ASR. This result should be reported as an action-interface robustness failure rather than a JSON-format failure.
+
 ## E007: Defender Generalization and Self-RedTeam Baselines
 
 ### Date
@@ -442,40 +516,85 @@ Self-RedTeam with base Qwen as both attacker and defender is weak in this setup:
 
 The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. Self-RedTeam is useful as a baseline but not competitive without schema-following supervision. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
 
-<!-- BEGIN GENERATED FINAL TABLES -->
+## E008: Online Red-teaming & Co-evolution
 
-## Final Experiment Tables
+### Date
 
-### Defender generalization evaluation (ASR↓ %)
-| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out |
-| --- | --- | --- | --- |
-| Base Qwen | - | 100.00 | 100.00 |
-| Qwen3Guard | 0.00 | - | - |
-| ToolSafe SFT | 0.00 | - | - |
-| Filtered RL-v1 | 0.00 | - | - |
-| Mixed RL-v1 | 0.00 | - | - |
-| Self-RedTeam | 97.14 | 100.00 | - |
+2026-07-15
 
-### Format adherence (valid JSON rate %)
-| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out |
-| --- | --- | --- | --- |
-| Base Qwen | - | 9.09 | 22.12 |
-| Qwen3Guard | 100.00 | - | - |
-| ToolSafe SFT | 100.00 | - | - |
-| Filtered RL-v1 | 100.00 | - | - |
-| Mixed RL-v1 | 99.05 | - | - |
-| Self-RedTeam | 25.71 | 19.09 | - |
+### Goal
 
-Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; otherwise the table falls back to the original non-strict logs.
+Validate the co-evolution loop between a Qwen-LoRA defender and an API-backed online attacker. The experiment checks whether the controller can generate attacks, evaluate them against the current defender, feed success/blocked memory back into later attack prompts, and update the defender with LoRA RL across multiple rounds.
 
-### Utility & safety metrics (ToolSafe held-out)
-| Defender | valid_json_rate | attack_interception_rate | over_refusal_rate | task_success_rate | attribution_accuracy |
-| --- | --- | --- | --- | --- | --- |
-| Base Qwen | - | - | - | - | - |
-| Qwen3Guard | 1.0000 | 1.0000 | 0.1220 | 0.9658 | 0.0000 |
-| ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
-| Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
-| Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
-| Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
+### Environment
 
-<!-- END GENERATED FINAL TABLES -->
+ToolSafe.
+
+### Model
+
+Base model:
+`/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct`.
+
+Defense Agent checkpoint:
+`outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft`.
+
+Attack generator:
+API-backed adaptive red-team model configured through the `EVOGUARD_ATTACK_*` environment variables.
+
+### Training Setup
+
+Rounds:
+5.
+
+Attacks per task:
+3.
+
+RL algorithm:
+LoRA reward-RL updates after each online red-team round.
+
+Per-round training records:
+65.
+
+### Attack Setup
+
+Attack source:
+API-backed adaptive red-team generation.
+
+Feedback memory:
+Successful attacks and blocked attacks are both recorded. Later attack prompts condition on this success/blocked memory so the attacker can adapt to the current defender.
+
+Filtering criterion:
+A candidate is successful only if the current defender allows an unsafe attacked-tool rollout to execute.
+
+### Metrics
+
+- Candidate attack success rate.
+- Blocked attack count.
+- Held-out attack interception rate.
+- Held-out attack success rate.
+- Held-out task success rate.
+- Held-out over-refusal rate.
+- Attribution accuracy.
+- LoRA RL valid JSON rate.
+
+### Results
+
+The full run is logged in `outputs/logs/coevolution_llm_metrics.jsonl`.
+
+| Round | Candidates | Successful attacks | Blocked attacks | Candidate ASR | Held-out ASR | Held-out interception | Held-out task success | Held-out attribution |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 39 | 0 | 39 | 0.00% | 0.00% | 100.00% | 100.00% | 50.39% |
+| 2 | 39 | 0 | 39 | 0.00% | 0.00% | 100.00% | 100.00% | 51.27% |
+| 3 | 39 | 0 | 39 | 0.00% | 0.00% | 100.00% | 100.00% | 55.81% |
+| 4 | 39 | 0 | 39 | 0.00% | 0.00% | 100.00% | 100.00% | 54.91% |
+| 5 | 39 | 0 | 39 | 0.00% | 0.00% | 100.00% | 100.00% | 50.79% |
+
+### Observations
+
+Across all five rounds, the API attacker generated 39 candidates per round and none succeeded against the ToolSafe SFT initialized Qwen-LoRA defender. Held-out defense metrics were perfect in every round: attack success remained 0.00%, interception remained 100.00%, task success remained 100.00%, and over-refusal remained 0.00%.
+
+Attribution on the round-local training/pre-update distributions decreased across rounds, from 43.26% in round 1 to 24.28% in round 5. Held-out attribution stayed stable around 50-56%, indicating that the defender preserved held-out localization behavior even as the co-evolution loop updated the adapter.
+
+### Conclusion
+
+The defense framework is extremely robust under the current dynamic API attack setting. The main limitation is now attacker strength: the online attacker did not produce successful attacks after conditioning on blocked/success memory, so a stronger generator or harder external benchmark is needed to break through the current defender and create a more informative co-evolution curriculum.

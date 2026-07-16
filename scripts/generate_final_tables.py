@@ -9,6 +9,7 @@ from typing import Any
 
 
 OUTPUT_PATH = Path("docs/experiments.md")
+COEVOLUTION_LOG = Path("outputs/logs/coevolution_llm_metrics.jsonl")
 
 
 def first_existing_log(*paths: Path) -> Path:
@@ -31,15 +32,18 @@ LOGS = {
     },
     "Qwen3Guard": {
         "toolsafe": Path("outputs/logs/baseline_qwen3guard.json"),
+        "jailbreak": Path("outputs/logs/eval_qwen3guard_vs_jailbreak.json"),
     },
     "ToolSafe SFT": {
         "toolsafe": Path("outputs/logs/eval_sft_toolsafe.json"),
+        "jailbreak": Path("outputs/logs/eval_sft_vs_jailbreak.json"),
     },
     "Filtered RL-v1": {
         "toolsafe": Path("outputs/logs/eval_rl_v1_filtered.json"),
     },
     "Mixed RL-v1": {
         "toolsafe": Path("outputs/logs/eval_rl_mixed_v2.json"),
+        "jailbreak": Path("outputs/logs/eval_mixedrl_vs_jailbreak.json"),
     },
 }
 
@@ -60,6 +64,7 @@ GENERALIZATION_COLUMNS = [
     ("ToolSafe held-out harmful", "toolsafe"),
     ("LLM-r1", "llm_r1"),
     ("Hard held-out", "hard"),
+    ("Automated jailbreak", "jailbreak"),
 ]
 
 UTILITY_COLUMNS = [
@@ -89,6 +94,8 @@ def main() -> None:
             render_valid_json_table(loaded),
             "",
             render_utility_table(loaded),
+            "",
+            render_coevolution_table(load_coevolution(COEVOLUTION_LOG)),
             "",
             "<!-- END GENERATED FINAL TABLES -->",
             "",
@@ -132,7 +139,7 @@ def select_dataset(payload: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def render_generalization_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
-    lines = ["### Defender generalization evaluation (ASR↓ %)"]
+    lines = ["### Defender generalization evaluation (Strict ASR↓ %, fallback when strict is unavailable)"]
     header = ["Defender", *[name for name, _ in GENERALIZATION_COLUMNS]]
     lines.append(markdown_row(header))
     lines.append(markdown_separator(len(header)))
@@ -177,6 +184,64 @@ def render_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
     return "\n".join(lines)
 
 
+def load_coevolution(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        print(f"warning: missing co-evolution log file: {path}")
+        return []
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(f"warning: invalid JSON in {path}:{line_number}: {exc}")
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def render_coevolution_table(rows: list[dict[str, Any]]) -> str:
+    lines = ["### Online red-team co-evolution"]
+    header = [
+        "Round",
+        "Candidates",
+        "Successful",
+        "Blocked",
+        "Candidate ASR %",
+        "Held-out ASR %",
+        "Held-out interception %",
+        "Held-out task success %",
+        "Held-out attribution %",
+    ]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    if not rows:
+        lines.append(markdown_row(["-"] * len(header)))
+        return "\n".join(lines)
+    for row in rows:
+        heldout = row.get("heldout_metrics") if isinstance(row.get("heldout_metrics"), dict) else {}
+        lines.append(
+            markdown_row(
+                [
+                    str(row.get("round_id", "-")),
+                    str(row.get("candidate_attacks", "-")),
+                    str(row.get("successful_attacks", "-")),
+                    str(row.get("blocked_attacks", "-")),
+                    format_percent(float_or_none(row.get("attack_success_rate"))),
+                    format_percent(float_or_none(heldout.get("attack_success_rate"))),
+                    format_percent(float_or_none(heldout.get("attack_interception_rate"))),
+                    format_percent(float_or_none(heldout.get("task_success_rate"))),
+                    format_percent(float_or_none(heldout.get("attribution_accuracy"))),
+                ]
+            )
+        )
+    lines.append("")
+    lines.append(f"Source: `{COEVOLUTION_LOG}`.")
+    return "\n".join(lines)
+
+
 def valid_json_rate(payload: dict[str, Any] | None) -> float | None:
     if not payload:
         return None
@@ -202,6 +267,10 @@ def format_float(value: Any) -> str:
     return "-" if value is None else f"{float(value):.4f}"
 
 
+def float_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, int | float) else None
+
+
 def markdown_row(cells: list[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
@@ -222,9 +291,20 @@ def write_or_replace(path: Path, markdown: str) -> None:
     end_index = current.find(end)
     if start_index >= 0 and end_index >= start_index:
         end_index += len(end)
-        updated = current[:start_index].rstrip() + "\n\n" + markdown + current[end_index:].lstrip()
+        without_existing = current[:start_index].rstrip() + "\n\n" + current[end_index:].lstrip()
     else:
-        updated = current.rstrip() + "\n\n" + markdown
+        without_existing = current
+    first_experiment = "\n## E001:"
+    insertion_index = without_existing.find(first_experiment)
+    if insertion_index >= 0:
+        updated = (
+            without_existing[:insertion_index].rstrip()
+            + "\n\n"
+            + markdown
+            + without_existing[insertion_index:].lstrip()
+        )
+    else:
+        updated = without_existing.rstrip() + "\n\n" + markdown
     path.write_text(updated, encoding="utf-8")
 
 
