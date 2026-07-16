@@ -48,6 +48,13 @@ LOGS = {
 }
 
 OPTIONAL_LOGS = {
+    "TS-Guard": {
+        "toolsafe": Path("outputs/logs/baseline_ts_guard.json"),
+    },
+    "Self-RedTeam (full)": {
+        "toolsafe": Path("outputs/logs/baseline_self_redteam_full.json"),
+        "llm_r1": Path("outputs/logs/baseline_self_redteam_full.json"),
+    },
     "Self-RedTeam": {
         "toolsafe": first_existing_log(
             Path("outputs/logs/baseline_self_redteam_strict.json"),

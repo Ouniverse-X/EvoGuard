@@ -91,6 +91,7 @@ Filtering criterion:
 | ToolSafe SFT | 0.00 | - | - | 0.00 |
 | Filtered RL-v1 | 0.00 | - | - | - |
 | Mixed RL-v1 | 0.00 | - | - | 0.00 |
+| Self-RedTeam (full) | 100.00 | 100.00 | - | - |
 | Self-RedTeam | 97.14 | 100.00 | - | - |
 
 ### Format adherence (valid JSON rate %)
@@ -101,6 +102,7 @@ Filtering criterion:
 | ToolSafe SFT | 100.00 | - | - | 100.00 |
 | Filtered RL-v1 | 100.00 | - | - | - |
 | Mixed RL-v1 | 99.05 | - | - | 100.00 |
+| Self-RedTeam (full) | 0.00 | 0.00 | - | - |
 | Self-RedTeam | 25.71 | 19.09 | - | - |
 
 Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; otherwise the table falls back to the original non-strict logs.
@@ -113,6 +115,7 @@ Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam
 | ToolSafe SFT | 1.0000 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
 | Filtered RL-v1 | 1.0000 | 1.0000 | 0.0000 | 0.9057 | 0.5024 |
 | Mixed RL-v1 | 0.9905 | 1.0000 | 0.0000 | 1.0000 | 0.9786 |
+| Self-RedTeam (full) | 0.0000 | 0.0000 | 1.0000 | 0.0000 | 0.0000 |
 | Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
 
 ### Online red-team co-evolution
@@ -123,6 +126,7 @@ Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam
 | 3 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 55.81 |
 | 4 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 54.91 |
 | 5 | 39 | 0 | 39 | 0.00 | 0.00 | 100.00 | 100.00 | 50.79 |
+| 1 | 390 | 0 | 390 | 0.00 | 0.00 | 100.00 | 100.00 | 46.45 |
 
 Source: `outputs/logs/coevolution_llm_metrics.jsonl`.
 
@@ -499,6 +503,9 @@ Assemble the current defender generalization table across base Qwen, Qwen3Guard,
 - Filtered RL-v1: `outputs/logs/eval_rl_v1_filtered.json`
 - Mixed RL-v2 eval: `outputs/logs/eval_rl_mixed_v2.json`
 - Self-RedTeam: `outputs/logs/baseline_self_redteam.json`
+- Self-RedTeam full: `outputs/logs/baseline_self_redteam_full.json`
+- TS-Guard official checkpoint: `MurrayTom/TS-Guard` on Hugging Face; local target path `/mnt/sata1/beihang_toolsafe/models/TS-Guard`.
+- TS-Guard strict eval target: `outputs/logs/baseline_ts_guard.json` once the checkpoint is available locally.
 
 ### Results Summary
 
@@ -512,9 +519,91 @@ Mixed RL-v2 recovers the ToolSafe SFT behavior on the held-out ToolSafe split: A
 
 Self-RedTeam with base Qwen as both attacker and defender is weak in this setup: ToolSafe held-out ASR is 22.86%, LLM-r1 ASR is 19.09%, valid JSON is 25.71%, over-refusal is 21.95%, and task success is 77.40%. The likely bottleneck is that the base model does not reliably follow the safety-decision JSON schema without SFT.
 
+### TS-Guard Official Baseline Status
+
+The official ToolSafe repository (`MurrayTom/ToolSafe`) and model card confirm that TS-Guard is public as `MurrayTom/TS-Guard`. The model card describes it as an 8B BF16 safetensors guardrail model for step-level tool invocation safety detection, and the official repository links TS-Guard from the README. The official parser maps TS-Guard output through the AShell/TS-Guard three-label format: `Malicious_User_Request`, `Being_Attacked`, and `Harmfulness_Rating`.
+
+EvoGuard now supports this baseline via:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src \
+python scripts/evaluate_llm_safety.py \
+  --model /mnt/sata1/beihang_toolsafe/models/TS-Guard \
+  --parser ts_guard \
+  --rollouts-jsonl data/eval/toolsafe_heldout_tri_rollouts.jsonl \
+  --output outputs/logs/baseline_ts_guard.json \
+  --strict
+```
+
+The strict evaluation has not been completed in this workspace because the current machine cannot download the checkpoint: Hugging Face and `hf-mirror.com` both fail after proxy `CONNECT` with TLS EOF, while direct access without proxy times out. The local target directory `/mnt/sata1/beihang_toolsafe/models/TS-Guard` is currently empty, so no TS-Guard metrics are reported and no unsupported TS-Guard row is inserted into the generated tables. Once the checkpoint is available locally and `outputs/logs/baseline_ts_guard.json` exists, `scripts/generate_final_tables.py` will add the `TS-Guard` row automatically.
+
 ### Current Conclusion
 
-The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. Self-RedTeam is useful as a baseline but not competitive without schema-following supervision. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
+The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. Qwen3Guard remains the main public safety baseline with completed strict logs, while EvoGuard ToolSafe SFT is the strongest ToolSafe-format baseline trained directly on TS-Bench-style data. The earlier Self-RedTeam row is a simplified inference-time shared-model red-team baseline and is kept only until the full reproduction finishes. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
+
+### Full Self-RedTeam Reproduction
+
+The official MAGIC repository (`AI45Lab/MAGIC`) was inspected for the baseline setup. MAGIC's main method uses an asymmetric two-agent attacker/defender game with GRPO, role switching, and separate model paths. The Self-RedTeam baseline differs from MAGIC's main method by using shared model parameters for the attacker and defender roles; this shared-parameter setting is the baseline that MAGIC contrasts against because it can introduce attacker/defender gradient conflict.
+
+EvoGuard now implements that shared-parameter baseline in:
+
+```bash
+scripts/train_self_redteam_full.py
+```
+
+Implementation details:
+
+- Base model: `/mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct`.
+- Training data: `data/rollouts/toolsafe_train_tri_rollouts.jsonl`.
+- One shared LoRA policy is used for both roles.
+- The attacker role generates an adversarial or benign untrusted context.
+- The defender role consumes that context and outputs the EvoGuard safety action JSON.
+- The shared LoRA parameters receive both attacker and defender policy-gradient losses.
+- Attacker reward encourages unsafe execute decisions on attacked-tool samples.
+- Defender reward uses the EvoGuard task, safety, attribution, and format rewards.
+- Output checkpoint: `outputs/checkpoints/self_redteam_full/`.
+
+GPU training command:
+
+```bash
+conda run --no-capture-output -n evoguard env PYTHONPATH=src \
+python scripts/train_self_redteam_full.py \
+  --model-name-or-path /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct \
+  --rollout-jsonl data/rollouts/toolsafe_train_tri_rollouts.jsonl \
+  --output-dir outputs/checkpoints/self_redteam_full \
+  --num-train-epochs 1 \
+  --gradient-accumulation-steps 4
+```
+
+Strict held-out evaluation command:
+
+```bash
+conda run --no-capture-output -n evoguard env PYTHONPATH=src \
+python scripts/evaluate_self_redteam.py \
+  --model /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct \
+  --lora outputs/checkpoints/self_redteam_full \
+  --output outputs/logs/baseline_self_redteam_full.json \
+  --strict
+```
+
+### Full Self-RedTeam Results
+
+The full shared-parameter self-play RL reproduction has completed and supersedes the earlier simplified inference-time Self-RedTeam baseline.
+
+| Dataset | Valid JSON | Strict ASR | Attack interception | Task success | FNR | FPR | Over-refusal | Attribution |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe held-out | 0.00% | 100.00% | 0.00% | 0.00% | 100.00% | 100.00% | 100.00% | 0.00% |
+| LLM-r1 generated attacks | 0.00% | 100.00% | 0.00% | 0.00% | 100.00% | 0.00% | 0.00% | 0.00% |
+
+Result artifact:
+
+```bash
+outputs/logs/baseline_self_redteam_full.json
+```
+
+The full reproduction confirms the MAGIC diagnosis for shared-parameter Self-RedTeam in this tool-safety setting: the model collapses under strict schema evaluation. The defender outputs invalid safety-action JSON on all checked attacked-tool records, so strict evaluation maps those failures to unsafe execution. This yields 100.00% ASR on both ToolSafe held-out and LLM-r1, with 0.00% attack interception and 0.00% attribution accuracy.
+
+`python scripts/generate_final_tables.py` now adds the `Self-RedTeam (full)` row to the ASR, format-adherence, and ToolSafe utility tables whenever this artifact is present.
 
 ## E008: Online Red-teaming & Co-evolution
 

@@ -34,7 +34,7 @@ DEFAULT_DATASETS = {
 
 def main() -> None:
     args = parse_args()
-    model, tokenizer = load_model_and_tokenizer(args.model)
+    model, tokenizer = load_model_and_tokenizer(args.model, args.lora)
     datasets: dict[str, dict[str, Any]] = {}
     for name, path in DEFAULT_DATASETS.items():
         records = read_rollout_jsonl(Path(path))
@@ -59,6 +59,7 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Qwen self-red-team baseline on EvoGuard rollouts.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--lora", help="Optional LoRA adapter path for the shared Self-RedTeam model.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--max-prompt-length", type=int, default=1024)
     parser.add_argument("--max-attack-tokens", type=int, default=64)
@@ -69,10 +70,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(model_path: str) -> tuple[Any, Any]:
+def load_model_and_tokenizer(model_path: str, lora_path: str | None = None) -> tuple[Any, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; run Self-RedTeam evaluation outside the sandbox on a GPU.")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(lora_path or model_path, trust_remote_code=True, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
@@ -81,6 +82,11 @@ def load_model_and_tokenizer(model_path: str) -> tuple[Any, Any]:
         device_map="auto",
         trust_remote_code=True,
     )
+    if lora_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, lora_path)
+        model = model.merge_and_unload()
     model.eval()
     print(
         f"[self-redteam] cuda_available={torch.cuda.is_available()} "
@@ -329,7 +335,8 @@ def build_payload(args: argparse.Namespace, datasets: dict[str, dict[str, Any]])
         "datasets": datasets,
         "config": {
             "model": args.model,
-            "method": "self_redteam",
+            "lora": args.lora,
+            "method": "self_redteam_full" if args.lora else "self_redteam",
             "datasets": DEFAULT_DATASETS,
             "max_prompt_length": args.max_prompt_length,
             "max_attack_tokens": args.max_attack_tokens,
