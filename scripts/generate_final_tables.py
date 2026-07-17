@@ -97,6 +97,36 @@ TS_BENCH_COLUMNS = [
     ("ASB", "tsbench_asb"),
 ]
 
+TRACESAFE_STRICT_LOGS = {
+    "Qwen3Guard": Path("outputs/logs/baseline_qwen3guard_tracesafe.json"),
+    "ToolSafe SFT": Path("outputs/logs/eval_sft_tracesafe.json"),
+    "Mixed RL-v1": Path("outputs/logs/eval_mixedrl_tracesafe.json"),
+    "TS-Guard": Path("outputs/logs/baseline_ts_guard_tracesafe.json"),
+}
+
+TRACESAFE_SEMANTIC_LOGS = {
+    "Qwen3Guard": Path("outputs/logs/baseline_qwen3guard_tracesafe_semantic.json"),
+    "ToolSafe SFT": Path("outputs/logs/eval_sft_tracesafe_semantic.json"),
+    "Mixed RL-v1": Path("outputs/logs/eval_mixedrl_tracesafe_semantic.json"),
+    "TS-Guard": Path("outputs/logs/baseline_ts_guard_tracesafe_semantic.json"),
+}
+
+TRACESAFE_CATEGORY_ORDER = [
+    "PromptInjectionIn",
+    "PromptInjectionOut",
+    "UserInfoLeak",
+    "ApiKeyLeak",
+    "DataLeak",
+    "AmbiguousArg",
+    "HallucinatedTool",
+    "HallucinatedArgValue",
+    "RedundantArg",
+    "MissingTypeHint",
+    "VersionConflict",
+    "DescriptionMismatch",
+    "benign",
+]
+
 UTILITY_COLUMNS = [
     "valid_json_rate",
     "attack_interception_rate",
@@ -113,28 +143,42 @@ def main() -> None:
             logs[name] = mapping
 
     loaded = load_all(logs)
-    markdown = "\n".join(
+    tracesafe_strict_loaded = load_tracesafe_logs(TRACESAFE_STRICT_LOGS)
+    tracesafe_semantic_loaded = load_tracesafe_logs(TRACESAFE_SEMANTIC_LOGS)
+    sections = [
+        "<!-- BEGIN GENERATED FINAL TABLES -->",
+        "",
+        "## Final Experiment Tables",
+        "",
+        render_generalization_table(loaded),
+        "",
+        render_tsbench_asr_table(loaded),
+        "",
+        render_valid_json_table(loaded),
+        "",
+        render_utility_table(loaded),
+        "",
+        render_tsbench_utility_table(loaded),
+        "",
+    ]
+    if tracesafe_strict_loaded or tracesafe_semantic_loaded:
+        sections.extend(
+            [
+                render_tracesafe_overall_table(tracesafe_strict_loaded, tracesafe_semantic_loaded),
+                "",
+                render_tracesafe_category_asr_table(tracesafe_semantic_loaded, mode="semantic"),
+                "",
+            ]
+        )
+    sections.extend(
         [
-            "<!-- BEGIN GENERATED FINAL TABLES -->",
-            "",
-            "## Final Experiment Tables",
-            "",
-            render_generalization_table(loaded),
-            "",
-            render_tsbench_asr_table(loaded),
-            "",
-            render_valid_json_table(loaded),
-            "",
-            render_utility_table(loaded),
-            "",
-            render_tsbench_utility_table(loaded),
-            "",
             render_coevolution_table(load_coevolution(COEVOLUTION_LOG)),
             "",
             "<!-- END GENERATED FINAL TABLES -->",
             "",
         ]
     )
+    markdown = "\n".join(sections)
     write_or_replace(OUTPUT_PATH, markdown)
     print(markdown)
 
@@ -163,6 +207,21 @@ def load_json(path: Path) -> dict[str, Any] | None:
         print(f"warning: expected object in {path}")
         return None
     return payload
+
+
+def load_tracesafe_logs(logs: dict[str, Path]) -> dict[str, dict[str, Any]]:
+    loaded: dict[str, dict[str, Any]] = {}
+    for defender, path in logs.items():
+        payload = load_optional_json(path)
+        if payload is not None:
+            loaded[defender] = payload
+    return loaded
+
+
+def load_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return load_json(path)
 
 
 def select_dataset(payload: dict[str, Any], key: str) -> dict[str, Any]:
@@ -252,6 +311,77 @@ def render_tsbench_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -
             row.append(format_percent(metric(payload, "over_refusal_rate")))
         lines.append(markdown_row(row))
     return "\n".join(lines)
+
+
+def render_tracesafe_overall_table(
+    strict_loaded: dict[str, dict[str, Any]],
+    semantic_loaded: dict[str, dict[str, Any]],
+) -> str:
+    lines = ["### TraceSafe-Bench external generalization (strict vs semantic)"]
+    header = [
+        "Defender",
+        "Strict ASR↓",
+        "Strict valid↑",
+        "Semantic ASR↓",
+        "Semantic interception↑",
+        "Semantic over-refusal↓",
+        "Semantic task↑",
+        "Semantic parse↑",
+    ]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    defenders = list(dict.fromkeys([*strict_loaded.keys(), *semantic_loaded.keys()]))
+    if not defenders:
+        lines.append(markdown_row(["-"] * len(header)))
+        return "\n".join(lines)
+    for defender in defenders:
+        strict_payload = strict_loaded.get(defender)
+        semantic_payload = semantic_loaded.get(defender)
+        lines.append(
+            markdown_row(
+                [
+                    defender,
+                    format_percent(metric(strict_payload, "attack_success_rate")),
+                    format_percent(valid_json_rate(strict_payload)),
+                    format_percent(metric(semantic_payload, "attack_success_rate")),
+                    format_percent(metric(semantic_payload, "attack_interception_rate")),
+                    format_percent(metric(semantic_payload, "over_refusal_rate")),
+                    format_percent(metric(semantic_payload, "task_success_rate")),
+                    format_percent(valid_json_rate(semantic_payload)),
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_tracesafe_category_asr_table(loaded: dict[str, dict[str, Any]], *, mode: str) -> str:
+    lines = [f"### TraceSafe-Bench per-category ASR↓ % ({mode})"]
+    defenders = list(loaded)
+    header = ["Category", *defenders]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    if not loaded:
+        lines.append(markdown_row(["-"] * len(header)))
+        return "\n".join(lines)
+    categories = tracesafe_categories_present(loaded)
+    for category in categories:
+        row = [category]
+        for defender in defenders:
+            category_payload = loaded[defender].get("category_metrics", {}).get(category)
+            row.append(format_percent(metric(category_payload, "attack_success_rate")))
+        lines.append(markdown_row(row))
+    return "\n".join(lines)
+
+
+def tracesafe_categories_present(loaded: dict[str, dict[str, Any]]) -> list[str]:
+    present: set[str] = set()
+    for payload in loaded.values():
+        category_metrics = payload.get("category_metrics")
+        if isinstance(category_metrics, dict):
+            present.update(str(category) for category in category_metrics)
+    ordered = [category for category in TRACESAFE_CATEGORY_ORDER if category in present]
+    ordered.extend(sorted(present - set(ordered)))
+    return ordered
 
 
 def load_coevolution(path: Path) -> list[dict[str, Any]]:

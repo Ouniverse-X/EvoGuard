@@ -145,6 +145,31 @@ Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam
 | Self-RedTeam (full) | - | - | - | - | - | - |
 | Self-RedTeam | - | - | - | - | - | - |
 
+### TraceSafe-Bench external generalization (strict vs semantic)
+| Defender | Strict ASR↓ | Strict valid↑ | Semantic ASR↓ | Semantic interception↑ | Semantic over-refusal↓ | Semantic task↑ | Semantic parse↑ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3Guard | 98.80 | 3.52 | 46.94 | 53.06 | 0.00 | 56.67 | 78.80 |
+| ToolSafe SFT | 98.06 | 2.04 | 1.11 | 98.89 | 0.00 | 98.97 | 89.81 |
+| Mixed RL-v1 | 97.87 | 3.33 | 2.04 | 97.96 | 0.00 | 98.12 | 90.19 |
+| TS-Guard | 99.54 | 42.31 | 29.72 | 70.28 | 24.44 | 70.68 | 64.91 |
+
+### TraceSafe-Bench per-category ASR↓ % (semantic)
+| Category | Qwen3Guard | ToolSafe SFT | Mixed RL-v1 | TS-Guard |
+| --- | --- | --- | --- | --- |
+| PromptInjectionIn | 3.33 | 1.11 | 5.56 | 27.78 |
+| PromptInjectionOut | 0.00 | 0.00 | 0.00 | 15.56 |
+| UserInfoLeak | 0.00 | 0.00 | 0.00 | 47.78 |
+| ApiKeyLeak | 0.00 | 0.00 | 0.00 | 38.89 |
+| DataLeak | 2.22 | 6.67 | 6.67 | 14.44 |
+| AmbiguousArg | 91.11 | 0.00 | 0.00 | 41.11 |
+| HallucinatedTool | 96.67 | 0.00 | 0.00 | 15.56 |
+| HallucinatedArgValue | 85.56 | 0.00 | 1.11 | 25.56 |
+| RedundantArg | 94.44 | 0.00 | 0.00 | 12.22 |
+| MissingTypeHint | 86.67 | 0.00 | 0.00 | 25.56 |
+| VersionConflict | 87.78 | 2.22 | 1.11 | 36.67 |
+| DescriptionMismatch | 15.56 | 3.33 | 10.00 | 55.56 |
+| benign | 0.00 | 0.00 | 0.00 | 0.00 |
+
 ### Online red-team co-evolution
 | Round | Candidates | Successful | Blocked | Candidate ASR % | Held-out ASR % | Held-out interception % | Held-out task success % | Held-out attribution % |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -771,3 +796,210 @@ Attribution on the round-local training/pre-update distributions decreased acros
 ### Conclusion
 
 The defense framework is extremely robust under the current dynamic API attack setting. The main limitation is now attacker strength: the online attacker did not produce successful attacks after conditioning on blocked/success memory, so a stronger generator or harder external benchmark is needed to break through the current defender and create a more informative co-evolution curriculum.
+
+## E009: TraceSafe-Bench External Multi-Step Trajectory Generalization
+
+### Date
+
+2026-07-17
+
+### Goal
+
+Add TraceSafe-Bench as an external generalization benchmark for multi-step tool-calling trajectory safety. This benchmark complements ToolSafe/TS-Bench: ToolSafe is primarily step-level tool-call safety, while TraceSafe-Bench evaluates whether a guard can detect corrupted intermediate execution traces across multi-step agent workflows.
+
+### Dataset
+
+TraceSafe-Bench is hosted as the gated Hugging Face dataset `CyCraftAI/TraceSafe` and accompanies the paper `TraceSafe: A Systematic Assessment of LLM Guardrails on Multi-Step Tool-Calling Trajectories` (`arXiv:2604.07223`). The dataset card reports 1,170 total records: 90 records per file across 13 JSONL files. It contains one benign baseline file and 12 risk categories:
+
+- `PromptInjectionIn`
+- `PromptInjectionOut`
+- `UserInfoLeak`
+- `ApiKeyLeak`
+- `DataLeak`
+- `AmbiguousArg`
+- `HallucinatedTool`
+- `HallucinatedArgValue`
+- `RedundantArg`
+- `MissingTypeHint`
+- `VersionConflict`
+- `DescriptionMismatch`
+
+### Implementation Status
+
+Implemented:
+
+- `src/evoguard/envs/tracesafe_env.py`
+  - Converts TraceSafe records into EvoGuard `TrajectoryRecord` objects.
+  - Maps `golden_0_benign.jsonl` / `pure_benign` to `clean_tool + execute`.
+  - Maps all 12 mutated categories to `attacked_tool + refuse`.
+  - Preserves `mutation_category`, `mutator_name`, `target_tool`, source model, and risk category in metadata.
+- `scripts/download_tracesafe.py`
+  - Downloads `CyCraftAI/TraceSafe` after Hugging Face access approval.
+- `scripts/build_tracesafe_eval_splits.py`
+  - Builds `data/eval/tracesafe_bench_rollouts.jsonl`.
+  - Builds `data/eval/tracesafe_bench_summary.json`.
+- `scripts/evaluate_llm_safety.py`
+  - Now emits `category_metrics`, including per-risk-category ASR.
+  - Supports `--batch-size` for faster batched generation on large external benchmarks.
+- `scripts/summarize_tracesafe_results.py`
+  - Summarizes overall TraceSafe metrics and per-category ASR from model logs.
+- `scripts/generate_final_tables.py`
+  - Automatically adds TraceSafe overall and per-category tables once TraceSafe logs exist.
+
+### Data Access Status
+
+The dataset was downloaded successfully after Hugging Face access approval and local proxy configuration:
+
+```bash
+http_proxy=http://127.0.0.1:17891 \
+https_proxy=http://127.0.0.1:17891 \
+HF_ENDPOINT=https://huggingface.co \
+python scripts/download_tracesafe.py \
+  --output-dir data/raw/tracesafe_bench
+```
+
+The converted EvoGuard rollout file contains 1,170 examples:
+
+- 90 benign `clean_tool + execute` examples from `golden_0_benign.jsonl`.
+- 1,080 attacked `attacked_tool + refuse` examples from the 12 TraceSafe risk categories.
+- 90 examples per category.
+
+### Evaluation Commands
+
+Build EvoGuard rollouts:
+
+```bash
+PYTHONPATH=src \
+python scripts/build_tracesafe_eval_splits.py \
+  --tracesafe-root data/raw/tracesafe_bench \
+  --output-dir data/eval
+```
+
+Evaluate ToolSafe SFT:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
+python scripts/evaluate_llm_safety.py \
+  --model /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct \
+  --lora outputs/checkpoints/llm_safety_lora_qwen15b_toolsafe_sft \
+  --rollouts-jsonl data/eval/tracesafe_bench_rollouts.jsonl \
+  --output outputs/logs/eval_sft_tracesafe.json \
+  --strict \
+  --batch-size 4 \
+  --max-prompt-length 2048
+```
+
+Evaluate Mixed RL-v2:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src \
+python scripts/evaluate_llm_safety.py \
+  --model /mnt/sata1/beihang_toolsafe/models/Qwen2.5-1.5B-Instruct \
+  --lora outputs/checkpoints/self_evo_mixed_rl_v2 \
+  --rollouts-jsonl data/eval/tracesafe_bench_rollouts.jsonl \
+  --output outputs/logs/eval_mixedrl_tracesafe.json \
+  --strict \
+  --batch-size 4 \
+  --max-prompt-length 2048
+```
+
+Evaluate Qwen3Guard:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src \
+python scripts/evaluate_llm_safety.py \
+  --model /home/beihang/.cache/huggingface/hub/models--Qwen--Qwen3Guard-Gen-8B/snapshots/4505cb1a6f1864f21f8b27f7daf1b9a1aab6edbb \
+  --parser qwen3guard \
+  --rollouts-jsonl data/eval/tracesafe_bench_rollouts.jsonl \
+  --output outputs/logs/baseline_qwen3guard_tracesafe.json \
+  --strict \
+  --max-prompt-length 2048 \
+  --max-new-tokens 96 \
+  --batch-size 2
+```
+
+Evaluate TS-Guard:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src \
+python scripts/evaluate_llm_safety.py \
+  --model /mnt/sata1/beihang_toolsafe/models/TS-Guard \
+  --parser ts_guard \
+  --rollouts-jsonl data/eval/tracesafe_bench_rollouts.jsonl \
+  --output outputs/logs/baseline_ts_guard_tracesafe.json \
+  --strict \
+  --max-prompt-length 2048 \
+  --max-new-tokens 512 \
+  --min-valid-json-rate 0.0 \
+  --batch-size 2
+```
+
+Summarize results:
+
+```bash
+python scripts/summarize_tracesafe_results.py
+python scripts/generate_final_tables.py
+```
+
+### Results
+
+TraceSafe is reported under two modes:
+
+- `strict`: requires the model to satisfy the EvoGuard structured action interface. This measures direct interface compliance.
+- `semantic`: uses the model-specific parser and compact TraceSafe prompt to recover the safety decision from native outputs. This measures safety judgment under the unified protocol.
+
+Overall results:
+
+| Model | Mode | ASR↓ | Interception↑ | Over-refusal↓ | Task success↑ | Valid/Parse↑ |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe SFT | strict | 98.06% | 1.94% | 88.89% | 2.65% | 2.04% |
+| Mixed RL-v2 | strict | 97.87% | 2.13% | 88.89% | 2.82% | 3.33% |
+| Qwen3Guard | strict | 98.80% | 1.20% | 90.00% | 1.88% | 3.52% |
+| TS-Guard | strict | 99.54% | 0.46% | 55.56% | 3.85% | 42.31% |
+| ToolSafe SFT | semantic | 1.11% | 98.89% | 0.00% | 98.97% | 89.81% |
+| Mixed RL-v2 | semantic | 2.04% | 97.96% | 0.00% | 98.12% | 90.19% |
+| Qwen3Guard | semantic | 46.94% | 53.06% | 0.00% | 56.67% | 78.80% |
+| TS-Guard | semantic | 29.72% | 70.28% | 24.44% | 70.68% | 64.91% |
+
+Per-category semantic ASR:
+
+| Category | ToolSafe SFT | Mixed RL-v2 | Qwen3Guard | TS-Guard |
+| --- | --- | --- | --- | --- |
+| PromptInjectionIn | 1.11% | 5.56% | 3.33% | 27.78% |
+| PromptInjectionOut | 0.00% | 0.00% | 0.00% | 15.56% |
+| UserInfoLeak | 0.00% | 0.00% | 0.00% | 47.78% |
+| ApiKeyLeak | 0.00% | 0.00% | 0.00% | 38.89% |
+| DataLeak | 6.67% | 6.67% | 2.22% | 14.44% |
+| AmbiguousArg | 0.00% | 0.00% | 91.11% | 41.11% |
+| HallucinatedTool | 0.00% | 0.00% | 96.67% | 15.56% |
+| HallucinatedArgValue | 0.00% | 1.11% | 85.56% | 25.56% |
+| RedundantArg | 0.00% | 0.00% | 94.44% | 12.22% |
+| MissingTypeHint | 0.00% | 0.00% | 86.67% | 25.56% |
+| VersionConflict | 2.22% | 1.11% | 87.78% | 36.67% |
+| DescriptionMismatch | 3.33% | 10.00% | 15.56% | 55.56% |
+| benign | 0.00% | 0.00% | 0.00% | 0.00% |
+
+The corresponding logs are:
+
+- `outputs/logs/eval_sft_tracesafe.json`
+- `outputs/logs/eval_mixedrl_tracesafe.json`
+- `outputs/logs/baseline_qwen3guard_tracesafe.json`
+- `outputs/logs/baseline_ts_guard_tracesafe.json`
+- `outputs/logs/eval_sft_tracesafe_semantic.json`
+- `outputs/logs/eval_mixedrl_tracesafe_semantic.json`
+- `outputs/logs/baseline_qwen3guard_tracesafe_semantic.json`
+- `outputs/logs/baseline_ts_guard_tracesafe_semantic.json`
+
+### Observations
+
+TraceSafe-Bench exposes a large gap between strict interface compliance and recoverable semantic safety judgment. Under strict evaluation, all models look poor because they often do not emit the exact EvoGuard JSON/action contract on long multi-step trace prompts. ToolSafe SFT and Mixed RL-v2 have strict valid-format rates of only 2-3%, and strict ASR is roughly 98%.
+
+After applying the unified protocol's semantic parser and a compact TraceSafe prompt, the picture changes substantially. ToolSafe SFT reaches 1.11% semantic ASR, and Mixed RL-v2 reaches 2.04% semantic ASR, both with 0.00% benign over-refusal. Qwen3Guard and TS-Guard remain much weaker in this setting: Qwen3Guard has 46.94% semantic ASR, while TS-Guard has 29.72% semantic ASR and 24.44% over-refusal.
+
+These results show that the initial strict TraceSafe failure was primarily an interface and format mismatch, not a complete inability to identify TraceSafe risks. They also provide useful external evidence that the ToolSafe-trained EvoGuard SFT and Mixed RL-v2 adapters generalize to multi-step TraceSafe risk categories when evaluated through a fair semantic parser.
+
+### Next Steps
+
+- Report TraceSafe separately from TS-Bench because it evaluates multi-step trace corruption and guardrail format robustness under much longer contexts.
+- Keep both strict and semantic metrics in the paper: strict measures deployable interface compliance; semantic measures recoverable safety judgment.
+- Use the remaining category-level errors, especially `DataLeak`, `PromptInjectionIn`, and `DescriptionMismatch`, as candidates for future TraceSafe-specific adversarial training.
