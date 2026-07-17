@@ -1,0 +1,117 @@
+{
+  "toolsafe_heldout_no_overlap": {
+    "distribution": {
+      "attacked_tool:refuse": 69,
+      "clean_tool:execute": 40
+    },
+    "metrics": {
+      "attack_interception_rate": 1.0,
+      "attack_success_rate": 0.0,
+      "attribution_accuracy": 1.0,
+      "false_negative_rate": 0.0,
+      "false_positive_rate": 0.0,
+      "over_refusal_rate": 0.0,
+      "task_success_rate": 1.0
+    },
+    "path": "data/eval/toolsafe_heldout_no_overlap.jsonl",
+    "records": 109,
+    "removed_exact_overlap": 37,
+    "source": "data/eval/toolsafe_heldout_tri_rollouts.jsonl"
+  },
+  "tsbench_agentdojo": {
+    "distribution": {
+      "attacked_tool:refuse": 352,
+      "clean_tool:execute": 868
+    },
+    "inputs": [
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/banking.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/slack.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/travel.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/workspace.json"
+    ],
+    "metrics": {
+      "attack_interception_rate": 1.0,
+      "attack_success_rate": 0.0,
+      "attribution_accuracy": 1.0,
+      "false_negative_rate": 0.0,
+      "false_positive_rate": 0.0,
+      "over_refusal_rate": 0.0,
+      "task_success_rate": 1.0
+    },
+    "path": "data/eval/tsbench_agentdojo_rollouts.jsonl",
+    "records": 1220
+  },
+  "tsbench_agentharm_full": {
+    "distribution": {
+      "attacked_tool:refuse": 525,
+      "clean_tool:execute": 206
+    },
+    "inputs": [
+      "/tmp/ToolSafe/TS-Bench/agentharm-traj/benign_steps.json",
+      "/tmp/ToolSafe/TS-Bench/agentharm-traj/harmful_steps.json"
+    ],
+    "metrics": {
+      "attack_interception_rate": 1.0,
+      "attack_success_rate": 0.0,
+      "attribution_accuracy": 1.0,
+      "false_negative_rate": 0.0,
+      "false_positive_rate": 0.0,
+      "over_refusal_rate": 0.0,
+      "task_success_rate": 1.0
+    },
+    "path": "data/eval/tsbench_agentharm_full_rollouts.jsonl",
+    "records": 731
+  },
+  "tsbench_all": {
+    "distribution": {
+      "attacked_tool:refuse": 3412,
+      "clean_tool:execute": 3765,
+      "no_tool:execute": 5
+    },
+    "inputs": [
+      "/tmp/ToolSafe/TS-Bench/agentharm-traj/benign_steps.json",
+      "/tmp/ToolSafe/TS-Bench/agentharm-traj/harmful_steps.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/banking.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/slack.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/travel.json",
+      "/tmp/ToolSafe/TS-Bench/agentdojo-traj/workspace.json",
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/DPI_attack_success.json",
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/OPI_attack_success.json",
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/atttack_failure.json"
+    ],
+    "metrics": {
+      "attack_interception_rate": 1.0,
+      "attack_success_rate": 0.0,
+      "attribution_accuracy": 1.0,
+      "false_negative_rate": 0.0,
+      "false_positive_rate": 0.0,
+      "over_refusal_rate": 0.0,
+      "task_success_rate": 1.0
+    },
+    "path": "data/eval/tsbench_all_rollouts.jsonl",
+    "records": 7182
+  },
+  "tsbench_asb": {
+    "distribution": {
+      "attacked_tool:refuse": 2535,
+      "clean_tool:execute": 2691,
+      "no_tool:execute": 5
+    },
+    "inputs": [
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/DPI_attack_success.json",
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/OPI_attack_success.json",
+      "/tmp/ToolSafe/TS-Bench/asb-traj/test/atttack_failure.json"
+    ],
+    "metrics": {
+      "attack_interception_rate": 1.0,
+      "attack_success_rate": 0.0,
+      "attribution_accuracy": 1.0,
+      "false_negative_rate": 0.0,
+      "false_positive_rate": 0.0,
+      "over_refusal_rate": 0.0,
+      "task_success_rate": 1.0
+    },
+    "path": "data/eval/tsbench_asb_rollouts.jsonl",
+    "records": 5231
+  }
+}

@@ -75,6 +75,49 @@ def generate_decision(
     return parse_generated_decision(raw_text)
 
 
+def generate_decisions_batch(
+    model: Any,
+    tokenizer: Any,
+    records: list[TrajectoryRecord],
+    *,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    parser: str,
+) -> list[GeneratedDecision]:
+    prompts = [build_prompt_for_parser(record, tokenizer, parser) for record in records]
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_prompt_length,
+        ).to(model.device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    prompt_width = inputs["input_ids"].shape[-1]
+    decisions: list[GeneratedDecision] = []
+    for row_ids in output_ids[:, prompt_width:]:
+        raw_text = tokenizer.decode(row_ids, skip_special_tokens=True).strip()
+        if parser == "qwen3guard":
+            decisions.append(parse_qwen3guard_decision(raw_text))
+        elif parser == "ts_guard":
+            decisions.append(parse_ts_guard_decision(raw_text))
+        else:
+            decisions.append(parse_generated_decision(raw_text))
+    return decisions
+
+
 def apply_strict_invalid_attack_policy(record: TrajectoryRecord, decision: GeneratedDecision) -> GeneratedDecision:
     if record.trajectory_type != TrajectoryType.ATTACKED_TOOL or decision.valid_json:
         return decision
@@ -242,33 +285,37 @@ def evaluate_records(
     max_failures: int,
     parser: str,
     strict: bool,
+    batch_size: int,
 ) -> dict[str, Any]:
     evaluated: list[TrajectoryRecord] = []
     json_checked = 0
     valid_json = 0
     failures: list[dict[str, Any]] = []
 
-    for record in records:
-        decision = generate_decision(
+    batch_size = max(1, batch_size)
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        decisions = generate_decisions_batch(
             model,
             tokenizer,
-            record,
+            batch,
             max_prompt_length=max_prompt_length,
             max_new_tokens=max_new_tokens,
             parser=parser,
         )
-        if strict:
-            decision = apply_strict_invalid_attack_policy(record, decision)
-        evaluated.append(apply_generated_decision(record, decision))
+        for record, decision in zip(batch, decisions, strict=True):
+            if strict:
+                decision = apply_strict_invalid_attack_policy(record, decision)
+            evaluated.append(apply_generated_decision(record, decision))
 
-        should_check_json = (
-            record.trajectory_type == TrajectoryType.ATTACKED_TOOL if json_check_attacks_only else True
-        )
-        if should_check_json:
-            json_checked += 1
-            valid_json += int(decision.valid_json)
-            if not decision.valid_json and len(failures) < max_failures:
-                failures.append(format_failure(record, decision))
+            should_check_json = (
+                record.trajectory_type == TrajectoryType.ATTACKED_TOOL if json_check_attacks_only else True
+            )
+            if should_check_json:
+                json_checked += 1
+                valid_json += int(decision.valid_json)
+                if not decision.valid_json and len(failures) < max_failures:
+                    failures.append(format_failure(record, decision))
 
     valid_json_rate = valid_json / json_checked if json_checked else 0.0
     metrics = compute_metrics(evaluated)
@@ -321,6 +368,7 @@ def main() -> None:
     parser.add_argument("--parser", choices=("evoguard_json", "qwen3guard", "ts_guard"), default="evoguard_json")
     parser.add_argument("--evaluated-output")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=1)
     args = parser.parse_args()
 
     records = read_rollout_jsonl(Path(args.rollouts_jsonl))
@@ -335,6 +383,7 @@ def main() -> None:
         max_failures=args.max_failures,
         parser=args.parser,
         strict=args.strict,
+        batch_size=args.batch_size,
     )
     payload = {
         **result,
@@ -349,6 +398,7 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "parser": args.parser,
             "strict": args.strict,
+            "batch_size": args.batch_size,
         },
     }
     write_output(Path(args.output), payload)

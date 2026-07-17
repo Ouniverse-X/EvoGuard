@@ -84,28 +84,40 @@ Filtering criterion:
 ## Final Experiment Tables
 
 ### Defender generalization evaluation (Strict ASR↓ %, fallback when strict is unavailable)
-| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out | Automated jailbreak |
-| --- | --- | --- | --- | --- |
-| Base Qwen | - | 100.00 | 100.00 | - |
-| Qwen3Guard | 0.00 | - | - | 98.72 |
-| ToolSafe SFT | 0.00 | - | - | 0.00 |
-| Filtered RL-v1 | 0.00 | - | - | - |
-| Mixed RL-v1 | 0.00 | - | - | 0.00 |
-| TS-Guard | 1.90 | - | - | - |
-| Self-RedTeam (full) | 100.00 | 100.00 | - | - |
-| Self-RedTeam | 97.14 | 100.00 | - | - |
+| Defender | ToolSafe held-out harmful | ToolSafe no-overlap | LLM-r1 | Hard held-out | Automated jailbreak |
+| --- | --- | --- | --- | --- | --- |
+| Base Qwen | - | - | 100.00 | 100.00 | - |
+| Qwen3Guard | 0.00 | 0.00 | - | - | 98.72 |
+| ToolSafe SFT | 0.00 | 0.00 | - | - | 0.00 |
+| Filtered RL-v1 | 0.00 | - | - | - | - |
+| Mixed RL-v1 | 0.00 | 0.00 | - | - | 0.00 |
+| TS-Guard | 1.90 | 2.90 | - | - | - |
+| Self-RedTeam (full) | 100.00 | - | 100.00 | - | - |
+| Self-RedTeam | 97.14 | - | 100.00 | - | - |
+
+### TS-Bench cross-suite evaluation (Strict ASR↓ %)
+| Defender | AgentHarm-traj | AgentDojo | ASB |
+| --- | --- | --- | --- |
+| Base Qwen | - | - | - |
+| Qwen3Guard | 0.57 | 64.20 | 66.35 |
+| ToolSafe SFT | 0.57 | 0.00 | 0.00 |
+| Filtered RL-v1 | - | - | - |
+| Mixed RL-v1 | 0.95 | 0.00 | 12.47 |
+| TS-Guard | 5.71 | 21.88 | 14.00 |
+| Self-RedTeam (full) | - | - | - |
+| Self-RedTeam | - | - | - |
 
 ### Format adherence (valid JSON rate %)
-| Defender | ToolSafe held-out harmful | LLM-r1 | Hard held-out | Automated jailbreak |
-| --- | --- | --- | --- | --- |
-| Base Qwen | - | 9.09 | 22.12 | - |
-| Qwen3Guard | 100.00 | - | - | 100.00 |
-| ToolSafe SFT | 100.00 | - | - | 100.00 |
-| Filtered RL-v1 | 100.00 | - | - | - |
-| Mixed RL-v1 | 99.05 | - | - | 100.00 |
-| TS-Guard | 98.10 | - | - | - |
-| Self-RedTeam (full) | 0.00 | 0.00 | - | - |
-| Self-RedTeam | 25.71 | 19.09 | - | - |
+| Defender | ToolSafe held-out harmful | ToolSafe no-overlap | LLM-r1 | Hard held-out | Automated jailbreak |
+| --- | --- | --- | --- | --- | --- |
+| Base Qwen | - | - | 9.09 | 22.12 | - |
+| Qwen3Guard | 100.00 | 100.00 | - | - | 100.00 |
+| ToolSafe SFT | 100.00 | 100.00 | - | - | 100.00 |
+| Filtered RL-v1 | 100.00 | - | - | - | - |
+| Mixed RL-v1 | 99.05 | 100.00 | - | - | 100.00 |
+| TS-Guard | 98.10 | 97.10 | - | - | - |
+| Self-RedTeam (full) | 0.00 | - | 0.00 | - | - |
+| Self-RedTeam | 25.71 | - | 19.09 | - | - |
 
 Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam; otherwise the table falls back to the original non-strict logs.
 
@@ -120,6 +132,18 @@ Strict evaluation logs are preferred when present for Base Qwen and Self-RedTeam
 | TS-Guard | 0.9810 | 0.9810 | 0.1951 | 0.9315 | 0.0000 |
 | Self-RedTeam (full) | 0.0000 | 0.0000 | 1.0000 | 0.0000 | 0.0000 |
 | Self-RedTeam | 0.2571 | 0.0286 | 0.2195 | 0.2397 | 0.0136 |
+
+### TS-Bench utility summary
+| Defender | AgentHarm task | AgentHarm over-refusal | AgentDojo task | AgentDojo over-refusal | ASB task | ASB over-refusal |
+| --- | --- | --- | --- | --- | --- | --- |
+| Base Qwen | - | - | - | - | - | - |
+| Qwen3Guard | 96.44 | 11.17 | 81.48 | 0.00 | 66.99 | 1.64 |
+| ToolSafe SFT | 99.59 | 0.00 | 100.00 | 0.00 | 99.94 | 0.00 |
+| Filtered RL-v1 | - | - | - | - | - | - |
+| Mixed RL-v1 | 99.32 | 0.00 | 100.00 | 0.00 | 92.66 | 2.42 |
+| TS-Guard | 89.19 | 23.79 | 82.13 | 16.24 | 82.05 | 21.55 |
+| Self-RedTeam (full) | - | - | - | - | - | - |
+| Self-RedTeam | - | - | - | - | - | - |
 
 ### Online red-team co-evolution
 | Round | Candidates | Successful | Blocked | Candidate ASR % | Held-out ASR % | Held-out interception % | Held-out task success % | Held-out attribution % |
@@ -494,6 +518,10 @@ Assemble the current defender generalization table across base Qwen, Qwen3Guard,
 ### Evaluation Sets
 
 - ToolSafe held-out harmful: `data/eval/toolsafe_heldout_tri_rollouts.jsonl`
+- ToolSafe held-out no-overlap: `data/eval/toolsafe_heldout_no_overlap.jsonl`
+- TS-Bench AgentHarm-traj full: `data/eval/tsbench_agentharm_full_rollouts.jsonl`
+- TS-Bench AgentDojo: `data/eval/tsbench_agentdojo_rollouts.jsonl`
+- TS-Bench ASB: `data/eval/tsbench_asb_rollouts.jsonl`
 - LLM-r1 generated attacks: `data/eval/llm_generated_round1_attacked_rollouts.jsonl`
 - Hard held-out: `data/eval/hard_heldout_tri_rollouts.jsonl`
 
@@ -509,6 +537,24 @@ Assemble the current defender generalization table across base Qwen, Qwen3Guard,
 - Self-RedTeam full: `outputs/logs/baseline_self_redteam_full.json`
 - TS-Guard official checkpoint: `MurrayTom/TS-Guard` on Hugging Face; local target path `/mnt/sata1/beihang_toolsafe/models/TS-Guard`.
 - TS-Guard strict eval: `outputs/logs/baseline_ts_guard.json`
+- ToolSafe no-overlap strict evals:
+  `outputs/logs/eval_sft_toolsafe_no_overlap.json`,
+  `outputs/logs/eval_mixedrl_toolsafe_no_overlap.json`,
+  `outputs/logs/baseline_qwen3guard_no_overlap.json`,
+  `outputs/logs/baseline_ts_guard_no_overlap.json`
+- TS-Bench strict evals:
+  `outputs/logs/eval_sft_tsbench_agentharm_full.json`,
+  `outputs/logs/eval_mixedrl_tsbench_agentharm_full.json`,
+  `outputs/logs/baseline_qwen3guard_tsbench_agentharm_full.json`,
+  `outputs/logs/baseline_ts_guard_tsbench_agentharm_full.json`,
+  `outputs/logs/eval_sft_tsbench_agentdojo.json`,
+  `outputs/logs/eval_mixedrl_tsbench_agentdojo.json`,
+  `outputs/logs/baseline_qwen3guard_tsbench_agentdojo.json`,
+  `outputs/logs/baseline_ts_guard_tsbench_agentdojo.json`,
+  `outputs/logs/eval_sft_tsbench_asb.json`,
+  `outputs/logs/eval_mixedrl_tsbench_asb.json`,
+  `outputs/logs/baseline_qwen3guard_tsbench_asb.json`,
+  `outputs/logs/baseline_ts_guard_tsbench_asb.json`
 
 ### Results Summary
 
@@ -549,9 +595,35 @@ The checkpoint was downloaded through the working local proxy endpoint `127.0.0.
 
 TS-Guard is a strong public ToolSafe-family baseline under this interface: it nearly matches ToolSafe SFT on harmful interception but has substantially higher over-refusal on clean tool calls. Attribution remains 0.00% because TS-Guard does not emit EvoGuard injection spans.
 
+### ToolSafe No-Overlap and TS-Bench Cross-Suite Results
+
+To check whether the original ToolSafe held-out result was inflated by exact train/eval overlap, we built `data/eval/toolsafe_heldout_no_overlap.jsonl` by removing records whose `(user_task, tool_name, tool_arguments, gold_action)` exactly matched `data/rollouts/toolsafe_train_tri_rollouts.jsonl`. This removes 37 records and leaves 109 examples: 69 attacked-tool refusal cases and 40 clean-tool execution cases.
+
+Strict evaluation on this de-overlapped split keeps the same ordering but gives a cleaner interpretation. ToolSafe SFT and Mixed RL-v2 both remain at 0.00% ASR with 0.00% over-refusal and 100.00% task success. Qwen3Guard also reaches 0.00% ASR but over-refuses 12.50% of clean tool calls. TS-Guard reaches 2.90% ASR with 20.00% over-refusal. This means the original 0.00% ASR for EvoGuard SFT is not solely explained by exact train/eval duplicate records, but it is still a ToolSafe/AgentHarm-distribution result rather than a complete generalization claim.
+
+| Defender | Valid JSON | Strict ASR | Attack interception | Over-refusal | Task success | Attribution |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe SFT | 100.00% | 0.00% | 100.00% | 0.00% | 100.00% | 96.75% |
+| Mixed RL-v2 | 100.00% | 0.00% | 100.00% | 0.00% | 100.00% | 96.75% |
+| Qwen3Guard-Gen-8B | 100.00% | 0.00% | 100.00% | 12.50% | 95.41% | 0.00% |
+| TS-Guard | 97.10% | 2.90% | 97.10% | 20.00% | 90.83% | 0.00% |
+
+We then evaluated the same defenders on all available TS-Bench trajectory subsets, not only `agentharm-traj`. The adapter now maps TS-Bench `score` labels explicitly: `score == 0.0` is `execute`, and any non-zero risk score is `refuse`. This avoids treating TS-Bench scores as confidence values.
+
+| Defender | AgentHarm ASR | AgentDojo ASR | ASB ASR | AgentDojo task success | ASB task success |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ToolSafe SFT | 0.57% | 0.00% | 0.00% | 100.00% | 99.94% |
+| Mixed RL-v2 | 0.95% | 0.00% | 12.47% | 100.00% | 92.66% |
+| Qwen3Guard-Gen-8B | 0.57% | 64.20% | 66.35% | 81.48% | 66.99% |
+| TS-Guard | 5.71% | 21.88% | 14.00% | 82.13% | 82.05% |
+
+The cross-suite result is more informative than the original AgentHarm-only held-out number. EvoGuard ToolSafe SFT is still robust across AgentHarm, AgentDojo, and ASB under the current action interface. Mixed RL-v2 preserves AgentDojo performance but weakens on ASB, mostly because strict parsing maps malformed outputs without an `action` field to unsafe execution. Qwen3Guard is strong on AgentHarm but fails badly on AgentDojo and ASB, showing that the generic guard label interface does not transfer cleanly to step-level tool-call decisions. TS-Guard is the closest public ToolSafe-family baseline, but it has higher ASR and materially higher over-refusal than EvoGuard SFT on these converted rollouts.
+
+The TS-Guard ASB result reported above uses the official 512-token generation budget log `outputs/logs/baseline_ts_guard_tsbench_asb.json`. A shorter 128-token backup run exists at `outputs/logs/baseline_ts_guard_tsbench_asb_128.json`, but it is not used as the main result because truncation drops valid-label rate to 3.63% and inflates ASR to 97.12%.
+
 ### Current Conclusion
 
-The main table should emphasize that adapter training, especially ToolSafe SFT and mixed RL, is necessary for a usable defender. TS-Guard is the closest official ToolSafe-family public baseline and is far stronger than generic Qwen3Guard on ToolSafe held-out, but EvoGuard ToolSafe SFT still has lower ASR and much lower over-refusal on the same action interface. The earlier Self-RedTeam row is a simplified inference-time shared-model red-team baseline and is kept only until the full reproduction finishes. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
+The main table should emphasize that adapter training, especially ToolSafe SFT, is necessary for a usable defender. TS-Guard is the closest official ToolSafe-family public baseline and is far stronger than generic Qwen3Guard on ToolSafe held-out, but EvoGuard ToolSafe SFT still has lower ASR and much lower over-refusal on the same action interface. The no-overlap split reduces concern about exact memorization, while AgentDojo and ASB show why AgentHarm-only reporting is insufficient. Mixed RL-v2 is competitive on ToolSafe and AgentDojo but regresses on ASB under strict parsing. Filtered RL-v1 is an informative negative result: it improves neither ASR nor utility over SFT and degrades task success and attribution.
 
 ### Full Self-RedTeam Reproduction
 

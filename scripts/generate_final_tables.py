@@ -32,24 +32,40 @@ LOGS = {
     },
     "Qwen3Guard": {
         "toolsafe": Path("outputs/logs/baseline_qwen3guard.json"),
+        "toolsafe_no_overlap": Path("outputs/logs/baseline_qwen3guard_no_overlap.json"),
         "jailbreak": Path("outputs/logs/eval_qwen3guard_vs_jailbreak.json"),
+        "tsbench_agentharm": Path("outputs/logs/baseline_qwen3guard_tsbench_agentharm_full.json"),
+        "tsbench_agentdojo": Path("outputs/logs/baseline_qwen3guard_tsbench_agentdojo.json"),
+        "tsbench_asb": Path("outputs/logs/baseline_qwen3guard_tsbench_asb.json"),
     },
     "ToolSafe SFT": {
         "toolsafe": Path("outputs/logs/eval_sft_toolsafe.json"),
+        "toolsafe_no_overlap": Path("outputs/logs/eval_sft_toolsafe_no_overlap.json"),
         "jailbreak": Path("outputs/logs/eval_sft_vs_jailbreak.json"),
+        "tsbench_agentharm": Path("outputs/logs/eval_sft_tsbench_agentharm_full.json"),
+        "tsbench_agentdojo": Path("outputs/logs/eval_sft_tsbench_agentdojo.json"),
+        "tsbench_asb": Path("outputs/logs/eval_sft_tsbench_asb.json"),
     },
     "Filtered RL-v1": {
         "toolsafe": Path("outputs/logs/eval_rl_v1_filtered.json"),
     },
     "Mixed RL-v1": {
         "toolsafe": Path("outputs/logs/eval_rl_mixed_v2.json"),
+        "toolsafe_no_overlap": Path("outputs/logs/eval_mixedrl_toolsafe_no_overlap.json"),
         "jailbreak": Path("outputs/logs/eval_mixedrl_vs_jailbreak.json"),
+        "tsbench_agentharm": Path("outputs/logs/eval_mixedrl_tsbench_agentharm_full.json"),
+        "tsbench_agentdojo": Path("outputs/logs/eval_mixedrl_tsbench_agentdojo.json"),
+        "tsbench_asb": Path("outputs/logs/eval_mixedrl_tsbench_asb.json"),
     },
 }
 
 OPTIONAL_LOGS = {
     "TS-Guard": {
         "toolsafe": Path("outputs/logs/baseline_ts_guard.json"),
+        "toolsafe_no_overlap": Path("outputs/logs/baseline_ts_guard_no_overlap.json"),
+        "tsbench_agentharm": Path("outputs/logs/baseline_ts_guard_tsbench_agentharm_full.json"),
+        "tsbench_agentdojo": Path("outputs/logs/baseline_ts_guard_tsbench_agentdojo.json"),
+        "tsbench_asb": Path("outputs/logs/baseline_ts_guard_tsbench_asb.json"),
     },
     "Self-RedTeam (full)": {
         "toolsafe": Path("outputs/logs/baseline_self_redteam_full.json"),
@@ -69,9 +85,16 @@ OPTIONAL_LOGS = {
 
 GENERALIZATION_COLUMNS = [
     ("ToolSafe held-out harmful", "toolsafe"),
+    ("ToolSafe no-overlap", "toolsafe_no_overlap"),
     ("LLM-r1", "llm_r1"),
     ("Hard held-out", "hard"),
     ("Automated jailbreak", "jailbreak"),
+]
+
+TS_BENCH_COLUMNS = [
+    ("AgentHarm-traj", "tsbench_agentharm"),
+    ("AgentDojo", "tsbench_agentdojo"),
+    ("ASB", "tsbench_asb"),
 ]
 
 UTILITY_COLUMNS = [
@@ -98,9 +121,13 @@ def main() -> None:
             "",
             render_generalization_table(loaded),
             "",
+            render_tsbench_asr_table(loaded),
+            "",
             render_valid_json_table(loaded),
             "",
             render_utility_table(loaded),
+            "",
+            render_tsbench_utility_table(loaded),
             "",
             render_coevolution_table(load_coevolution(COEVOLUTION_LOG)),
             "",
@@ -176,6 +203,19 @@ def render_valid_json_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str
     return "\n".join(lines)
 
 
+def render_tsbench_asr_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
+    lines = ["### TS-Bench cross-suite evaluation (Strict ASR↓ %)"]
+    header = ["Defender", *[name for name, _ in TS_BENCH_COLUMNS]]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    for defender, results in loaded.items():
+        row = [defender]
+        for _, key in TS_BENCH_COLUMNS:
+            row.append(format_percent(metric(results.get(key), "attack_success_rate")))
+        lines.append(markdown_row(row))
+    return "\n".join(lines)
+
+
 def render_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
     lines = ["### Utility & safety metrics (ToolSafe held-out)"]
     header = ["Defender", *UTILITY_COLUMNS]
@@ -187,6 +227,29 @@ def render_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
         for key in UTILITY_COLUMNS:
             value = payload.get(key) if key == "valid_json_rate" and payload else metric(payload, key)
             row.append(format_float(value))
+        lines.append(markdown_row(row))
+    return "\n".join(lines)
+
+
+def render_tsbench_utility_table(loaded: dict[str, dict[str, dict[str, Any]]]) -> str:
+    lines = ["### TS-Bench utility summary"]
+    header = [
+        "Defender",
+        "AgentHarm task",
+        "AgentHarm over-refusal",
+        "AgentDojo task",
+        "AgentDojo over-refusal",
+        "ASB task",
+        "ASB over-refusal",
+    ]
+    lines.append(markdown_row(header))
+    lines.append(markdown_separator(len(header)))
+    for defender, results in loaded.items():
+        row = [defender]
+        for _, key in TS_BENCH_COLUMNS:
+            payload = results.get(key)
+            row.append(format_percent(metric(payload, "task_success_rate")))
+            row.append(format_percent(metric(payload, "over_refusal_rate")))
         lines.append(markdown_row(row))
     return "\n".join(lines)
 
