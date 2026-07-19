@@ -1,0 +1,94 @@
+# Example EvoGuard experiment configuration.
+#
+# Run with:
+#
+#   scripts/run_experiment.sh configs/example.yaml
+#
+# This file mirrors the defaults in evoguard/config.py; uncomment / edit the
+# fields you want to override. All-OpenAI-backend runs require a vLLM (or
+# OpenAI-compatible) server exposing chat completions, with LoRA adapters
+# registered under their served names so defense/attacker/judge/tool-executor
+# can request them via LLMConfig.lora_adapter.
+
+name: example_agentdojo_banking
+
+rounds_dir: rounds
+seed: 0
+
+defense:
+  llm:
+    backend: openai
+    model: Qwen/Qwen2.5-7B-Instruct
+    base_url: http://localhost:8001/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 768
+    # Set this once a defender adapter has been trained and is served by vLLM.
+    lora_adapter: null
+  max_turns: 12
+
+attacker:
+  llm:
+    backend: openai
+    model: Qwen/Qwen2.5-7B-Instruct
+    base_url: http://localhost:8002/v1
+    api_key: EMPTY
+    temperature: 0.9
+    max_tokens: 1024
+  population_size: 50      # N
+  offspring_size: 45       # M
+  elite_size: 5            # E
+  tournament_k: 3          # k
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.5
+  diversity_position_window: 1
+  random_seed: 0
+
+env:
+  dataset: agentdojo            # or "agentharm"
+  data_root: data
+  suites: ["banking"]           # empty => all discovered suites
+  max_tasks: 20                 # cap for smoke-scale real-model experiments
+  tool_executor_llm:
+    backend: openai
+    model: Qwen/Qwen2.5-7B-Instruct
+    base_url: http://localhost:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+  judge_llm:
+    backend: openai
+    model: Qwen/Qwen2.5-7B-Instruct
+    base_url: http://localhost:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length     # "clean_length" | "max_length"
+
+training:
+  enabled: true
+  method: sft_then_grpo         # "sft" | "grpo" | "sft_then_grpo"
+  base_model: Qwen/Qwen2.5-7B-Instruct
+  llamafactory_root: evoguard/training/LLaMA-Factory
+  verl_root: evoguard/training/AEPO/verl_aepo_entropy
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+  grpo_learning_rate: 1.0e-6
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+  dry_run: true                  # flip to false to actually launch training jobs
+
+pipeline:
+  max_rounds: 20
+  patience_rounds: 5             # K consecutive low-asr rounds -> stop
+  asr_threshold: 0.05            # epsilon
+  stop_on_zero_success: true
+  validation_fraction: 0.2       # held-out tasks used only to compute val ASR

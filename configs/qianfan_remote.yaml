@@ -1,0 +1,102 @@
+# EvoGuard Qianfan-remote experiment configuration.
+#
+# This is a TEMPLATE consumed by sh/qianfan_run.sh which performs @INPUT_DIR@
+# substitution at runtime, writing a fully-resolved copy into
+# ${CUSTOM_WORK_DIR}/output/resolved_config.yaml before invoking evoguard.run.
+#
+# Run on the Baidu Qianfan platform (8×A100-80G) via:
+#   bash ${CUSTOM_WORK_DIR}/input/<leaf>/sh/qianfan_run.sh
+# The wrapper auto-discovers <leaf> by searching WORKDIR/input/**/{sh/qianfan_run.sh}.
+#
+# Differences vs configs/real_qianfan.yaml (the local-run variant):
+#   * training.dry_run flipped to false — real LoRA SFT+GRPO fires remotely.
+#   * All asset paths use @INPUT_DIR@ placeholders pointing into bundle root;
+#     wrapper resolves them against discovered ${INPUT_DIR} absolute location.
+#   * per_device_batch_size 1→2 and gradient_accumulation 8→16 to exploit A100×8
+#     memory headroom; effective batch = 2 × 16 × 8 GPUs = 256 trajectories.
+#   * Everything else preserved verbatim so plan.md canonical hyperparameters stay intact.
+
+name: evoguard_qianfan_remote
+
+rounds_dir: rounds                # resolves to $OUTPUT_DIR/rounds/
+seed: 0
+
+defense:
+  llm:
+    backend: openai                       # in-container vLLM server started by qianfan_run.sh on GPU #0–3, port 8000.
+    model: qwen2.5-7b-it                  # must match vllm serve's --served-model-name.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                        # vLLM ignores key but SDK requires non-empty string.
+    temperature: 0.2                      # low-temp for deterministic-ish decisioning.
+    max_tokens: 1024                      # reasoning-heavy agent steps need headroom over prompt template size.
+    max_retries: 4
+    timeout: 180.0
+    lora_adapter: null                    # filled by pipeline after first SFT+GRPO round completes.
+  max_turns: 8                            # cap interaction length for predictable API cost.
+
+attacker:
+  llm:
+    backend: qianfan                      # attacker generator hits remote QianFan GLM endpoint over HTTP.
+    model: glm-5.2                        # creative generation role → most capable model available here.
+    temperature: 0.95                     # high temp encourages diverse injection strategies across GA population.
+    max_tokens: 4096                      # thinking models consume hidden CoT budget before emitting final JSON envelope.
+    timeout: 300.0
+    max_retries: 3
+  population_size: 50      # N            # plan.md canonical hyperparameters preserved exactly.
+  offspring_size: 45       # M
+  elite_size: 5            # E
+  tournament_k: 3          # k
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.5
+  diversity_position_window: 1
+  random_seed: 0
+
+env:
+  dataset: agentdojo
+  data_root: "@INPUT_DIR@/data"           # bundle carries vendored benchmark trajectories here.
+  suites: ["banking"]                     # smallest suite (~90 tasks); good smoke-scale real-model target.
+  max_tasks: 20                           # subset banking tasks keeps total rollout count manageable.
+
+  tool_executor_llm:
+    backend: qianfan
+    model: glm-5.2
+    temperature: 0.0                      # executor should be deterministic & faithful to spec.
+    max_tokens: 2048
+    timeout: 240.0
+    max_retries: 3
+  judge_llm:
+    backend: qianfan
+    model: glm-5                          # separate judging-model biases differ from attacker's.
+    temperature: 0.0
+    max_tokens: 3072
+    timeout: 240.0
+    max_retries: 3
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length              # "clean_length" | "max_length"
+
+training:
+  enabled: true
+  method: sft_then_grpo                   # cold-start SFT then GRPO RL fine-tune (plan.md default).
+  base_model: "@INPUT_DIR@/qwen2.5-7b-it"                # local path beats HF hub lookup latency at scale.
+  llamafactory_root: "@INPUT_DIR@/evoguard/training/LLaMA-Factory"
+  verl_root:               "@INPUT_DIR@/evoguard/training/AEPO/verl_aepo_entropy"
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4               # standard PEFT LR for instruct-tuned base with rank-16 adapter.
+  grpo_learning_rate: 1.0e-6              # one order lower than SFT because we're refining not reprogramming.
+  per_device_batch_size: 2                # ↑ from 1: each A100-80G comfortably holds bs=2 @ seq_len<=4k with grad checkpointing.
+  gradient_accumulation: 16               # ↑ from 8: effective batch=bs×accum×ngpus=2*16*8=256 trajectories / step.
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+  dry_run: false                          # REAL TRAINING FIRES REMOTELY ON QIANFAN GPU CLUSTER.
+
+pipeline:
+  max_rounds: 10                          # bounded co-evolution horizon.
+  patience_rounds: 5                      # K consecutive sub-threshold ASR rounds => early stop.
+  asr_threshold: 0.05                     # epsilon: stop once val-set attack success rate stays <5%.
+  stop_on_zero_success: true
+  validation_fraction: 0.2

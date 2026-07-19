@@ -1,0 +1,103 @@
+# Real-model EvoGuard experiment configuration.
+#
+# Run with:
+#
+#   scripts/run_real.sh configs/real_qianfan.yaml
+#
+# Backends in use:
+#   * defense agent        -> local vLLM-served Qwen2.5-7B-Instruct (GPU #6, port 8000)
+#   * attack judge         -> Baidu QianFan GLM-5
+#   * attacker generator   -> Baidu QianFan GLM-5.2  (seed/crossover/mutate)
+#   * tool executor (env)  -> Baidu QianFan GLM-5.2
+#
+# Credentials for the qianfan backend are read from env vars:
+#     export EVOGUARD_QIANFAN_APPID='app-<your-appid>'
+#     export EVOGUARD_QIANFAN_TOKEN='bce-v3/<your-bearer-token>'
+# We never hardcode secrets inside this YAML on purpose; the run wrapper sets them.
+
+name: evoguard_real_qianfan
+
+rounds_dir: rounds
+seed: 0
+
+defense:
+  llm:
+    backend: openai                       # OpenAI-compatible vLLM server below.
+    model: qwen2.5-7b-it                  # must match --served-model-name of start_vllm.sh
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                        # vLLM ignores the key but the SDK requires non-empty.
+    temperature: 0.2                      # low-temp for deterministic-ish decisioning
+    max_tokens: 1024                      # reasoning-heavy agent steps need headroom over the prompt template size
+    max_retries: 4
+    timeout: 180.0
+    lora_adapter: null                    # filled by training loop after first SFT+GRPO round completes
+  max_turns: 8                            # cap per-task interaction length to keep API cost predictable
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2                         # creative generation role -> most capable model available here
+    temperature: 0.95                     # high temp encourages diverse injection strategies across GA population
+    max_tokens: 4096                      # thinking models consume hidden CoT budget before emitting final JSON envelope; keep generous
+    timeout: 300.0
+    max_retries: 3
+  population_size: 50      # N            # plan.md canonical hyperparameters preserved exactly
+  offspring_size: 45       # M
+  elite_size: 5            # E
+  tournament_k: 3          # k
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.5
+  diversity_position_window: 1
+  random_seed: 0
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites: ["banking"]                     # smallest suite (~90 tasks); good smoke-scale real-model target
+  max_tasks: 20                           # subset banking tasks per round keeps total rollout count manageable
+                                           # = 1 clean + ~pop=50 attacks × 20 tasks ≈ 1000 LLM calls / round worst case
+
+  tool_executor_llm:
+    backend: qianfan
+    model: glm-5.2
+    temperature: 0.0                       # executor should be deterministic & faithful to spec
+    max_tokens: 2048
+    timeout: 240.0
+    max_retries: 3
+  judge_llm:
+    backend: qianfan
+    model: glm-5                          # plan.md asks for a separate judging model so its biases differ from the attacker's
+    temperature: 0.0
+    max_tokens: 3072                       # verdict + rationale can be long when trajectory has many turns
+    timeout: 240.0
+    max_retries: 3
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length              # "clean_length" | "max_length"
+
+training:
+  enabled: true                            # set false only if you want pure inference-side co-evolution without LoRA updates
+  method: sft_then_grpo                   # cold-start SFT then GRPO RL fine-tune (plan.md default)
+  base_model: /ssd1/models/qwen2.5-7b-it  # local path beats HF hub lookup latency at scale
+  llamafactory_root: evoguard/training/LLaMA-Factory
+  verl_root:               evoguard/training/AEPO/verl_aepo_entropy
+  sft_epochs: 2.0                          # two passes is enough given small corrective SFT corpus size each round (~tens-hundreds examples)
+  sft_learning_rate: 1.0e-4                # standard PEFT LR for instruct-tuned base with rank-16 adapter
+  grpo_learning_rate: 1.0e-6               # one order lower than SFT because we're refining not reprogramming
+  per_device_batch_size: 1                 # A100 40GB comfortably holds bs=1 @ seq_len<=4k with grad checkpointing
+  gradient_accumulation: 8                  # effective batch = 8 trajectories per optimizer step
+  lora_rank: 16                             # matches AEPO paper defaults; sufficient capacity for safety-policy delta
+  lora_alpha: 32                            # conventional alpha=2*rank scaling factor
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # attention-only adapters keep trainable params <10M
+  dry_run: true                              # PHASE 5 LEAVES THIS TRUE FOR FIRST VALIDATION ROUND;
+                                             # flip to false after dry-run pipeline proves end-to-end clean (see Phase 6).
+
+pipeline:
+  max_rounds: 10                            # bounded co-evolution horizon — more than enough to observe ASR dynamics on AgentDojo-banking scale
+  patience_rounds: 5                        # K consecutive sub-threshold ASR rounds => early stop
+  asr_threshold: 0.05                       # epsilon: stop once val-set attack success rate stays under 5%
+  stop_on_zero_success: true
+  validation_fraction: 0.2                  # hold out 20% of discovered tasks purely for independent validation probing

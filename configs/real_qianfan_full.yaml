@@ -1,0 +1,123 @@
+# Production-scale EvoGuard experiment on full agentdojo suite.
+#
+# Tuned for cloud deployment on Baidu Qianfan platform (8×A100-80G) but also
+# usable locally if you have enough wall-clock budget. Key changes vs the
+# canonical plan.md defaults (N=50/M=45/E=5):
+#   * Population shrunk to N=12 / M=10 / E=2 -- still >10 individuals so GA
+#     selection pressure remains meaningful while cutting rollout cost ~4x.
+#   * Two-layer concurrency enabled: task_concurrency=4 × attack_concurrency=4
+#     = peak 16 simultaneous outbound HTTP requests, comfortably below Baidu
+#     Qianfan default tier RPM=60 ceiling.
+#   * training.dry_run=false finally enables real LoRA SFT + GRPO each round.
+#     Newly-trained adapters get hot-loaded onto the running vLLM server via
+#     POST /v1/load_lora_adapter so subsequent rounds use the hardened policy.
+#   * patience_rounds shortened from K=5 → 3 for faster early-stop signal.
+#
+# Run via:
+#   scripts/run_real.sh configs/real_qianfan_full.yaml
+# OR inside Qianfan container:
+#   bash ${CUSTOM_WORK_DIR}/input/evoguard/deploy/qianfan/run_evoguard_qianfan.sh
+
+name: evoguard_agentdojo_full
+
+rounds_dir: rounds
+seed: 0
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    max_retries: 6
+    timeout: 180.0
+  max_turns: 6                            # ↓ from 8; shorter trajectories cut per-attack LLM-call count
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    temperature: 0.95
+    max_tokens: 4096
+    timeout: 300.0
+    max_retries: 3
+
+  # Reduced-population scheme. N*M*E ratio preserved roughly the same as
+  # original plan.md proportions (~90% offspring, ~10% elites).
+  population_size:        12              # N : was 50 -> now 12 (-76%)
+  offspring_size:         10             # M : was 45 -> now 10 (-78%)
+  elite_size:               2            # E : was 5  -> now 2  (-60%)
+  tournament_k:           3              # k unchanged — selection diversity fine at this scale.
+  crossover_rate:         0.9
+  mutation_rate:          0.5
+  diversity_penalty:      0.5
+  random_seed:            0
+
+env:
+  dataset: agentdojo                      # uses data/toolsafe/agentdojo-tragj/*.json files vendored in repo
+  data_root: data                         # relative-to-cwd path inside repo root
+  suites:                                 # ALL four suites included == 1220 tasks total
+    - banking                             #   banking=87 slack=101 travel=177 workspace=855
+    - slack
+    - travel
+    - workspace
+  # Overnight local validation target (~15h wall-clock budget before tomorrow 11AM).
+  # Mixes across all four suites giving broad coverage while staying tractable.
+  # Each round's pure-rollout cost at this scale estimates ~3-4 hr given RPM=60 saturation;
+  # expect roughly 2-3 co-evolution iterations completed within available time window.
+  max_tasks: 100
+
+  tool_executor_llm:
+    backend: qianfan
+    model: glm-5.2
+    temperature: 0.0
+    max_tokens: 2048
+    timeout: 240.0
+    max_retries: 3
+  judge_llm:
+    backend: qianfan
+    model: glm-5                          # separate judging model biases differ from attacker's generator
+    temperature: 0.0
+    max_tokens: 3072                       # verdict + rationale headroom when trajectory has many turns
+    timeout: 240.0
+    max_retries: 3
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length              # "clean_length" | "max_length"
+
+training:
+  enabled: true                           # keep enabled so dataset-builder codepath exercises every round
+  method: sft_then_grpo                   # cold-start LoRA-SFT then GRPO RL refinement (plan.md default)
+  base_model: /ssd1/models/qwen2.5-7b-it  # local path; overridden by BASE_MODEL_PATH env var in Qianfan launcher
+  llamafactory_root: evoguard/training/LLaMA-Factory
+  verl_root:               evoguard/training/AEPO/verl_aepo_entropy
+  sft_epochs:                2.0          # two passes is plenty given small corrective corpus per round
+  sft_learning_rate:       1.0e-4
+  grpo_learning_rate:      1.0e-6
+  per_device_batch_size:      8           # A100-80G comfortably holds bs=8 @ seq_len<=4096 with grad checkpointing
+  gradient_accumulation:      2           # effective batch = 16 trajectories per optimizer step
+  lora_rank:                 16
+  lora_alpha:                32
+  lora_dropout:             0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+  dry_run: false                          # ★★★ FINALLY FLIPPED TO FALSE FOR REAL TRAINING ★★★
+                                           # Ensure vllm started with --enable-lora before launching!
+pipeline:
+  max_rounds:                  15         # upper bound; typical experiments converge within 5–10 rounds
+  patience_rounds:              3         # K consecutive low-ASR rounds triggers termination (--from 5)
+  asr_threshold:              0.05        # epsilon threshold below which ASR counts toward patience streak
+  stop_on_zero_success: false             # don't terminate just because one round had zero successes --
+                                            # could be transient judge variance not actual convergence
+  validation_fraction:       0.15         # hold out 15% of tasks purely for ASR tracking (never train-side)
+
+  # Concurrency knobs drive throughput against paid-endpoint rate quotas.
+  # Default product task*attack=16 stays safely under Baidu Qianfan RPM=60 limit
+  # accounting for thinking-model hidden-CoT token consumption eating into TPM too.
+  #
+  # If you observe HTTP 429 throttling errors in logs, halve both values together.
+  # If GPU/CPU utilization stays <50% and no throttle warnings appear, can push higher.
+  task_concurrency:    4
+  attack_concurrency:  4

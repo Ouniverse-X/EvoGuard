@@ -1,0 +1,98 @@
+# Small-scale live-backend validation config (Phase 5 dry-run).
+#
+# Same backend mix as real_qianfan.yaml -- local vLLM Qwen2.5-7B-Instruct for
+# defense, Baidu QianFan GLM-5/5.2 for attacker / judge / tool executor -- but
+# with the rollout scale tuned down so the entire co-evolution loop completes
+# in a few minutes per round instead of hours. Use this to verify end-to-end
+# correctness of the LLM-client wiring, structured-output degradation, judge
+# envelope parsing and results-folder persistence BEFORE flipping
+# training.dry_run=False on the production-sized sibling.
+#
+# Run:
+#
+#   scripts/run_real.sh configs/real_qianfan_smoke.yaml
+
+name: evoguard_real_qianfan_smoke
+
+rounds_dir: rounds
+seed: 0
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                  # matches start_vllm.sh served-model-name
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                        # vLLM ignores the key value; SDK requires non-empty.
+    temperature: 0.2
+    max_tokens: 1024                      # reasoning-heavy agent steps need headroom over prompt template size
+    max_retries: 4
+    timeout: 180.0
+  max_turns: 4                            # tighter cap keeps validation rounds fast
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2                         # creative generation role -> most capable model available here
+    temperature: 0.95                      # high temp encourages diverse injection strategies across population
+    max_tokens: 4096                       # thinking models consume hidden CoT budget before emitting final JSON envelope
+    timeout: 300.0
+    max_retries: 3
+  # Validation-tuned scale: still exercises seed/crossover/mutate paths.
+  population_size: 6       # N            # tiny pop so total rollouts stay manageable (~pop * max_tasks * max_rounds)
+  offspring_size: 5        # M
+  elite_size: 1            # E
+  tournament_k: 3          # k            # k<=population_size so this is fine at N=6
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.5
+  random_seed: 0
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites: ["banking"]                     # smallest suite (~90 tasks)
+  max_tasks: 3                            # only three banking tasks => ~3 clean + ~18 attacks per round = cheap probe
+
+  tool_executor_llm:
+    backend: qianfan
+    model: glm-5.2
+    temperature: 0.0
+    max_tokens: 2048
+    timeout: 240.0
+    max_retries: 3
+  judge_llm:
+    backend: qianfan
+    model: glm-5                          # separate judging model so its biases differ from the attacker's
+    temperature: 0.0
+    max_tokens: 3072                       # verdict + rationale headroom when trajectory has many turns
+    timeout: 240.0
+    max_retries: 3
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length              # "clean_length" | "max_length"
+
+training:
+  enabled: true                           # keep enabled to exercise dataset-builder code path under dry_run=true
+  method: sft_then_grpo                   # cold-start SFT then GRPO RL fine-tune (plan.md default)
+  base_model: /ssd1/models/qwen2.5-7b-it
+  llamafactory_root: evoguard/training/LLaMA-Factory
+  verl_root:               evoguard/training/AEPO/verl_aepo_entropy
+  sft_epochs: 2.0                          # two passes is enough given small corrective SFT corpus each round
+  sft_learning_rate: 1.0e-4                # standard PEFT LR for instruct-tuned base with rank-16 adapter
+  grpo_learning_rate: 1.0e-6               # one order lower than SFT because we're refining not reprogramming
+  per_device_batch_size: 1                 # A100 40GB comfortably holds bs=1 @ seq_len<=4k with grad checkpointing
+  gradient_accumulation: 8                  # effective batch = 8 trajectories per optimizer step
+  lora_rank: 16                             # matches AEPO paper defaults
+  lora_alpha: 32                            # conventional alpha=2*rank scaling factor
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+  dry_run: true                             # PHASE 5 LEAVES THIS TRUE FOR FIRST VALIDATION ROUND;
+                                            # flip to false after dry-run proves end-to-end clean.
+
+pipeline:
+  max_rounds: 2                            # two-round smoke is enough to validate round-over-round state propagation
+  patience_rounds: 10                       # disable early-stop during validation
+  asr_threshold: 0.0
+  stop_on_zero_success: false
+  validation_fraction: 0.0                  # use all tasks as training-side GAs in this small probe

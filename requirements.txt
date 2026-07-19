@@ -1,0 +1,22 @@
+# EvoGuard runtime dependencies.
+#
+# Install into a fresh Python>=3.10 environment after creating the conda env::
+#
+#     mamba create -n evoguard --clone /ssd1/conda_envs/stabletool   # brings torch+vllm+transformers in one shot
+#     pip install -r requirements.txt                                  # adds lightweight pure-python extras below
+#     # heavy training-stack deps are pulled from the vendored frameworks at dry_run=False time,
+#     # see evoguard/training/{LLaMA-Factory,AEPO}/requirements.txt.
+
+# --- Core LLM client stack ---------------------------------------------------
+openai>=1.40,<2          # OpenAIClient backend (also covers OpenAI-compatible endpoints like QianFan's openai-style gateway if used that way).
+requests>=2.28           # Raw HTTP client backing our dedicated qianfan_client.py implementation.
+
+# --- Config & logging --------------------------------------------------------
+PyYAML>=6                # ExperimentConfig.from_file YAML loader.
+jsonschema>=4            # Optional schema-shape validation helpers; not required at import time (guarded).
+
+# --- Plotting ---------------------------------------------------------------
+matplotlib>=3.5         # utils/plots.plot_curves (imported lazily — absence only disables PNG output).
+
+# --- Numerics --------------------------------------------------------------
+numpy>=1.24             # Used indirectly through matplotlib and signal math utilities.
