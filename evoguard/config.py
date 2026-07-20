@@ -49,6 +49,12 @@ class LLMConfig:
     max_retries: int = 3
     # Optional LoRA adapter name to request from the vLLM server for this role.
     lora_adapter: Optional[str] = None
+    # Whether to enable model-side chain-of-thought ("thinking mode") for backends
+    # that support it (e.g. QianFan GLM-5 / glm-5.2). Thinking models consume hidden
+    # CoT tokens BEFORE emitting visible content; disabling it dramatically reduces
+    # finish_reason="length" truncations observed during real rollouts.
+    # Backend clients honor this best-effort: unknown backends silently ignore False.
+    enable_thinking: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -80,6 +86,17 @@ class AttackerConfig:
     # position / method are highly similar to already-selected ones.
     diversity_penalty: float = 0.5
     diversity_position_window: int = 1   # turns within which positions count as "close"
+    # Crowding-based selection (replaces pure tournament when > 1): each tournament
+    # bracket may contain at most ``crowding_factor`` individuals sharing the same
+    # ``method`` label, forcing exploration across method niches.
+    crowding_factor: int = 2
+    # Random-immigrant injection rate in [0, 1]: fraction of worst-fitness
+    # individuals replaced with freshly-seeded random genomes per generation.
+    # Activates only when mean best fitness drops by ``fitness_drop_threshold``
+    # between consecutive generations, preventing premature convergence like the
+    # r5 collapse observed in evoguard_agentdojo_full run.
+    immigrant_injection_rate: float = 0.2
+    fitness_drop_threshold: float = 0.5
     random_seed: int = 0
 
 
@@ -102,6 +119,12 @@ class EnvConfig:
     # Whether the injection oracle should judge attack success with an LLM.
     judge_llm: LLMConfig = field(
         default_factory=lambda: LLMConfig(temperature=0.0, max_tokens=256)
+    )
+    # Optional fallback judge for benign-task completion scoring when the
+    # native AgentDojo verifier is unavailable (no matching user-task class or
+    # environment replay fails). When omitted, env falls back to a no-op scorer.
+    utility_judge_llm: LLMConfig = field(
+        default_factory=lambda: LLMConfig(temperature=0.0, max_tokens=512)
     )
 
 
@@ -137,6 +160,14 @@ class TrainingConfig:
     grpo_learning_rate: float = 1.0e-6
     per_device_batch_size: int = 1
     gradient_accumulation: int = 8
+    # If True, only run SFT cold-start on round_0; subsequent rounds reuse the
+    # existing adapter and apply GRPO incrementally. Saves ~30-40 min/round of
+    # redundant cold-start compute observed in evoguard_agentdojo_full run.
+    sft_coldstart_only_round_zero: bool = False
+    # Minimum number of NEW successful B-trajectories accumulated since the last
+    # training step required to actually fire another GRPO update. Setting this
+    # above zero avoids retraining when the latest round produced no novel signal.
+    grpo_min_new_successes: int = 5
     # If True, only render configs/datasets and print commands without launching.
     dry_run: bool = True
 

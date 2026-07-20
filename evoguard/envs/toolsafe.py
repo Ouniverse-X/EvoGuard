@@ -23,9 +23,10 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from evoguard.core.types import Task, ToolSpec
-from evoguard.envs.base import SimulatedToolEnv
+from evoguard.core.types import Task, ToolSpec, Trajectory
+from evoguard.envs.base import SimulatedToolEnv, ToolEnv
 from evoguard.envs.tool_parsing import parse_env_info
+from evoguard.envs.utility_judge import score_utility as _score_utility_impl
 from evoguard.llm.base import LLMClient
 from evoguard.utils.logging import get_logger
 
@@ -47,6 +48,7 @@ class _ToolSafeEnv(SimulatedToolEnv):
         *,
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
+        utility_judge: Optional[LLMClient] = None,
     ):
         super().__init__(executor)
         self._data_dir = data_dir
@@ -54,6 +56,10 @@ class _ToolSafeEnv(SimulatedToolEnv):
         self._max_tasks = max_tasks
         self._tasks: list[Task] = []
         self._tools_by_task: dict[str, list[ToolSpec]] = {}
+        # Dedicated judge client used by the benign-completion scorer fallback
+        # path (Plan C). May be None when caller opts out of utility scoring;
+        # in that case score_utility returns 0.0 with method='skipped_no_llm'.
+        self._utility_judge = utility_judge
         self._load()
 
     # ---- ToolEnv API ------------------------------------------------------ #
@@ -62,6 +68,28 @@ class _ToolSafeEnv(SimulatedToolEnv):
 
     def get_tools(self, task: Task) -> list[ToolSpec]:
         return self._tools_by_task.get(task.task_id, [])
+
+    def score_utility(
+        self,
+        task: Task,
+        trajectory: Trajectory,
+    ) -> tuple[float, str, str]:
+        """Score how well ``trajectory`` completed the BENIGN objective.
+
+        Returns ``(score∈[0,1], method_tag, evidence)`` per
+        :mod:`evoguard.envs.utility_judge`. Never raises.
+        """
+        try:
+            return _score_utility_impl(
+                task=task,
+                trajectory=trajectory,
+                judge_llm=self._utility_judge,
+                strict_text_check_only=False,
+            )
+        except Exception as exc:                                            # noqa: BLE001 - never crash round-loop here
+            logger.warning("score_utility raised for task %s: %s",
+                           getattr(task, "task_id", "?"), exc)
+            return (0.0, "error", f"{type(exc).__name__}: {str(exc)[:300]}")
 
     # ---- loading ---------------------------------------------------------- #
     def _iter_files(self):
@@ -123,9 +151,14 @@ class AgentDojoEnv(_ToolSafeEnv):
         *,
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
+        utility_judge: Optional[LLMClient] = None,
     ):
         data_dir = os.path.join(data_root, "toolsafe", "agentdojo-tragj")
-        super().__init__(executor, data_dir, suites=suites, max_tasks=max_tasks)
+        super().__init__(
+            executor, data_dir,
+            suites=suites, max_tasks=max_tasks,
+            utility_judge=utility_judge,
+        )
 
 
 class AgentHarmEnv(_ToolSafeEnv):
@@ -140,6 +173,11 @@ class AgentHarmEnv(_ToolSafeEnv):
         *,
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
+        utility_judge: Optional[LLMClient] = None,
     ):
         data_dir = os.path.join(data_root, "toolsafe", "agentharm-traj")
-        super().__init__(executor, data_dir, suites=suites, max_tasks=max_tasks)
+        super().__init__(
+            executor, data_dir,
+            suites=suites, max_tasks=max_tasks,
+            utility_judge=utility_judge,
+        )

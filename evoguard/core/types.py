@@ -442,6 +442,10 @@ class TrajectoryRecord:
     signals: Optional[Signals] = None
     # Task-level correctness of the *benign* objective (from the env scorer).
     utility: Optional[float] = None
+    # How that score was produced: "native_lite"|"llm_rubric"|"error"|"skipped_no_llm"|"".
+    utility_method: str = ""
+    # Short evidence string (≤500 chars) explaining why utility got its value.
+    utility_evidence: str = ""
     created_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -476,6 +480,8 @@ class TrajectoryRecord:
             "attack": self.attack.to_dict() if self.attack else None,
             "signals": self.signals.to_dict() if self.signals else None,
             "utility": self.utility,
+            "utility_method": self.utility_method,
+            "utility_evidence": self.utility_evidence,
             "created_at": self.created_at,
             "metadata": self.metadata,
         }
@@ -492,6 +498,8 @@ class TrajectoryRecord:
             attack=AttackSpec.from_dict(d["attack"]) if d.get("attack") else None,
             signals=Signals.from_dict(d["signals"]) if d.get("signals") else None,
             utility=d.get("utility"),
+            utility_method=str(d.get("utility_method", "") or ""),
+            utility_evidence=str(d.get("utility_evidence", "") or "")[:1000],
             created_at=d.get("created_at", time.time()),
             metadata=d.get("metadata", {}) or {},
         )

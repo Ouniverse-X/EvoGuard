@@ -116,6 +116,7 @@ class QianFanClient(LLMClient):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         response_format: Optional[dict] = None,
+        enable_thinking: Optional[bool] = None,
     ) -> LLMResponse:
         base_payload = {
             "model": self.config.model,
@@ -136,6 +137,14 @@ class QianFanClient(LLMClient):
             base_payload["max_tokens"] = max_tok
         if stop:
             base_payload["stop"] = list(stop)
+
+        # Thinking-mode toggle: GLM-5 / glm-5.2 on QianFan accept a top-level
+        # ``thinking`` field shaped {"type": "enabled"|"disabled"}. Disabling it
+        # eliminates the hidden CoT token budget that previously caused many
+        # attacker calls to truncate with finish_reason="length" before emitting
+        # any visible JSON. We honor per-call override first, then config default.
+        want_thinking = self.config.enable_thinking if enable_thinking is None else bool(enable_thinking)
+        base_payload["thinking"] = {"type": "enabled" if want_thinking else "disabled"}
 
         use_strict_mode = response_format is not None and self._schema_supported is not False
         return self._call_with_degrade(base_payload, response_format if use_strict_mode else None)

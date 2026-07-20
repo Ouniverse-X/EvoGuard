@@ -123,10 +123,31 @@ TOOL_OBSERVATION_SCHEMA: dict = {
     "required": ["observation"],
 }
 
+# --------------------------------------------------------------------------- #
+# Benign-task completion judge (utility scoring fallback path C).
+# Used by evoguard/envs/utility_judge.py when no deterministic AgentDojo
+# verifier applies. ``score`` is continuous in [0,1] so partial completion
+# (e.g., correct tool called but wrong final answer) can be captured; the
+# boolean ``completed`` field is a convenience for downstream filters that
+# only care about pass/fail semantics.
+# --------------------------------------------------------------------------- #
+TASK_COMPLETION_SCHEMA: dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "completed": {"type": "boolean"},
+        "score":     {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence":  {"type": "string", "maxLength": 500},
+    },
+    "required": ["completed", "score", "evidence"],
+}
+
 
 __all__ = [
     "DEFENSE_ACTION_SCHEMA",
     "ATTACK_GENOMES_SCHEMA",
     "JUDGE_VERDICT_SCHEMA",
     "TOOL_OBSERVATION_SCHEMA",
+    "TASK_COMPLETION_SCHEMA",
 ]

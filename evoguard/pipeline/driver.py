@@ -267,19 +267,81 @@ class Pipeline:
             except Exception as exc:
                 logger.warning("Evolution failed for task=%s: %s", tid, exc)
 
-    def maybe_train_defender(self, *, round_label: str, records):
-        """Build datasets/configs and optionally launch SFT+GRPO training."""
+    def maybe_train_defender(self, *, round_label: str, records, round_id: int = 0):
+        """Build datasets/configs and optionally launch SFT+GRPO training.
+
+        Honors ``TrainingConfig.sft_coldstart_only_round_zero``: when set (and an
+        adapter from a prior round is already loaded), rounds after r0 skip the
+        SFT cold-start phase entirely and only run GRPO incrementally on new
+        successful B-trajectories. This eliminates ~30-40 min/round of redundant
+        cold-init compute observed in evoguard_agentdojo_full where every round
+        re-ran SFT from scratch.
+        """
         if not self.cfg.training.enabled or self._dataset_builder is None:
             return None
+
+        # Skip SFT cold-start on rounds > 0 when configured + adapter already live.
+        skip_cold_start = (
+            self.cfg.training.sft_coldstart_only_round_zero
+            and round_id > 0
+            and bool(getattr(self.cfg.defense.llm, "lora_adapter", "") )
+        )
+        # GRPO needs fresh signal to be worth firing; count NEW B-trajectories.
+        n_new_success_b = sum(
+            1 for rec in records
+            if getattr(rec, "outcome", None) is not None
+            and rec.outcome.value == "success"
+        )
+
+        grpo_min = max(0, int(self.cfg.training.grpo_min_new_successes))
+        if (
+            self.cfg.training.sft_coldstart_only_round_zero
+            and round_id > 0
+            and n_new_success_b < grpo_min
+        ):
+            logger.info(
+                "[train] skipping defender update at %s: only %d new successes "
+                "(threshold=%d); keeping existing lora_adapter=%r",
+                round_label,
+                n_new_success_b,
+                grpo_min,
+                getattr(self.cfg.defense.llm, "lora_adapter", ""),
+            )
+            return None
+
         try:
             from evoguard.training import train_defender
-            outcome = train_defender(
+
+            effective_cfg = self.cfg.training
+            method_override = None
+            if skip_cold_start:
+                # Switch this call's method to "grpo" so we don't redo cold start;
+                # we leave cfg.training.method untouched for next-round reference.
+                try:
+                    import dataclasses as _dc
+                    effective_cfg = _dc.replace(effective_cfg, method="grpo")
+                except Exception:
+                    method_override = "grpo"
+
+            outcome_kwargs = dict(
                 records=list(records),
                 exp_rounds_root=self.exp_dir,
-                training_cfg=self.cfg.training,
+                training_cfg=effective_cfg,
                 round_label=round_label,
                 dataset_builder=self._dataset_builder,
             )
+            if method_override is not None:
+                logger.info(
+                    "[train] skipping SFT cold-start at %s; running incremental "
+                    "%s against existing adapter=%r",
+                    round_label, method_override.upper(),
+                    getattr(self.cfg.defense.llm, "lora_adapter", ""),
+                )
+                outcome_kwargs["training_cfg"] = _replace_training_method(
+                    self.cfg.training, method_override,
+                )
+
+            outcome = train_defender(**outcome_kwargs)
             # Only propagate the suggested adapter name into the live runtime
             # config when an actual LoRA artifact was trained AND loaded onto the
             # serving backend. Under ``training.dry_run=True`` (or when
@@ -390,6 +452,7 @@ class Pipeline:
             self.maybe_train_defender(
                 round_label=label,
                 records=[rec for rec in rr.rollouts.records],
+                round_id=rid,
             )
 
             streak, stop_now, reason = update_termination_state(
@@ -545,6 +608,23 @@ def write_summary_summary(s: ExperimentSummary) -> None:
     with open(target, "w", encoding="utf-8") as f:
         import json as _json2
         _json2.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _replace_training_method(training_cfg, new_method: str):
+    """Return a shallow copy of ``training_cfg`` with ``method`` swapped.
+
+    Used by :meth:`Pipeline.maybe_train_defender` to switch an SFT-then-GRPO
+    config into GRPO-only mode for incremental rounds after the cold start,
+    without mutating the live config object.
+    """
+    try:
+        import dataclasses as _dc
+        return _dc.replace(training_cfg, method=new_method)
+    except Exception:
+        # Fallback: mutate a copy via __dict__ if dataclasses.replace fails.
+        copy = type(training_cfg)(**{**vars(training_cfg)})
+        setattr(copy, "method", new_method)
+        return copy
 
 
 # Public surface ----------------------------------------------------------- #

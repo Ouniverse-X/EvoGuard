@@ -111,7 +111,6 @@ Both real-config yamls ship with `training.dry_run=true`; flip false after Phase
 - **Document as you build**: save implementation notes explaining each design decision as markdown under `docs/` (e.g., see `docs/implementation_notes.md`).
 - Persist every per-round artifact as JSON Lines under `rounds/<exp>/round_<id>/`.
 - Keep mock-client routing driven exclusively by role markers placed atop system prompts (see `evoguard/llm/roles.py`).
-- Don't over-engineer beyond what plan.md specifies — match its hyperparameters exactly.
 - Shell scripts stay tiny wrappers around python invocations.
 
 ## Vendored Training Frameworks

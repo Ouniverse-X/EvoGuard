@@ -86,6 +86,7 @@ class MockClient(LLMClient):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         response_format: Optional[dict] = None,  # noqa: ARG002 - mock output already conforms
+        enable_thinking: Optional[bool] = None,  # noqa: ARG002 - mock has no thinking mode
     ) -> LLMResponse:
         system = next((m.content for m in messages if m.role is Role.SYSTEM), "")
         role = roles.detect_role(system)

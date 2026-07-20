@@ -77,6 +77,7 @@ class OpenAIClient(LLMClient):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         response_format: Optional[dict] = None,
+        enable_thinking: Optional[bool] = None,  # noqa: ARG002 - ignored on OpenAI-compatible
     ) -> LLMResponse:
         payload_messages = [m.to_dict() for m in messages]
         kwargs = {

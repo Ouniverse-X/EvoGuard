@@ -38,6 +38,7 @@ class LLMClient(abc.ABC):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         response_format: Optional[dict] = None,
+        enable_thinking: Optional[bool] = None,
     ) -> LLMResponse:
         """Return a completion for ``messages``.
 
@@ -52,6 +53,10 @@ class LLMClient(abc.ABC):
         retry-without-format fallback). The deterministic
         :class:`~evoguard.llm.mock_client.MockClient` accepts the argument
         but ignores it because its output already conforms.
+
+        ``enable_thinking`` toggles model-side chain-of-thought on backends that
+        expose such a knob (currently QianFan GLM-5 family). Other clients
+        silently ignore this parameter.
         """
 
     def complete(self, prompt: str, **kwargs) -> str:

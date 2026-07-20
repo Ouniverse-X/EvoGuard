@@ -138,10 +138,60 @@ class GeneticAttacker:
         ]
         elites = [self.sanitize_spec(s) for s in elites]
 
-        # Build offspring via tournament selection + crossover + mutation.
+        # Detect premature convergence: when mean best fitness drops sharply
+        # vs the previous generation we inject random immigrants to escape the
+        # local optimum (prevents r5-style collapse seen in evoguard_agentdojo_full).
+        current_best = float(ranked[0].fitness) if ranked else 0.0
+        prev_best = getattr(self, "_prev_gen_best_fitness", None)
+        trigger_immigrants = (
+            prev_best is not None
+            and current_best < prev_best * self.config.fitness_drop_threshold
+            and current_best <= 0.0  # only kick in on actual collapse to zero
+        )
+        self._prev_gen_best_fitness = current_best
+        if trigger_immigrants:
+            logger.warning(
+                "Task %s gen %d->%d: best_fit %.4f -> %.4f below threshold; "
+                "injecting random immigrants at rate=%.2f",
+                self.task.task_id,
+                self.generation,
+                self.generation + 1,
+                prev_best or 0.0,
+                current_best,
+                self.config.immigrant_injection_rate,
+            )
+
+        # Build offspring via crowding-aware tournament selection + crossover/mutation.
         offspring: list[AttackSpec] = []
         selected_history: list[AttackSpec] = []
         target_offspring = self.config.offspring_size
+
+        # If immigrants are triggered AND the generator can re-seed, replace a
+        # fraction of the worst-ranked individuals with fresh random genomes.
+        n_immigrants = 0
+        if trigger_immigrants and self.config.immigrant_injection_rate > 0.0:
+            n_immigrants = int(round(target_offspring * self.config.immigrant_injection_rate))
+            try:
+                fresh_seeds = self.generator.seed(
+                    self.task, self.tools, max(1, n_immigrants),
+                    max_turns=self._inject_turn_ceiling,
+                    generation=self.generation + 1,
+                )
+                for fs in fresh_seeds[:n_immigrants]:
+                    tagged = _clone_as(
+                        self.sanitize_spec(fs),
+                        generation=self.generation + 1,
+                        origin="immigrant",
+                    )
+                    offspring.append(tagged)
+                    # Track in history so crowding penalty treats them like any other.
+                    selected_history.append(tagged)
+            except Exception as exc:                                            # noqa: BLE001
+                logger.warning(
+                    "Task %s: immigrant seeding failed (%s); skipping injection.",
+                    self.task.task_id, str(exc)[:200],
+                )
+
         guard = 0
         while len(offspring) < target_offspring and guard < target_offspring * 10:
             guard += 1
@@ -166,25 +216,62 @@ class GeneticAttacker:
         self.generation += 1
         self._population = offspring[:target_offspring] + elites
         logger.info(
-            "Task %s: generation %d -> %d offspring + %d elites (best fitness=%.3f)",
+            "Task %s: generation %d -> %d offspring (+%d immigrants) + %d elites "
+            "(best fitness=%.3f)",
             self.task.task_id,
             self.generation,
             len(offspring[:target_offspring]),
+            n_immigrants,
             len(elites),
             ranked[0].fitness,
         )
         return list(self._population)
 
-    # ---- selection with diversity maintenance ----------------------------- #
+    # ---- selection with niching / crowding --------------------------------- #
     def _tournament(
         self,
         evaluated: Sequence[EvaluatedAttack],
         selected_history: Sequence[AttackSpec],
     ) -> EvaluatedAttack:
-        """Tournament selection on diversity-adjusted fitness."""
+        """Tournament selection on diversity-adjusted fitness.
+
+        When ``crowding_factor`` >= 2 this enforces method-niche limits per bracket:
+        no more than ``crowding_factor`` contenders sharing the same ``method``
+        label may enter the same tournament sample. This forces exploration across
+        distinct attack methods instead of letting one dominant niche take over --
+        directly addressing the r5 collapse pattern observed when pure tournament
+        drove every contender into the same immediate-trigger corner of the search space.
+        """
 
         k = min(self.config.tournament_k, len(evaluated))
-        contenders = self.rng.sample(list(evaluated), k)
+        cf = max(1, int(getattr(self.config, "crowding_factor", 1)))
+        pool = list(evaluated)
+
+        if cf <= 1 or k <= 1:
+            # Pure-tournament fast path identical to legacy behavior.
+            contenders = self.rng.sample(pool, k)
+        else:
+            # Sample k candidates while enforcing that no more than `cf`
+            # share the same `method` label. Falls back to plain sampling if
+            # diversity is exhausted before reaching k.
+            shuffled = self.rng.sample(pool, min(len(pool), k * 4))
+            chosen: list[EvaluatedAttack] = []
+            method_counts: dict[str, int] = {}
+            for cand in shuffled:
+                m = cand.spec.method or ""
+                if method_counts.get(m, 0) >= cf:
+                    continue
+                chosen.append(cand)
+                method_counts[m] = method_counts.get(m, 0) + 1
+                if len(chosen) >= k:
+                    break
+            if len(chosen) < k:
+                # Top up ignoring crowding so we always return something valid.
+                leftover = [c for c in shuffled if c not in chosen]
+                while leftover and len(chosen) < k:
+                    chosen.append(leftover.pop(0))
+            contenders = chosen
+
         best = None
         best_score = float("-inf")
         for c in contenders:

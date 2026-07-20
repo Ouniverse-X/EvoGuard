@@ -70,6 +70,9 @@ def build_smoke_config() -> ExperimentConfig:
             max_tasks=n_tasks,
             tool_executor_llm=LLMConfig(backend="mock", temperature=0.0),
             judge_llm=LLMConfig(backend="mock", temperature=0.0),
+            # Benign-completion scorer also needs an offline mock backend
+            # otherwise build_env() constructs an OpenAIClient pointing nowhere.
+            utility_judge_llm=LLMConfig(backend="mock", temperature=0.0),
         ),
         process=ProcessConfig(divergence_threshold=0.5, normalize_by="clean_length"),
         training=TrainingConfig(

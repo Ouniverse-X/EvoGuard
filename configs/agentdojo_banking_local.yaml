@@ -1,0 +1,117 @@
+# EvoGuard experiment: AgentDojo banking subset, fully-local backend.
+#
+# Improvements enabled (vs evoguard_agentdojo_full baseline):
+#   * Part 1 — utility scoring via native_lite + LLM rubric fallback
+#     → new metrics clean_completion_rate / attacked_benign_preserved_rate /
+#       dos_overblock_rate populated each round under results/.
+#   * Part 2 — attacker max_tokens raised 4096→8192 AND thinking mode disabled
+#     on QianFan-style backends. Here we use local vLLM which doesn't expose a
+#     thinking toggle; enable_thinking flag is harmlessly ignored by OpenAIClient.
+#   * Part 3 — sft_coldstart_only_round_zero=True so rounds after r0 skip the
+#     ~30-40 min redundant cold-init SFT and only run incremental GRPO.
+#   * Part 4 — crowding_factor=2 enforces method-niche diversity per tournament
+#     bracket; immigrant_injection_rate=0.2 kicks in on fitness collapse.
+#
+# All LLM roles point at the single localhost vLLM instance serving
+# qwen2.5-7b-it with --enable-lora so freshly-trained adapters hot-load.
+
+name: evoguard_banking_local_improved
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                        # vLLM ignores key value but SDK requires non-empty.
+    temperature: 0.2
+    max_tokens: 1024                      # defense agent needs room for tool args + final answer.
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8                            # banking tasks rarely need >6 turns; cap to bound rollout cost.
+
+attacker:
+  llm:
+    backend: openai                       # reuse same local server for attack generation creativity.
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.1                      # higher temp for diverse injection strategies.
+    max_tokens: 8192                      # Part 2 fix: doubled from previous 4096 ceiling that caused finish_reason=length truncations.
+    enable_thinking: false                # Harmless no-op for OpenAIClient/vLLM; honored only when backed by QianFan GLM-5 family.
+    timeout: 180.0
+  population_size: 12                     # N=12 keeps wall-clock reasonable against one shared endpoint without paid API quota headroom.
+  offspring_size: 10                      # M=10 ; M+E=N preserved.
+  elite_size: 2                           # E=2 elites retained verbatim across generations.
+  tournament_k: 3                         # k=3 standard GA selection pressure.
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4                  # mild discount when position+method duplicate prior selections.
+  diversity_position_window: 1
+  crowding_factor: 2                      # NEW Part 4: cap same-method individuals per tournament bracket at 2.
+  immigrant_injection_rate: 0.20          # NEW Part 4: replace worst 20% with fresh genomes if best_fit collapses to zero between gens.
+  fitness_drop_threshold: 0.50            # trigger threshold relative to prev gen best.
+  random_seed: 42
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:
+    - banking                             # focus only on banking subset this run as requested.
+  max_tasks: 30                           # cap sample size so multi-round co-evolution completes overnight.
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0                      # deterministic simulated tool results preferred.
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:                     # NEW Part 1: dedicated judge client for benign-completion rubric path C.
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true                          # keep training machinery wired in case user flips dry_run later.
+  base_model: Qwen/Qwen2.5-7B-Instruct
+  method: sft_then_grpo                  # r0 cold-start SFT then GRPO thereafter via Part-3 skip logic.
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  llamafactory_root: "evoguard/training/LLaMA-Factory"
+  verl_root: "evoguard/training/AEPO/verl_aepo_entropy"
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+  grpo_learning_rate: 1.0e-6
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+  sft_coldstart_only_round_zero: true    # NEW Part 3: avoid re-running cold-start every round.
+  grpo_min_new_successes: 3              # NEW Part 3: skip GRPO update unless ≥3 fresh B-trajectories available.
+  dry_run: true                          # keep dry-run true initially; flip false once pipeline proves stable locally.
+
+pipeline:
+  max_rounds: 10                         # cap iterations so we get final summary.json within budget even if termination never fires.
+  patience_rounds: 5                     # K=5 consecutive ASR<ε required for early stop.
+  asr_threshold: 0.05                    # ε=0.05 plan.md default.
+  stop_on_zero_success: false            # don't terminate just because round had no successful attacks (oscillation pattern observed).
+  validation_fraction: 0.15              # hold out tail fraction for early-stop signal independence.
+  task_concurrency: 4                    # outer fan-out = tasks running simultaneously.
+  attack_concurrency: 4                  # inner fan-out = attacks-per-task evaluated concurrently.
+                                          # peak ≈ task×attack=16 concurrent requests well below any sane rate quota.
