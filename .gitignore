@@ -5,7 +5,17 @@
 /docs/
 /logs/
 /rounds/
+/results/
 /sh/
+
+# --- Stray experiment artifacts anywhere in tree -----------------------------
+*.log
+*.pid
+*.log.*
+nohup.out
+*.tmp
+*.bak
+*.swp
 
 # --- Build artifacts --------------------------------------------------------
 __pycache__/

@@ -92,12 +92,43 @@ class AttackerConfig:
     crowding_factor: int = 2
     # Random-immigrant injection rate in [0, 1]: fraction of worst-fitness
     # individuals replaced with freshly-seeded random genomes per generation.
-    # Activates only when mean best fitness drops by ``fitness_drop_threshold``
-    # between consecutive generations, preventing premature convergence like the
+    # Activates when EITHER mean-best fitness drops by ``fitness_drop_threshold``
+    # between consecutive generations OR ``immigrant_stagnation_gens`` elapsed
+    # without any elite improvement -- prevents premature convergence like the
     # r5 collapse observed in evoguard_agentdojo_full run.
     immigrant_injection_rate: float = 0.2
     fitness_drop_threshold: float = 0.5
+    # Stagnation-based alternative trigger for immigrant injection. Fires when
+    # this many consecutive generations pass WITHOUT a strict increase in the
+    # population's best fitness -- catches plateau-style stalls where best_fit
+    # stays at zero forever so the relative-drop rule above can never fire.
+    # Set to 0 to disable.
+    immigrant_stagnation_gens: int = 4
+    # Adaptive-mutation toggle + cap. When enabled, mutation_rate scales UP
+    # multiplicatively within one generation whenever phenotypic variance of
+    # current-population fitness collapses near zero; bounded by max.
+    adaptive_mutation_enabled: bool = True
+    mutation_rate_min: float = 0.05   # absolute lower bound post-scaling.
+    mutation_rate_max: float = 0.85    # upper bound preventing pure-random walk.
+    behavioral_archive_size: int = 20  # rolling window length for novelty bonus.
+    novelty_bonus_weight: float = 0.03 # additive boost caps raw_fitness range shift.
     random_seed: int = 0
+
+    # ------------------------------------------------------------------ #
+    # Search-backend selector + MCTS-specific knobs                     #
+    # (see docs/mcts_attacker_design.md). All mcts_* fields are ignored  #
+    # when search_method == "ga"; they carry defaults that make the     #
+    # "mcts_delta" backend work out-of-the-box without extra yaml.       #
+    # ------------------------------------------------------------------ #
+    # Selects which attacker backend to instantiate via build_attacker():
+    #   "ga"         -> GeneticAttacker (legacy, default for backward compat)
+    #   "mcts_delta" -> DeltaGuidedMCTSAttacker
+    search_method: str = "ga"
+    mcts_ucb_c: float = 1.414           # classic UCB exploration coefficient (= sqrt(2))
+    mcts_lambda_delta: float = 0.6      # weight of the delta-potential term in selection score
+    mcts_failure_credit_eps: float = 0.03  # fraction of late-caught-failure tau converted into partial credit
+    mcts_tau_window_size: int = 8        # sliding window of recent C-class taus kept per node
+    mcts_revisit_fraction: float = 0.30  # share of N budget reserved for revisiting existing leaves
 
 
 @dataclass
@@ -155,11 +186,37 @@ class TrainingConfig:
     # Framework roots (vendored under evoguard/training).
     llamafactory_root: str = "evoguard/training/LLaMA-Factory"
     verl_root: str = "evoguard/training/AEPO/verl_aepo_entropy"
+    # When ``method == "native_sft"`` we bypass both vendored frameworks entirely
+    # and use a thin in-process wrapper around HuggingFace + PEFT + TRL's
+    # :class:`SFTTrainer`. This sidesteps dependency conflicts between LF/verl's
+    # pinned versions (numpy<2, peft<=0.15) and what is actually installed.
+    # Incremental rounds load this round's previous-adapter as warm-start rather
+    # than re-doing cold-start each time, mirroring plan.md intent without the
+    # full GRPO online-RL machinery (deferred until GRPO integration stabilizes).
+    use_native_trainer: bool = False
+    # Comma-separated GPU indices passed through as CUDA_VISIBLE_DEVICES while
+    # training; empty string means "use whatever the parent process sees".
+    cuda_visible_devices: str = ""
+    # Per-round cap on number of incremental SFT steps beyond which we stop even
+    # if max_steps not yet reached -- prevents runaway long rounds on noisy data.
+    # 0 disables the cap (use sft_epochs alone).
+    native_max_steps_per_round: int = 0
     sft_epochs: float = 2.0
     sft_learning_rate: float = 1.0e-4
     grpo_learning_rate: float = 1.0e-6
     per_device_batch_size: int = 1
     gradient_accumulation: int = 8
+
+    # ---- Native GRPO hyperparameters (spec §5) ----------------------- #
+    # Used by evoguard/training/native_grpo_runner.py when method is one of
+    # {"native_grpo","sft_then_native_grpo"}. All defaults chosen to match
+    # standard RLHF recipe ranges; users override via YAML as needed.
+    grpo_beta: float = 0.04                  # KL coefficient toward reference policy β.
+    grpo_group_size_g: int = 8               # G completions sampled per prompt for group-relative advantage.
+    grpo_clip_epsilon: float = 0.20          # PPO clip range ε.
+    grpo_rollout_temperature: float = 0.90   # sampling temperature during inner-loop generation (>defense temp encourages exploration).
+    grpo_max_prompts_per_round: int = 32     # cap prompts fed to trainer each round bounds runtime.
+
     # If True, only run SFT cold-start on round_0; subsequent rounds reuse the
     # existing adapter and apply GRPO incrementally. Saves ~30-40 min/round of
     # redundant cold-start compute observed in evoguard_agentdojo_full run.
@@ -170,6 +227,31 @@ class TrainingConfig:
     grpo_min_new_successes: int = 5
     # If True, only render configs/datasets and print commands without launching.
     dry_run: bool = True
+
+    # ------------------------------------------------------------------ #
+    # Pre-training LoRA layer probe (one-shot static version)            #
+    # (see docs/delta_signal_essence.md §2.4 causal-chain relay stations)#
+    #                                                                    #
+    # When ``lora_probe_enabled`` is true, an offline pre-pass scores    #
+    # every Transformer block's sensitivity to injection via paired      #
+    # clean/attacked forward passes and writes a JSON artifact at        #
+    # ``lora_probe_artifact_path`` whose ``recommended_target_modules``  #
+    # field overrides the static default target_modules above when the   #
+    # native trainer loads a fresh cold-start adapter in round r0.       #
+    # Subsequent rounds inherit those layers automatically via PEFT      #
+    # adapter_config.json reuse so no per-round re-probing is needed     #
+    # for this static version.                                           #
+    # ------------------------------------------------------------------ #
+    lora_probe_enabled: bool = False
+    # Scoring algorithm selector; MVP ships "attn_kl" only.
+    # "grad_attr"/"act_patch" reserved as interface placeholders only
+    # and are NOT implemented by probes/sensitivity.py yet -- selecting them
+    # raises NotImplementedError at call time rather than silently falling back.
+    lora_probe_method: str = "attn_kl"
+    lora_probe_top_k_blocks: int = 8           # how many Transformer blocks enter target set.
+    lora_probe_artifact_path: str = ""         # written by run_lora_probe.sh entry point;
+                                               # read by native_runner.py to override defaults.
+    lora_probe_max_pairs: int = 80             # stratified-per-domain sampling size cap.
 
 
 @dataclass
@@ -209,6 +291,11 @@ class ExperimentConfig:
     name: str = "evoguard-exp"
     rounds_dir: str = "rounds"
     seed: int = 0
+    # Optional sub-directory inserted between ``<exp_dir>/evo_data`` and the
+    # three bucket names (clean / attack_success_B / attack_failure_C) so that
+    # parallel experiments sharing one repo root can namespace their exports
+    # without colliding. Empty string preserves legacy flat layout.
+    evo_data_subdir: str = ""
     defense: DefenseConfig = field(default_factory=DefenseConfig)
     attacker: AttackerConfig = field(default_factory=AttackerConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
