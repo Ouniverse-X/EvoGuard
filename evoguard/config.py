@@ -215,6 +215,14 @@ class TrainingConfig:
     grpo_clip_epsilon: float = 0.20          # PPO clip range ε.
     grpo_rollout_temperature: float = 0.90   # sampling temperature during inner-loop generation (>defense temp encourages exploration).
     grpo_max_prompts_per_round: int = 32     # cap prompts fed to trainer each round bounds runtime.
+    # 方案乙 (spec §3 explicit Δ↔advantage coupling): multiplicative curriculum factor applied
+    # DIRECTLY on top of group-relative advantages before PPO ratio computation:
+    #     Ã⁽ᵍᵖ⁾ = (1 + λ·δ_p) · A⁽ᵍᵖ⁾
+    # where δ_p is the originating record's normalized Δ carried per-prompt via PromptMeta.
+    # Default λ=0.0 reproduces legacy equal-weight behaviour bit-for-bit so existing yamls keep working;
+    # positive values amplify gradients on latent-attack prompts without touching reward scale itself,
+    # avoiding the dilution problem that crippled r_early's contribution under five-component summing.
+    grpo_advantage_curriculum_lambda: float = 0.0
 
     # If True, only run SFT cold-start on round_0; subsequent rounds reuse the
     # existing adapter and apply GRPO incrementally. Saves ~30-40 min/round of
