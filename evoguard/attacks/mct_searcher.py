@@ -115,7 +115,6 @@ class DeltaGuidedMCTSAttacker:
         self._lambda_delta = float(config.mcts_lambda_delta)
         self._failure_eps = float(config.mcts_failure_credit_eps)
         self._tau_window = int(config.mcts_tau_window_size)
-        self._revisit_frac = float(config.mcts_revisit_fraction)
 
         # ---- Tree state -------------------------------------------------- #
         self._root = _TreeNode(
@@ -555,10 +554,17 @@ class DeltaGuidedMCTSAttacker:
     def _regenerate_population_buffer(self, generation_label: int) -> None:
         """Run N iterations of traverse-and-maybe-expand, materializing one
         candidate AttackSpec per iteration, storing paired paths for upcoming
-        evolve()-driven backpropagation."""
+        evolve()-driven backpropagation.
+
+        v0.x: the previous ``revisit_fraction``-driven split between fresh
+        expansion and known-leaf resampling has been removed. Every iteration
+        now follows the single ``traverse -> expand -> materialize`` pipeline;
+        UCB's explore term alone decides whether mature leaves get revisited
+        or new frontiers get opened, eliminating the artificial 30% budget
+        reservation that starved cold-start tree growth.
+        """
         self.generation = generation_label
         N_target = int(getattr(self.config, "population_size", 50))
-        rev_frac = self._revisit_frac
 
         new_specs: list[AttackSpec] = []
         new_paths: list[list[str]] = []
@@ -570,24 +576,20 @@ class DeltaGuidedMCTSAttacker:
             attempts_guard -= 1
             tries_total += 1
 
-            r_draw = self.rng.random()
-            want_revisit = (r_draw < rev_frac) and bool(new_specs)   # avoid pure-revisit deadlock on cold start
-            if want_revisit:
-                path, leaf = self._descend_into_leaf_under(self._root)
+            path, frontier = self._traverse_to_frontier()
+            extended = self._expand_frontier(frontier)
+            if extended is not None:
+                path = path + [extended.node_id]
+                leaf = extended
+                tries_in_expand_mode += 1
             else:
-                path, frontier = self._traverse_to_frontier()
-                extended = self._expand_frontier(frontier)
-                if extended is not None:
-                    path = path + [extended.node_id]
-                    leaf = extended
-                    tries_in_expand_mode += 1
-                else:
-                    leaf = frontier
-                    if leaf.level != "L3_payload" and not leaf.children_ids:
-                        # Empty frontier with no extension possible right now:
-                        # force descend-if-any-children path fallback
-                        path2, leaf2 = self._descend_into_leaf_under(self._root)
-                        path, leaf = path2, leaf2
+                leaf = frontier
+                if leaf.level != "L3_payload" and not leaf.children_ids:
+                    # Empty frontier with no extension possible right now:
+                    # force descend-if-any-children path fallback so we still
+                    # emit a valid AttackSpec this iteration.
+                    path2, leaf2 = self._descend_into_leaf_under(self._root)
+                    path, leaf = path2, leaf2
 
             spec = self._materialize_attack_from_leaf(path, leaf)
             new_specs.append(spec)

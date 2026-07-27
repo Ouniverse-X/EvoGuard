@@ -128,7 +128,6 @@ class AttackerConfig:
     mcts_lambda_delta: float = 0.6      # weight of the delta-potential term in selection score
     mcts_failure_credit_eps: float = 0.03  # fraction of late-caught-failure tau converted into partial credit
     mcts_tau_window_size: int = 8        # sliding window of recent C-class taus kept per node
-    mcts_revisit_fraction: float = 0.30  # share of N budget reserved for revisiting existing leaves
 
 
 @dataclass

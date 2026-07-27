@@ -70,7 +70,6 @@ attacker:
   mcts_lambda_delta: 0.6                        # weight of the delta-potential term in UCB-Δ selection score.
   mcts_failure_credit_eps: 0.03                # fraction of late-caught-failure tau converted into partial credit.
   mcts_tau_window_size: 8                       # sliding window of recent C-class taus kept per node.
-  mcts_revisit_fraction: 0.30                   # share of N budget reserved for revisiting existing leaves.
 
 env:
   dataset: agentdojo
