@@ -99,13 +99,13 @@ class AttackedRollout(RolloutStrategy):
         self.process_config = process_config
 
     def rollout(self, task: Task, *, attack: AttackSpec, clean: Trajectory, **kwargs) -> TrajectoryRecord:
-        traj = self.controller.run_attacked(task, attack)
+        traj = self.controller.run_attacked(task, attack, clean=clean)
         success, reason = self.judge.judge(traj, attack)
         outcome = AttackOutcome.SUCCESS if success else AttackOutcome.FAIL
         signals = compute_signals(clean, traj, attack, self.process_config)
 
         # Score benign-task completion on the attacked trajectory too so we can
-        # detect DoS-style over-defense (high safety_precision but low preserved
+        # detect DoS-style over-defense (high cf_precision but low preserved
         # utility). Same fallback semantics as CleanRollout.
         utility_preserved: Optional[float] = None
         method_tag = ""

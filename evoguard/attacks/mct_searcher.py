@@ -1,14 +1,4 @@
 """Δ-guided Monte-Carlo Tree Search attacker backend.
-
-Alternative to :class:`evoguard.attacks.genetic.GeneticAttacker`. Replaces flat
-population-based optimization with structured tree-of-rollouts exploration whose
-selection rule is biased toward subtrees historically producing high-latency
-(``τ_turn − τ_inj`` large) successful injections -- i.e. *latent* attacks rather
-than immediate-trigger ones.
-
-Public interface mirrors ``GeneticAttacker`` exactly so callers swap backends
-purely through ``AttackerConfig.search_method``::
-
     build_attacker(task, tools, gen, cfg,
                    defense_max_turns=K)   # picks GA vs MCTS internally
 """
@@ -16,8 +6,11 @@ purely through ``AttackerConfig.search_method``::
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import random
+import re
 from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Optional, Sequence
@@ -33,10 +26,75 @@ logger = get_logger("attacks.mct_searcher")
 _NodeLevel = Literal["root", "L1_turn", "L2_method", "L3_payload"]
 
 # Cap how many sibling nodes a single ``_expand_frontier`` invocation may
-# register from one generator call. Prevents pathological cases where the
-# LLM returns dozens of similar method labels in one batch and inflates a
-# single cell of the tree before any of its siblings get explored.
+# register from one generator call. 
 _MAX_BATCH_SPAWN_PER_CALL = 6
+
+
+# --------------------------------------------------------------------------- #
+# Prewarm skeleton loader (warm-start hand-authored JSON templates)            #
+# --------------------------------------------------------------------------- #
+_PREWARM_CACHE: Optional[dict[str, list[dict]]] = None
+
+
+def _load_prewarm_skeletons_all() -> dict[str, list[dict]]:
+    global _PREWARM_CACHE
+    if _PREWARM_CACHE is not None:
+        return _PREWARM_CACHE
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.getcwd(), "data", "toolsafe", "agentdojo-tragj"),
+        os.path.join(here, "..", "..", "data", "toolsafe", "agentdojo-tragj"),
+    ]
+    cache: dict[str, list[dict]] = {}
+    seen_dirs: set[str] = set()
+    for cdir in candidates:
+        try:
+            rdir = os.path.realpath(cdir)
+        except OSError:
+            continue
+        if not os.path.isdir(rdir) or rdir in seen_dirs:
+            continue
+        seen_dirs.add(rdir)
+        try:
+            entries = sorted(os.listdir(rdir))
+        except OSError as exc:
+            logger.warning("[prewarm] cannot list %s (%s); skipping.", rdir, exc)
+            continue
+        n_loaded_for_this_dir = 0
+        for fname in entries:
+            m = re.match(r"^(?P<suite>[a-z]+)_seeds\.json$", fname)
+            if not m:
+                continue
+            suite_key = m.group("suite")
+            fpath = os.path.join(rdir, fname)
+            try:
+                with open(fpath, encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            except (OSError, ValueError) as exc:
+                logger.warning("[prewarm] failed reading %s: %s", fpath, exc)
+                continue
+            entry_list = []
+            if isinstance(raw, dict):
+                seeds_field = raw.get("seeds")
+                if isinstance(seeds_field, list):
+                    for ent in seeds_field:
+                        if isinstance(ent, dict):
+                            entry_list.append(ent)
+            elif isinstance(raw, list):  # tolerate bare-list format too
+                entry_list.extend(e for e in raw if isinstance(e, dict))
+            cache[suite_key] = entry_list
+            n_loaded_for_this_dir += len(entry_list)
+        if cache:
+            logger.info(
+                "[prewarm] loaded skeletons from %s across %d suites "
+                "(total=%d entries).",
+                rdir, len(cache), sum(len(v) for v in cache.values()),
+            )
+            break  
+
+    _PREWARM_CACHE = cache  
+    return _PREWARM_CACHE
 
 
 # --------------------------------------------------------------------------- #
@@ -59,15 +117,15 @@ class _TreeNode:
     discriminator: dict[str, Any] = field(default_factory=dict)
 
     n_visits: int = 0
-    n_success: int = 0                       # count of B-class outcomes observed here
+    n_success: int = 0                       # count of B-class outcomes observed 
     sum_delta_on_success: float = 0.0         # Σ Δ_norm restricted to successes only
     max_delta_observed: float = 0.0           # running peak for exploitation bound
 
     # Failure partial credit machinery. Sliding window length governed by config
-    # ``mcts_tau_window_size``; rolling sum kept separately for O(1) reads inside
-    # the UCB score function.
+    # ``mcts_tau_window_size``; 
     last_failure_taus: deque = field(default_factory=lambda: deque(maxlen=8))
-    sum_partial_credit: float = 0.0            # accumulated ε·tau_frac contributions
+    # 走过它的失败的case给他的贡献（8的滑窗）
+    sum_partial_credit: float = 0.0            
 
     cached_payload_text: Optional[str] = None  # set on L3 leaves post-materialization
     children_ids: list[str] = field(default_factory=list)
@@ -80,13 +138,7 @@ def _short_hash(text: str, prefix_len: int = 10) -> str:
     return h[:prefix_len]
 
 
-# --------------------------------------------------------------------------- #
-# Attacker                                                                    #
-# --------------------------------------------------------------------------- #
 class DeltaGuidedMCTSAttacker:
-    """MCTS-based replacement for :class:`GeneticAttacker`.
-    """
-
     def __init__(
         self,
         task: Task,
@@ -109,14 +161,13 @@ class DeltaGuidedMCTSAttacker:
         else:
             self._inject_turn_ceiling = max(1, len(self.tools))
 
-        # ---- Cache MCTS config scalars (constant per run, avoids repeated
-        #      getattr lookups on the UCB hot path). ---------------------------- #
-        self._ucb_c = float(config.mcts_ucb_c)
+        self._ucb_c = float(config.mcts_ucb_c)#公式探索系数
+        # delta方差项系数
         self._lambda_delta = float(config.mcts_lambda_delta)
+        # 失败样本的部分积分系数 ε。当一次攻击失败但被防御方很晚才检测到（tau_caught 大）时，仍给该路径一定正向信用 ε·(tau/T_cap)
         self._failure_eps = float(config.mcts_failure_credit_eps)
         self._tau_window = int(config.mcts_tau_window_size)
 
-        # ---- Tree state -------------------------------------------------- #
         self._root = _TreeNode(
             node_id="root",
             parent_id=None,
@@ -129,22 +180,20 @@ class DeltaGuidedMCTSAttacker:
         # Buffer coupling current_population <-> next evolve(): each element is
         # parallel pair (spec, path_of_node_ids_used_during_materialization).
         # Path info lets backprop know exactly which ancestors deserve updates
-        # when evaluated results come back, even though specs themselves don't
-        # carry tree coordinates.
+        # when evaluated results come back
         self._buffer_specs: list[AttackSpec] = []
         self._buffer_paths: list[list[str]] = []
 
-        # Pre-populate deterministic L1 enumeration so subsequent selects never
-        # hit an empty frontier at depth-1 needing expensive generation calls.
         self._ensure_L1_children()
+        self._inject_prewarm_skeletons()
 
     @property
     def injectable_turn_ceiling(self) -> int:
-        """Exclusive upper bound for ``AttackSpec.target_turn``."""
+        """返回攻击注入目标轮次的排他上界，攻击target_turn 的合法取值范围是 [0, injectable_turn_ceiling) 这一值由防御方对话轮次和工具列表长度决定"""
         return self._inject_turn_ceiling
 
     def sanitize_spec(self, spec: AttackSpec) -> AttackSpec:
-        """Mirror :py:meth:`GeneticAttacker.sanitize_spec` semantics."""
+        """裁剪越界的 target_turn"""
         ub = self._inject_turn_ceiling - 1
         original = int(spec.target_turn)
         clamped = max(0, min(original, ub))
@@ -158,15 +207,8 @@ class DeltaGuidedMCTSAttacker:
             return replace(spec, target_turn=clamped)
         return spec
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                        #
-    # ------------------------------------------------------------------ #
     def current_population(self) -> list[AttackSpec]:
         """Return the batch scheduled for rollout evaluation this round.
-
-        First invocation seeds lazily; subsequent invocations re-use whatever was
-        installed by the previous :meth:`evolve` (or the constructor seeding step
-        if nothing evolved yet).
         """
         if not self._buffer_specs:
             self._regenerate_population_buffer(self.generation)
@@ -221,7 +263,6 @@ class DeltaGuidedMCTSAttacker:
     def _register_node(self, node: _TreeNode) -> _TreeNode:
         nid = node.node_id
         if nid != "root" and nid in self._nodes_by_id:
-            # Idempotent registration allowed for caller convenience.
             return self._nodes_by_id[nid]
         self._nodes_by_id[nid] = node
         if node.parent_id is not None:
@@ -250,9 +291,6 @@ class DeltaGuidedMCTSAttacker:
 
     def _ensure_L1_children(self) -> None:
         """Pre-create every reachable target_turn slot up-front.
-
-        Deterministic expansion requiring NO LLM calls; saves budget for deeper
-        layers where generative creativity matters most.
         """
         ceiling = self._inject_turn_ceiling
         for t in range(ceiling):
@@ -270,26 +308,99 @@ class DeltaGuidedMCTSAttacker:
             )
             self._register_node(child)
 
+    def _inject_prewarm_skeletons(self) -> None:
+        """For each skeleton entry whose ``turn`` falls in
+        ``[0, inject_turn_ceiling)`` and whose ``method`` label is non-empty, an
+        :class:`_TreeNode` of level ``L2_method`` is registered as a child of the
+        corresponding L1_turn sibling IF no sibling with identical method already
+        exists. The payload_template is stashed on the new node's
+        ``cached_payload_text`` so subsequent materialization can surface it to
+        downstream mutators when they ask for a refinement hint.
+        """
+        try:
+            skel_by_suite = _load_prewarm_skeletons_all()
+        except Exception as exc:                                            
+            logger.warning("[prewarm] loader raised (%s); skipping injection.", exc)
+            return
+        if not skel_by_suite:
+            return
+
+        suite = (getattr(self.task, "suite", "") or "").strip()
+        if not suite:
+            return
+
+        entries = skel_by_suite.get(suite)
+        if not isinstance(entries, list) or not entries:
+            return
+
+        added = 0
+        skipped_dup = 0
+        skipped_oob = 0
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            turn_raw = ent.get("turn")
+            method = str(ent.get("method") or "").strip()
+            tmpl = str(ent.get("payload_template") or "").strip()
+            try:
+                t_val = int(turn_raw)
+            except (TypeError, ValueError):
+                skipped_oob += 1
+                continue
+            if t_val < 0 or t_val >= self._inject_turn_ceiling or not method:
+                skipped_oob += 1
+                continue
+            l1_parent = self._child_with_discriminator(
+                self._root, disc_key="turn", disc_value=t_val,
+            )
+            if l1_parent is None:
+                skipped_oob += 1
+                continue       
+            ex = self._child_with_discriminator(
+                l1_parent, disc_key="method", disc_value=method,
+            )
+            if ex is not None:
+                # If pre-existing sibling has no template but we do have one now,
+                # backfill so future mutation steps can pick up the template text.
+                if not getattr(ex, "cached_payload_text", None) and tmpl:
+                    ex.cached_payload_text = tmpl
+                    logger.debug(
+                        "[prewarm] enriched existing %s/%s with template from seeds.json",
+                        suite, method[:32],
+                    )
+                else:
+                    skipped_dup += 1
+                continue
+            cid = f"L2_{method}_{_short_hash(method)}"
+            ch = _TreeNode(
+                node_id=cid,
+                parent_id=l1_parent.node_id,
+                level="L2_method",
+                discriminator={"method": method},
+                cached_payload_text=tmpl or None,
+            )
+            self._register_node(ch)
+            added += 1
+
+        if added > 0:
+            logger.info(
+                "[prewarm][task=%s] injected %d skeletons under root "
+                "(skipped dup=%d oob=%d).",
+                (self.task.task_id or "?")[:60], added, skipped_dup, skipped_oob,
+            )
+
     # ------------------------------------------------------------------ #
     # Selection                                                         #
     # ------------------------------------------------------------------ #
     def _ucb_score(self, parent_visits: int, child: _TreeNode) -> float:
         """Composite selection criterion.
-
         ``score = exploit_term + c·explore_term + λ·δ_potential``
-
-        The staleness-penalty term once planned in ``docs/mcts_attacker_design.md``
-        has been removed from this implementation. Its underlying Phase-C machinery
-        (LoRA-fingerprint hashing, exponential decay sweep, resurrection probes)
-        was never wired up, so carrying an always-zero fourth summand served no
-        purpose but to mislead readers into thinking it influenced selection.
-        Should that subsystem ever land, restore the subtraction here and add the
-        required bookkeeping fields to :class:`_TreeNode`.
         """
         eps_visit = 1e-9
         if child.n_visits <= 0:
-            exploit_mean_delta = 0.01               # tiny prior avoids div-by-zero lockout
-            variance_estimate = 0.25                  # broad prior on unseen regions
+            exploit_mean_delta = 0.01               
+            # 做个宽先验，如果节点未访问，这片方差设为0.25，鼓励探索
+            variance_estimate = 0.25                 
         else:
             denom_succ = float(max(1, child.n_success))
             mean_on_succ = float(child.sum_delta_on_success) / denom_succ
@@ -313,18 +424,15 @@ class DeltaGuidedMCTSAttacker:
         return exploit_mean_delta + explore_term + delta_potential
 
     def _traverse_to_frontier(self) -> tuple[list[str], _TreeNode]:
-        """Walk from root picking best-scoring child at each interior node
-        until arriving at an L3 payload leaf or a frontier with no children yet
-        (the natural expansion point)."""
         path: list[str] = ["root"]
         cur = self._root
         guard_iters = 0
         while True:
             guard_iters += 1
             if guard_iters > 10000:
-                break                          # circuit-breaker safeguard
+                break                          
             if not cur.children_ids:
-                break                           # truly empty subtree → must be expanded outside
+                break                          
             visits_parent = cur.n_visits
             scored_children: list[tuple[float, _TreeNode]] = []
             for cid in cur.children_ids:
@@ -335,61 +443,39 @@ class DeltaGuidedMCTSAttacker:
                 scored_children.append((s, cn))
             if not scored_children:
                 break
-            # Random tie-breaking prevents degenerate repeat-picking when many
-            # children share identical zero-statistics during cold-start phases.
             self.rng.shuffle(scored_children)
             top_s, top_n = max(scored_children, key=lambda x: x[0])
             path.append(top_n.node_id)
             cur = top_n
             if cur.level == "L3_payload":
                 break
-            # Stop descending when we hit a leaf with no children — that is the
-                # natural expansion point. No visit-count gating: any interior
-                # node may be expanded on every call, so cold-start latency and
-                # generator output waste are both minimised.
+            # MCT只有三层，走到头就不往下走
             if not cur.children_ids:
                 break                           # leaf with no children → expand now
         return path, cur
-
-    # ------------------------------------------------------------------ #
-    # Expansion                                                         #
-    # ------------------------------------------------------------------ #
+ 
     def _expand_frontier(self, node: _TreeNode) -> Optional[_TreeNode]:
         """Create one or more new children beneath ``node`` and return the last
         freshly-registered child (or ``None`` when nothing new could be produced).
-
-        Eligibility rules after v0.x simplification:
-          • Only L1/L2 levels are expandable — L3 leaves never spawn further.
-          • No visit-count gating. Any interior node may add siblings on every
-            call, so cold-start latency is minimised.
-          • Generator output is harvested in BATCH rather than first-match-return:
-            all unique candidates within ``_MAX_BATCH_SPAWN_PER_CALL`` get registered
-            as sibling children in one shot, eliminating wasted API calls when the
-            generator returns several novel labels at once (the previous behaviour
-            discarded all but the first unique match).
-          • Returns the LAST newly-created child as the leaf targeted by THIS
-            simulation step; its older siblings stay attached waiting for future
-            select passes to discover them naturally via UCB scoring.
-
-        The L2 → L3 branch remains single-shot because :meth:`AttackGenerator.mutate`
-        is a single-input/single-output interface by contract; batching there would
-        require an upstream API change outside the scope of this refactor.
         """
         if node.level not in {"L1_turn", "L2_method"}:
             return None
-
+        # 调用 LLM 生成器批量获取候选攻击方法
+        # 从当前 L1 节点的 discriminator 取出它代表的目标注入轮次编号 t_val
         if node.level == "L1_turn":
             t_val = int(node.discriminator.get("turn", 0))
+            # 调用攻击生成器 generator
             seeded = self.generator.seed(
                 self.task, self.tools,
                 n=_MAX_BATCH_SPAWN_PER_CALL * 2,           # request a bit more than cap so dedup losses don't starve us
                 max_turns=t_val + 1, generation=self.generation,
             )
             newly_registered: list[_TreeNode] = []
+            # 批量生产，确保去重后的候选节点在0-_MAX_BATCH_SPAWN_PER_CALL之间，这里多请求一倍，主要防止去重给删完了
             for cand_spec in seeded[: _MAX_BATCH_SPAWN_PER_CALL * 2]:
                 lbl = cand_spec.method or ""
                 if not lbl or len(newly_registered) >= _MAX_BATCH_SPAWN_PER_CALL:
-                    continue                              # blank label OR per-call cap reached -- stop adding but keep iterating for completeness
+                    continue                              # 
                 ex = self._child_with_discriminator(node, disc_key="method", disc_value=lbl)
                 if ex is not None:
                     continue                               # dup against existing sibling -- skip WITHOUT aborting the loop
@@ -406,12 +492,15 @@ class DeltaGuidedMCTSAttacker:
 
         if node.level == "L2_method":
             t_val = self._lookup_ancestor_turn_value(node.node_id)
+            # 构造一个最小化的展位，作为变异器的输入种子
             placeholder = _construct_seed_from_cell(t_val, node.discriminator.get("method"), self.task)
+            # 基于占位 spec 生成一个具体的攻击 payload 文本
             mutated = self.generator.mutate(self.task, self.tools, placeholder, generation=self.generation)
             sig_hash = _short_hash(mutated.payload or "")
+            # 查看生成的新节点和以前的有没有重复
             ex = self._child_with_discriminator(node, disc_key="signature", disc_value=sig_hash)
             if ex is not None:
-                return ex                      # silently reused if collision occurs
+                return ex # silently reused
             cid = f"L3_{sig_hash}"
             ch = _TreeNode(
                 node_id=cid, parent_id=node.node_id, level="L3_payload",
@@ -424,12 +513,11 @@ class DeltaGuidedMCTSAttacker:
 
     def _descend_into_leaf_under(self, node: _TreeNode) -> tuple[list[str], _TreeNode]:
         """Pick some descendant L3 leaf beneath ``node`` (or stay put if already
-        at L3), returning both path ids and chosen leaf. Used when revisiting
-        known territory rather than spawning fresh branches."""
+        at L3), returning both path ids and chosen leaf."""
         path: list[str] = [node.node_id]
         cur = node
         if cur.children_ids:
-            # walk greedily until L3 reached
+            # 对于给定的节点，沿UCB最有路径一路下行到 L3 叶节点
             while cur.level != "L3_payload" and cur.children_ids:
                 visits_p = cur.n_visits
                 kids = [kn for kn in (self._nodes_by_id.get(c) for c in cur.children_ids) if kn is not None]
@@ -484,7 +572,7 @@ class DeltaGuidedMCTSAttacker:
             injection_channel="",              # filled in by generator pipeline elsewhere
             method=method,
             payload=payload,
-            goal=self.task.instruction[:200],  # mirror heuristic commonly seen in records
+            goal=self.task.instruction[:200],  
             generation=self.generation,
             parents=[leaf.node_id],
             origin=f"mcts_{leaf.level}",
@@ -523,11 +611,6 @@ class DeltaGuidedMCTSAttacker:
                              delta_norm: float,
                              tau_caught: int):
         """Update visit/success/delta/partial-credit counters on every ancestor.
-
-        Failures add fractional credit ``ε·mean(last_failure_taus)/T_ceiling``
-        accumulated into :attr:`_TreeNode.sum_partial_credit` -- this quantity
-        feeds back into :meth:`_ucb_score` indirectly nudging selections toward
-        subtrees where late-caught failures hint at latent potential.
         """
         T_cap = float(self._inject_turn_ceiling) or 1.0
 
@@ -555,13 +638,6 @@ class DeltaGuidedMCTSAttacker:
         """Run N iterations of traverse-and-maybe-expand, materializing one
         candidate AttackSpec per iteration, storing paired paths for upcoming
         evolve()-driven backpropagation.
-
-        v0.x: the previous ``revisit_fraction``-driven split between fresh
-        expansion and known-leaf resampling has been removed. Every iteration
-        now follows the single ``traverse -> expand -> materialize`` pipeline;
-        UCB's explore term alone decides whether mature leaves get revisited
-        or new frontiers get opened, eliminating the artificial 30% budget
-        reservation that starved cold-start tree growth.
         """
         self.generation = generation_label
         N_target = int(getattr(self.config, "population_size", 50))
@@ -585,9 +661,7 @@ class DeltaGuidedMCTSAttacker:
             else:
                 leaf = frontier
                 if leaf.level != "L3_payload" and not leaf.children_ids:
-                    # Empty frontier with no extension possible right now:
-                    # force descend-if-any-children path fallback so we still
-                    # emit a valid AttackSpec this iteration.
+                    # 如果无法扩展，在 ``node`` 下方选取某个 L3 叶子节点作为后代（若当前已处于 L3 层级则保持原位）
                     path2, leaf2 = self._descend_into_leaf_under(self._root)
                     path, leaf = path2, leaf2
 
@@ -620,8 +694,7 @@ def _construct_seed_from_cell(turn: int, method: str, task: Task, *,
                               payload: str = "") -> AttackSpec:
     """Build a minimal valid AttackSpec representing the cell identified by
     (turn, method). Used solely as scaffolding around generator.mutate() calls
-    expecting an individual argument; the resulting mutated payload replaces
-    whatever stub content lives here."""
+    expecting an individual argument"""
     return AttackSpec(
         attack_id=AttackSpec.new_id(),
         task_id=task.task_id,

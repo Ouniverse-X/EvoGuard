@@ -29,7 +29,7 @@ defense:
     model: qwen2.5-7b-it                        # base served model; LoRA adapter overlaid each round after hot-load fix.
     base_url: http://127.0.0.1:8000/v1
     api_key: EMPTY                              # vLLM ignores key value but SDK requires non-empty string.
-    temperature: 0.2                            # greedy-ish defense policy during rollouts (GRPO uses its own temp below).
+    temperature: 0.0                            # deterministic defense policy during rollouts — eliminates pre-injection divergence (negative delta) even without clean-replay; clean-replay is belt-and-suspenders.
     max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
     timeout: 120.0
     max_retries: 3
