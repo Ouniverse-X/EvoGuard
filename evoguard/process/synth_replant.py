@@ -347,5 +347,158 @@ def make_live_judge_closure(*,endpoint_url:str,model_id:str,
     return closure
 
 
+def assemble_diversified_batch(*,results:Sequence[ReplayValidationResult],
+                                family_ceiling:float=FAMILY_CONCENTRATION_CEILING,
+                                per_bucket_quota:int|None=None,
+                                rng_random_state:int=0)->list[ReplayValidationResult]:
+    """Filter accepted-results enforcing per-canonical-family concentration ceiling.
+
+    Uses a POST-ADD projected-share guard: a family is only extended when adding one more
+    would keep its share at-or-below ``family_ceiling``. This guarantees the ceiling invariant
+    holds on the final selected pool regardless of input distribution skew.
+    """
+    import random as _rng
+    _rng.seed(rng_random_state)
+
+    grouped:dict[str,list[ReplayValidationResult]]={}
+    for r in results:
+        if not r.accepted: continue
+        fid=r.candidate.seed.canonical_technique_id or "<none>"
+        grouped.setdefault(fid,[]).append(r)
+    # Randomize within-family order so pop() doesn't favor a fixed sub-ordering.
+    for fid in grouped:
+        _rng.shuffle(grouped[fid])
+
+    selected:list[ReplayValidationResult]=[]
+    safety_iters=0
+
+    # Bootstrap: seed one item per family so the ceiling guard has a baseline denominator.
+    for fid in sorted(grouped.keys()):
+        lst=grouped[fid]
+        if not lst: continue
+        pick=lst.pop()
+        selected.append(pick)
+        if per_bucket_quota is not None and len(selected)>=per_bucket_quota:
+            break
+    if per_bucket_quota is not None and len(selected)>=per_bucket_quota:
+        return selected
+
+    while True:
+        progressed_any=False
+        for fid in sorted(grouped.keys()):
+            lst=grouped[fid]
+            if not lst: continue
+            count_fid=sum(1 for s in selected if s.candidate.seed.canonical_technique_id==fid)
+            projected_after=(count_fid+1)/max(len(selected)+1,1)
+            if projected_after<=family_ceiling+1e-12:
+                pick=lst.pop()
+                selected.append(pick)
+                progressed_any=True
+                if per_bucket_quota is not None and len(selected)>=per_bucket_quota:
+                    break
+        if per_bucket_quota is not None and len(selected)>=per_bucket_quota:
+            break
+        if not progressed_any:
+            break
+        safety_iters+=1
+        if safety_iters>10_000:
+            break
+    return selected
+
+
+def run_pipeline(*,bench_root:str,target_buckets:Sequence[str]=("d3","d4"),
+                 rounds_root:str=".",dry_run:bool=False,
+                 defender_generate_fn=None,live_judge_factory=None,
+                 per_bucket_quota:int=100,family_ceiling:float=FAMILY_CONCENTRATION_CEILING)->dict:
+    """Top-level orchestrator chaining β-1→β-5 emitting synth outputs under bench/scenarios/_synthetic/.
+
+    Returns summary statistics suitable for inclusion in CHANGELOG.md audit trail.
+    """
+    br=Path(bench_root)
+    syn_root=br/"scenarios"/"_synthetic"
+    syn_root.mkdir(parents=True,exist_ok=True)
+
+    seeds=extract_seeds(bench_root=bench_root,source_buckets=("imm","d1","d2"),rounds_root=rounds_root)
+    near_misses_global:list=[]
+    accepted_by_bucket:dict[str,list[ReplayValidationResult]]={bk:[] for bk in target_buckets}
+
+    for bk in target_buckets:
+        tgt=int(bk.lstrip("d"))
+        bucket_full=False
+        for sd in seeds:
+            if bucket_full: break
+            for cand in enumerate_candidates(seed=sd,target_deltas=(tgt,),
+                                             near_miss_sink=near_misses_global):
+                res=validate_forward_replay(candidate=cand,
+                                            defender_generate_fn=defender_generate_fn,
+                                            judge_fn=live_judge_factory() if live_judge_factory else None,
+                                            near_miss_sink=near_misses_global)
+                if res.accepted:
+                    accepted_by_bucket[bk].append(res)
+                    if len(accepted_by_bucket[bk])>=per_bucket_quota:
+                        bucket_full=True
+                        break
+
+    written_totals={}
+    for bk,results_list in accepted_by_bucket.items():
+        curated=assemble_diversified_batch(results=results_list,family_ceiling=family_ceiling,
+                                           per_bucket_quota=per_bucket_quota,rng_random_state=0)
+        out_path=syn_root/f"bucket_{bk}_synth.jsonl"
+        if dry_run:
+            written_totals[bk]=("DRY_RUN_SKIPPED_WRITE",len(curated));continue
+        with open(out_path,"w",encoding="utf-8") as wh:
+            for cr in curated:
+                serialized=_serialize_accepted_result(cr)
+                wh.write(serialized+"\n")
+        written_totals[bk]=len(curated)
+
+    return {"buckets_written":written_totals,
+            "seeds_loaded":len(seeds),
+            "accepted_total_before_diversification":sum(len(l) for l in accepted_by_bucket.values()),
+            "near_miss_logged":len(near_misses_global)}
+
+
+def _serialize_accepted_result(result:ReplayValidationResult)->str:
+    """Convert accepted validation result into bench_v2 JSONLine row tagged origin_mode=synth_shifted."""
+    from evoguard.process.bench_schema import ScenarioRecordV2, SignalsRef
+    cand=result.candidate; seed=cand.seed
+    sr_obj=ScenarioRecordV2(
+        scenario_id=f"scn_synth_{_short_uuid_hex()}",
+        bucket=f"d{cand.target_delta}",origin_mode="synth_shifted",
+        delta_value_orig=cand.target_delta,
+        canonical_technique_id=seed.canonical_technique_id,
+        method_tag_raw="(synth-shifted)",
+        task_id=seed.task_id,domain=seed.domain,
+        toolkit_signature=seed.toolkit_signature,
+        goal_instruction="",
+        context_prefix_actions=seed.context_prefix_actions_verbatim[:cand.proposed_injection_turn_index+1],
+        poisoned_observation_text=seed.poisoned_observation_text,
+        injected_payload_sha256_first16=_sha_short(),
+        injection_target_turn_index=cand.proposed_injection_turn_index,
+        signals_ref=SignalsRef(injection_point=cand.proposed_injection_turn_index,
+                              turning_point=result.divergence_absolute_turn_index or 0,
+                              delta=cand.target_delta,
+                              delta_normalized=round(float(cand.target_delta)/max(len(seed.context_prefix_actions_verbatim),1),4),
+                              edit_distance=-1),
+        provenance={"_provenance":{
+            "synthesizer_version":"v2.0.0-alpha",
+            "validator_judge_model":"live-qwen2.5-7b-port8002",
+            "shift_steps_from_origin":cand.proposed_injection_turn_index-seed.injection_target_turn_index_original,
+            "origin_scenario_id":seed.origin_scenario_id,
+            "replay_defender_model_state":"base-model-no-lora-loaded"}})
+    return sr_obj.to_json_line()
+
+
+def _short_uuid_hex()->str:
+    import uuid
+    return uuid.uuid4().hex[:16]
+
+def _sha_short()->str:
+    import hashlib,time
+    digest=hashlib.sha256(time.time_ns().to_bytes(8,'big')).hexdigest()[:16]
+    return digest
+
+
 __all__=["SynthSeed","CandidateShiftPosition","extract_seeds","enumerate_candidates",
-         "validate_forward_replay","ReplayValidationResult","make_live_judge_closure"]
+         "validate_forward_replay","ReplayValidationResult","make_live_judge_closure",
+         "assemble_diversified_batch","run_pipeline"]

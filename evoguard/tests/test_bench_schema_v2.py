@@ -1,9 +1,11 @@
 """Tests for bench_v2 constants & schemas. Runnable as python -m or pytest."""
 from __future__ import annotations
 
+import collections
 import importlib
 import json
 import pathlib
+import random
 import tempfile
 from pathlib import Path
 
@@ -571,6 +573,29 @@ def test_live_judge_closure_gracefully_degrades_to_reject_on_network_failure_wit
     verdict,msg=closure({},None)
     assert verdict is False
     assert "network-error" in msg.lower()
+
+
+def test_assemble_diversified_caps_single_family_share_at_configured_ceiling_pct(tmp_path=None):
+    sr=_sr(); bc=_bc()
+    random.seed(0)
+    fake_results=[]
+    families=['AAA','BBB','CCC','DDD','EEE','FFF']
+    # Generate many results concentrated heavily in AAA exceeding 35% share naturally
+    for i in range(60):
+        chosen_family='AAA' if i%2==0 else ('BBB' if i%3==0 else random.choice(['CCC','DDD']))
+        fr=sr.ReplayValidationResult(True,
+                                      candidate=sr.CandidateShiftPosition(seed=sr.SynthSeed("","",0,"workspace","","","",chosen_family,"",[{"thought":"","tool_call":{"name":"X"},"observation":""}],0,[{}],{}),
+                                                                       proposed_injection_turn_index=i%5,target_delta=3,estimated_max_lookahead_budget=5),
+                                      measured_delta=3,divergence_absolute_turn_index=i%5+3,rejection_reason_code="")
+        fake_results.append(fr)
+
+    assembled=sr.assemble_diversified_batch(results=fake_results,
+                                            family_ceiling=bc.FAMILY_CONCENTRATION_CEILING,
+                                            per_bucket_quota=40)
+    families_kept_counter=collections.Counter(r.candidate.seed.canonical_technique_id for r in assembled)
+    dominant_share=max(families_kept_counter.values())/sum(families_kept_counter.values())
+    assert dominant_share<=bc.FAMILY_CONCENTRATION_CEILING+1e-9
+    assert len(assembled)<=len(fake_results)
 
 
 def _main() -> int:
