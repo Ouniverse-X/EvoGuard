@@ -598,6 +598,50 @@ def test_assemble_diversified_caps_single_family_share_at_configured_ceiling_pct
     assert len(assembled)<=len(fake_results)
 
 
+def _bg():
+    return importlib.import_module("evoguard.process.bench_release_gate")
+
+
+def test_release_gate_emits_three_diagnostic_jsons_under_specified_paths_given_partial_filled_layout(tmp_path=None):
+    bg=_bg()
+    tmp_path=_opt_tmp(tmp_path)
+    # Construct partial-filled bench dir mimicking mid-execution checkpoint state
+    br=tmp_path/"partial_bench"
+    (br/"scenarios").mkdir(parents=True)
+    for lbl,count in [("imm",100),("d1",100),("d2",75),("d3",55),("d4",48)]:
+        rows=[{"scenario_id":f"sid_{lbl}{i:>04}","bucket":lbl,"schema_version":"bench_v2",
+               "origin_mode":"mined","delta_value_orig":int(lbl.replace("imm","0").replace("d","")),
+               "canonical_technique_id":"tech_placeholderAA","task_id":"x","domain":"workspace",
+               "toolkit_signature":"","goal_instruction":"","context_prefix_actions":[],
+               "poisoned_observation_text":"","injected_payload_sha256_first16":"",
+               "injection_target_turn_index":0,"signals_ref":{"injection_point":0,"turning_point":0,"delta":0,"delta_normalized":0,"edit_distance":-1},
+               "_provenance":{}} for i in range(count)]
+        (br/"scenarios"/f"bucket_{lbl}.jsonl").write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+
+    verdict=bg.evaluate_release_state(bench_root=str(br),planned_contrasts_count=4,output_diag_subdir="diagnostics")
+
+    pa_path=br/"diagnostics"/"pool_audit.json"; pc_path=br/"diagnostics"/"power_calc.json"; cf_path=br/"diagnostics"/"confound_report.json"
+    assert pa_path.exists() and pc_path.exists() and cf_path.exists()
+    assert verdict["stagegate_decision"].startswith(("BLOCKED_","DEV_SNAPSHOT_ALLOWED","PUBLIC_RELEASE_ALLOWED"))
+
+
+def test_release_gate_decision_consistent_between_evaluations_until_inputs_change_stability_property(tmp_path=None):
+    bg=_bg()
+    tmp_path=_opt_tmp(tmp_path)
+    br=tmp_path/"stable_bench"; (br/"scenarios").mkdir(parents=True)
+    rows=[{"scenario_id":f"a{i:>03}","bucket":"imm","schema_version":"bench_v2","origin_mode":"mined",
+           "delta_value_orig":0,"canonical_technique_id":"tech_qq","task_id":"x","domain":"workspace",
+           "toolkit_signature":"","goal_instruction":"","context_prefix_actions":[],
+           "poisoned_observation_text":"","injected_payload_sha256_first16":"",
+           "injection_target_turn_index":0,"signals_ref":{"injection_point":0,"turning_point":0,"delta":0,"delta_normalized":0,"edit_distance":-1},
+           "_provenance":{}} for i in range(101)]
+    (br/"scenarios"/"bucket_imm.jsonl").write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+    for empties in ("d1","d2","d3","d4"): (br/"scenarios"/f"bucket_{empties}.jsonl").touch()
+    v1=bg.evaluate_release_state(bench_root=str(br),planned_contrasts_count=4,output_diag_subdir="diagnostics")
+    v2=bg.evaluate_release_state(bench_root=str(br),planned_contrasts_count=4,output_diag_subdir="diagnostics")
+    assert v1["stagegate_decision"]==v2["stagegate_decision"]
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
