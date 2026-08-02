@@ -143,6 +143,73 @@ def test_iter_load_scenarios_include_synthetic_flag_optin_returns_all_rows(tmp_p
     assert n_default==1 and n_all==2
 
 
+def _bt():
+    return importlib.import_module("evoguard.process.bench_taxonomy")
+
+
+def test_classifier_unknown_sentinel_maps_to_canonical_tuple_not_null():
+    bt=_bt(); bc=_bc()
+    tid,axis_tuple=bt.classify_method_tag(bc.LEGACY_UNKNOWN_SENTINEL_METHOD_TAG)
+    assert axis_tuple==bc.CANONICAL_TUPLE_DEFAULT_FOR_UNKNOWN_SENTINEL
+    assert tid.startswith("tech_")
+
+
+def test_classifier_pure_function_same_input_same_output_across_calls():
+    bt=_bt()
+    samples=["authority_directive","dlg_calendar_description_roleplay_extract_attendee_t3","",None,42,"deferred_trigger","developer_override_immediate_invoke"]
+    cache={}
+    for s in samples*3:
+        try:
+            tid,_=bt.classify_method_tag("" if s is None else str(s))
+            key=str(s)
+            if key in cache:
+                assert cache[key]==tid,f"non-pure mapping diverged for {key!r}"
+            else:
+                cache[key]=tid
+        except TypeError:
+            continue
+
+
+def test_envelope_pattern_information_tag_detected_from_compound_name():
+    bt=_bt()
+    _,tup=bt.classify_method_tag("authenv_information_tag_with_delayed_tool_result_spoof_xxx")
+    assert tup[0]=="INFORMATION_TAG"
+
+
+def test_authority_vector_developer_override_keyword_recognised_variants():
+    bt=_bt()
+    cases=["developer_override_immediate_invoke","DEVELOPER-OVERRIDE-banner","debug_protocol_xxx"]
+    for c in cases:
+        _,t=bt.classify_method_tag(c); assert t[3]=="DEVELOPER_OVERRIDE",f"miss on {c}"
+
+
+def test_compute_techid_truncated_to_twelve_hex_chars_prefixed_tech_underscore():
+    bt=_bt()
+    tid,_=bt.classify_method_tag("any_random_string_input_here_for_test_only_zzzzz")
+    prefix_len=len("tech_"); hexpart=tid[prefix_len:]
+    assert len(hexpart)==12
+    assert set(hexpart)<=set('0123456789abcdef')
+
+
+def test_alias_log_writer_appends_one_jsonl_line_per_call(tmp_path=None):
+    bt=_bt()
+    log_path=_opt_tmp(tmp_path)/"aliases.jsonl"
+    history=["foo","","bar_foo"]
+    for h in history:
+        tid,tup=bt.classify_method_tag(h)
+        bt.record_alias_entry(str(log_path),h,(tid,tup),"regex-default-fallback")
+    lines=log_path.read_text(encoding="utf-8").strip().split("\n")
+    decoded=[json.loads(l) for l in lines]
+    assert len(decoded)==len(history)
+    assert {d["input_str"] for d in decoded}==set(history)
+
+
+def test_axis_tuple_length_always_five_even_for_unmatched_inputs():
+    bt=_bt()
+    _,tup=bt.classify_method_tag("totally novel string nothing matches here")
+    assert len(tup)==5
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
