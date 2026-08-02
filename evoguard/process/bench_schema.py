@@ -108,3 +108,27 @@ def iter_load_scenarios(path:str,*,exclude_synthetic:bool=True)->Iterator[dict[s
             if exclude_synthetic and om!=ORIGIN_MODE_MINED:
                 continue
             yield obj
+
+
+from pathlib import Path as _Path
+
+
+def resolve_legacy_corpus_path(*,repo_root:str,bucket_label:str)->str:
+    """Return path-equivalent content for callers expecting bench/corpus_<bucket>.jsonl.
+
+    Tries symlink-style passthrough first preferring already-existing symlinks created externally;
+    otherwise resolves directly to underlying bench/scenarios/bucket_<label>.jsonl content streamer-friendly.
+    """
+    root=_Path(repo_root)
+    candidates=[
+        root/"bench"/f"corpus_{bucket_label}.jsonl",                          # original physical filename
+        root/"bench"/"scenarios"/f"bucket_{bucket_label}.jsonl",               # primary v2 destination
+        root/"scenarios"/f"bucket_{bucket_label}.jsonl",                       # migrated tree root (no bench/ prefix)
+        root/"bench"/"scenarios"/"_synthetic"/f"bucket_{bucket_label}_synth.jsonl",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    raise FileNotFoundError(
+        f"BenchAdapterError: neither legacy nor v2-resolved path exists for bucket='{bucket_label}' "
+        f"in repo '{repo_root}'. Searched {[str(c) for c in candidates]}")

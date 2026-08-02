@@ -5,6 +5,7 @@ import importlib
 import json
 import pathlib
 import tempfile
+from pathlib import Path
 
 
 def _bc():
@@ -333,6 +334,38 @@ def test_migration_zero_orphan_rate_after_processing_historical_noisy_tags(tmp_p
 
     assert summary["records_orphan_after_classification"]==0
     assert summary["records_total_processed"]==len(noisy_methods)
+
+
+def test_adapter_resolve_legacy_corpus_path_yields_equivalent_content_when_called_against_migrated_tree(tmp_path=None):
+    bs=_bs(); bm=_bm()
+    src=_opt_tmp(tmp_path)/"src"; dst=_opt_tmp(tmp_path)/"dst"
+    src.mkdir(parents=True,exist_ok=True); dst.mkdir(parents=True,exist_ok=True)
+    (src/"corpus_d1.jsonl").write_text("\n".join([
+        json.dumps({"scenario_id":"legacy_aa"+"bb"+"bb"+"bb"+"bb"+"bb"+"bb"+"bb"+"bb","bucket":"d1",
+                    "delta_value_orig":1,"domain":"workspace","task_id":"tx","method":"",
+                    "context_prefix_actions":[],"injection_target_turn_index":0,
+                    "original_signals_for_reference":{"injection_point":0,"turning_point":1}})])+"\n")
+    (src/"manifest.json").write_text("{}")
+    bm.migrate(src_dir=str(src),dst_dir=str(dst),
+               canonical_aliases_out=str(dst/"techniques"/"aliases.jsonl"))
+
+    resolved=bs.resolve_legacy_corpus_path(repo_root=str(dst),bucket_label="d1")
+    rows_via_old_name=list(bs.iter_load_scenarios(resolved,exclude_synthetic=False))
+    rows_via_new_name=list(bs.iter_load_scenarios(str(Path(dst)/"scenarios"/"bucket_d1.jsonl"),
+                                                  exclude_synthetic=False))
+    assert {r["scenario_id"] for r in rows_via_old_name}=={r["scenario_id"] for r in rows_via_new_name}
+
+
+def test_adapter_resolve_legacy_path_raises_helpful_error_when_neither_variant_exists(tmp_path=None):
+    bs=_bs()
+    raised=False
+    try:
+        bs.resolve_legacy_corpus_path(repo_root=str(_opt_tmp(tmp_path)),bucket_label="d99_missing")
+    except FileNotFoundError as e:
+        msg=str(e); raised=("neither" in msg.lower())
+    except Exception:
+        pass
+    assert raised
 
 
 def _main() -> int:
