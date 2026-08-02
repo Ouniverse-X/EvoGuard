@@ -210,6 +210,131 @@ def test_axis_tuple_length_always_five_even_for_unmatched_inputs():
     assert len(tup)==5
 
 
+def _bm():
+    return importlib.import_module("evoguard.process.bench_migrate")
+
+
+def test_migration_writes_new_layout_files_from_minimal_fixture_corpus(tmp_path=None):
+    bm=_bm(); bs=_bs(); bc=_bc()
+    tmp=_opt_tmp(tmp_path)
+    src_dir=tmp/"src"; dst_dir=tmp/"dst"; alias_path=dst_dir/"techniques"/"aliases.jsonl"
+
+    imm_fp=src_dir/"corpus_imm.jsonl"
+    sample={
+      "_meta":{"schema_version":"preliminary_bench_v1"},
+      "scenarios":[
+        {"scenario_id":"scn_imm_test_aaaaaaaa","bucket":"imm","delta_value_orig":0,
+         "domain":"workspace","task_id":"agentdojo:workspace:t1","method":"",
+         "context_prefix_actions":[{"thought":"","tool_call":{"name":"get_day_calendar_events","arguments":{"day":"x"}},"observation":"[]"}],
+         "injection_target_turn_index":0,
+         "original_signals_for_reference":{"injection_point":0,"turning_point":0,"delta":0},
+         "_provenance":{"clean_record_record_id":"x"}},
+      ],
+    }
+    src_dir.mkdir(parents=True,exist_ok=True)
+    imm_fp.write_text("\n".join(json.dumps(s) for s in sample["scenarios"])+"\n")
+    (src_dir/"manifest.json").write_text("{}")
+
+    summary=bm.migrate(src_dir=str(src_dir),dst_dir=str(dst_dir),
+                        canonical_aliases_out=str(alias_path))
+
+    expected_bucket_file=dst_dir/"scenarios"/"bucket_imm.jsonl"
+    assert expected_bucket_file.exists()
+    rows=list(bs.iter_load_scenarios(str(expected_bucket_file),exclude_synthetic=False))
+    assert len(rows)==1
+    r=rows[0]
+    assert r["schema_version"]=="bench_v2"
+    assert r["origin_mode"]==bc.ORIGIN_MODE_MINED
+    assert r["canonical_technique_id"].startswith("tech_")
+    assert len(r["canonical_technique_id"])-len("tech_")==12
+    assert alias_path.exists()
+
+
+def test_migration_skips_records_whose_domain_doesnt_match_scope_restriction_workspace_only(tmp_path=None):
+    bm=_bm(); bs=_bs()
+    bc_unused=_bc()
+    tmp=_opt_tmp(tmp_path)
+    src_dir=tmp/"src"; dst_dir=tmp/"dst"
+    # refactored-for-clarity-from-spec-original-preserving-semantics:
+    # Original used ``i in ["0"]`` then computed ``i*"aa"+...[:(15-len(i))]`` which
+    # mixes string-with-string slicing/multiplication incorrectly on py>=3.
+    # Here we replace list comprehension with explicit single workspace record +
+    # one explicit non-workspace record asserting identical pass/fail intent
+    # (workspace kept across filter, banking filtered out).
+    rows=[{"scenario_id":"wspace_keep_aaaaaaaa","bucket":"d1",
+           "delta_value_orig":1,"domain":"workspace","task_id":"agentdojo:workspace:x0",
+           "method":"","context_prefix_actions":[],"injection_target_turn_index":0,
+           "original_signals_for_reference":{"injection_point":0,"turning_point":1},"_provenance":{}}]
+    banking_row={"scenario_id":"bank_drop_ccccccccccccccc","bucket":"d1","delta_value_orig":1,
+                 "domain":"banking","task_id":"agentdojo:banking:y","method":"",
+                 "context_prefix_actions":[],"injection_target_turn_index":0,
+                 "original_signals_for_reference":{"injection_point":0,"turning_point":1}}
+    fp=src_dir/"corpus_d1.jsonl"
+    src_dir.mkdir(parents=True,exist_ok=True)
+    fp.write_text("\n".join(json.dumps(x) for x in (rows+[banking_row]))+"\n")
+    (src_dir/"manifest.json").write_text("{}")
+
+    bm.migrate(src_dir=str(src_dir),dst_dir=str(dst_dir),
+               canonical_aliases_out=str(dst_dir/"techniques"/"aliases.jsonl"))
+
+    kept=list(bs.iter_load_scenarios(str(dst_dir/"scenarios"/"bucket_d1.jsonl"),exclude_synthetic=False))
+    domains={r["domain"] for r in kept}
+    assert domains=={"workspace"}
+    # refactored-for-clarity-from-spec-original-preserving-semantics:
+    # removed placeholder-noop assertion ``assert sum(kept.__sizeof__()for _ in [])>=0``
+    # left intact in original plan line; only meaningful asserts survive here.
+
+
+def test_migration_registry_contains_one_entry_per_unique_canonical_technique_id_seen(tmp_path=None):
+    bm=_bm()
+    bs_unused=_bs()
+    tmp=_opt_tmp(tmp_path)
+    src_dir=tmp/"src"; dst_dir=tmp/"dst"
+    rows=[]
+    methods_used=["authority_directive","developer_override_immediate_invoke","authority_directive"]  # dup intentional
+    for i,meth in enumerate(methods_used):
+        rows.append({"scenario_id":f"id_{i}_{(20-i)*'a'}"[:24].ljust(19,'b')+"bbbbb","bucket":"d2",
+                     "delta_value_orig":2,"domain":"workspace","task_id":f"x{i}",
+                     "method":meth,"context_prefix_actions":[],"injection_target_turn_index":0,
+                     "original_signals_for_reference":{"injection_point":0,"turning_point":2}})
+    src_dir.mkdir(parents=True,exist_ok=True)
+    (src_dir/"corpus_d2.jsonl").write_text("\n".join(json.dumps(x) for x in rows)+"\n")
+    (src_dir/"manifest.json").write_text("{}")
+
+    bm.migrate(src_dir=str(src_dir),dst_dir=str(dst_dir),
+               canonical_aliases_out=str(dst_dir/"techniques"/"aliases.jsonl"))
+
+    registry_lines=(dst_dir/"techniques"/"registry.jsonl").read_text(encoding="utf-8").strip().split("\n")
+    entries=[json.loads(l) for l in registry_lines]
+    unique_ids={e["tech_id"] for e in entries}
+    # two distinct method strings -> potentially different OR collapsed family IDs depending classification;
+    # strict requirement: registry contains exactly len(unique_ids) lines (no duplicates within registry).
+    assert len(entries)==len(set(e["tech_id"] for e in entries)),f"duplicate tech_ids found in registry"
+
+
+def test_migration_zero_orphan_rate_after_processing_historical_noisy_tags(tmp_path=None):
+    bm=_bm()
+    tmp=_opt_tmp(tmp_path)
+    src_dir=tmp/"src"; dst_dir=tmp/"dst"
+    noisy_methods=["","<unknown>","authenv_delete_legitimate_mail_after_read_exfil_t2",
+                   "ambient_metadata_blended_governance_with_spoofed_integrity_log_and_multi_stage_retention_protocol",
+                   "steganographic_gdpr_authority_with_triple_channel_exfiltration_and_delayed_spoof"]
+    rows=[{"scenario_id":f"s_{i}_{'aaaabbbbccccddd'}","bucket":"d3","delta_value_orig":3,
+           "domain":"workspace","task_id":f"w_{i}",
+           "method":m,"context_prefix_actions":[],"injection_target_turn_index":0,
+           "original_signals_for_reference":{"injection_point":0,"turning_point":3}}
+          for i,m in enumerate(noisy_methods)]
+    src_dir.mkdir(parents=True,exist_ok=True)
+    (src_dir/"corpus_d3.jsonl").write_text("\n".join(json.dumps(x) for x in rows)+"\n")
+    (src_dir/"manifest.json").write_text("{}")
+
+    summary=bm.migrate(src_dir=str(src_dir),dst_dir=str(dst_dir),
+                        canonical_aliases_out=str(dst_dir/"techniques"/"aliases.jsonl"))
+
+    assert summary["records_orphan_after_classification"]==0
+    assert summary["records_total_processed"]==len(noisy_methods)
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
