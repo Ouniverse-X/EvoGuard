@@ -368,6 +368,45 @@ def test_adapter_resolve_legacy_path_raises_helpful_error_when_neither_variant_e
     assert raised
 
 
+def _bp():
+    return importlib.import_module("evoguard.process.bench_power_calc")
+
+
+def test_required_n_cell_matches_handcalc_defaults_alpha_dot05_beta_dot20_effectsize_dot45_k_eq_4():
+    bp=_bp(); bc=_bc()
+    req=bp.compute_required_n_per_cell(effect_size_cohen_d=bc.DEFAULT_EFFECT_SIZE_COHEN_D,
+                                       alpha_overall=bc.DEFAULT_ALPHA_OVERALL,
+                                       beta=bc.DEFAULT_BETA_POWER_TARGET,
+                                       bonferroni_correction_count=4)
+    # closed-form hand-check: ((zα'+zβ)^2)/(d^2)= ((2.49+0.84)^2)/(0.45^2) ≈ 54.7→55 rounded up
+    assert 50<=req<=60
+
+
+def test_required_n_decreases_as_effect_size_grows_larger_signal_detectable_smaller_samples_needed():
+    bp=_bp()
+    small_eff=bp.compute_required_n_per_cell(effect_size_cohen_d=0.30,alpha_overall=.05,beta=.20,bonferroni_correction_count=4)
+    large_eff=bp.compute_required_n_per_cell(effect_size_cohen_d=0.60,alpha_overall=.05,beta=.20,bonferroni_correction_count=4)
+    assert small_eff > large_eff > 10
+
+
+def test_required_n_increases_monotonically_with_more_concurrent_contrasts_stricter_Bonferroni():
+    bp=_bp()
+    base=bp.compute_required_n_per_cell(effect_size_cohen_d=.45,alpha_overall=.05,beta=.20,bonferroni_correction_count=1)
+    more=bp.compute_required_n_per_cell(effect_size_cohen_d=.45,alpha_overall=.05,beta=.20,bonferroni_correction_count=8)
+    most=bp.compute_required_n_per_cell(effect_size_cohen_d=.45,alpha_overall=.05,beta=.20,bonferroni_correction_count=16)
+    assert base <= more <= most
+
+
+def test_gate_decision_function_blocks_release_below_threshold_ratio_passes_above_above_threshold_ratio():
+    bp=_bp(); bc=_bc()
+    decision_dev_snapshot=bp.decide_stagegate(current_n_by_bucket={"imm":95,"d1":100,"d2":110,"d3":92,"d4":90},required_n=100)
+    decision_full_release=bp.decide_stagegate({"imm":105,"d1":120,"d2":130,"d3":115,"d4":108},required_n=100)
+    decision_blocked=bp.decide_stagegate({"imm":40,"d1":40,"d2":35,"d3":32,"d4":16},required_n=100)
+    assert decision_dev_snapshot["decision"]=="DEV_SNAPSHOT_ALLOWED"
+    assert decision_full_release["decision"]=="PUBLIC_RELEASE_ALLOWED"
+    assert decision_blocked["decision"]=="BLOCKED_BELOW_HALF_FLOOR_OR_DEV_THRESHOLD"
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
