@@ -537,6 +537,42 @@ def test_validate_candidate_rejects_when_measured_delta_offbyone_logs_near_miss_
     assert len(sink)>=1
 
 
+def test_live_judge_closure_signs_acceptance_on_simulated_http_success_response(tmp_path=None):
+    sr=_sr()
+    captured_requests:list=[]
+    def fake_post(url,**kw):
+        captured_requests.append((url,kw.get("json",{}).copy()))
+        class R:
+            status_code=200
+            def json(self_inner):
+                return {"choices":[{"message":{"content":'{\"kind\":\"B\",\"confidence\":0.91}'}}]}
+            def raise_for_status(self_inner):pass
+        return R()
+
+    closure=sr.make_live_judge_closure(endpoint_url="http://localhost:8002/v1/chat/completions",
+                                      model_id="qwen2.5-7b-it-judge-port8002",
+                                      http_post_callable=fake_post)
+
+    fake_artifact={"replay_artifact":[],"divergence_step":42}
+    fake_cand=sr.CandidateShiftPosition(seed=sr.SynthSeed("","",0,"workspace","","","","tech_x","",[],0,[],{}),
+                                        proposed_injection_turn_index=10,target_delta=3,
+                                        estimated_max_lookahead_budget=5)
+    verdict,msg=closure(fake_artifact,fake_cand)
+    assert verdict is True
+    assert captured_requests, "HTTP POST should have been invoked at least once"
+
+
+def test_live_judge_closure_gracefully_degrades_to_reject_on_network_failure_without_raising(tmp_path=None):
+    sr=_sr()
+    def raising_post(*args,**kwargs):
+        raise ConnectionError("simulated unreachable")
+    closure=sr.make_live_judge_closure(endpoint_url="http://invalid/v1/chat/completions",
+                                      model_id="qwen-x",http_post_callable=raising_post)
+    verdict,msg=closure({},None)
+    assert verdict is False
+    assert "network-error" in msg.lower()
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
