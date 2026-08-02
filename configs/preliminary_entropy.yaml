@@ -1,0 +1,74 @@
+# Default configuration for the preliminary IPI alertness-entropy experiment.
+# Spec: docs/superpowers/specs/2026-08-02-preliminary-ipi-alertness-entropy-design.md
+# Usage: python -m preliminary.cli --config configs/preliminary_entropy.yaml --stage all
+
+experiment_name: preliminary_entropy_v1
+seed: 42
+repo_root_override: null              # auto-detect from this file's location by default
+
+model:
+  base_url: http://localhost:8000/v1
+  api_key_env_var: OPENAI_API_KEY     # falls back to literal "EMPTY" if env var unset
+  model_id: qwen2.5-7b-it             # validated against GET /v1/models; matches what primary vLLM serves under --enable-lora setup; requesting this id returns PURE-BASE outputs (adapters apply ONLY when caller passes an explicit adapter-id string instead).
+  require_no_lora_loaded: false       # set false because historical experiments register multiple legacy adapters onto same instance; we still measure intrinsically-bare behaviour by always routing through base-model id above. Set true only when freshly-restarted dedicated-bare-vllm exists.
+
+generation:
+  max_new_tokens: 512
+  temperature: 0.0                    # greedy decode; logprobs distribution reported unaffected
+  top_p: 1.0
+  top_logprobs: 20
+  extra_stop_sequences:
+    - "<|im_end|>"
+    - "</answer>"
+  seed_passthrough: ${experiment.seed}   # resolved at load-time to integer seed value above
+
+mining:
+  source_experiments:
+    - evoguard_agentdojo_full_v6_mcts
+    - evoguard_agentdojo_full_v7_integrated
+    - agentdojo_full_mcts_cont
+    - evoguard_agentdojo_full_v4_grpo_v2          # added 2026-08-02 phase-B1: widen latent-attack pool
+    - evoguard_agentdojo_full_v5_mcts_failed_oom_20260726   # partial-run artifacts still valid for signal-mining purposes
+    - evoguard_agentdojo_full_v6_probed_lora      # probed-lora variant explores slightly different attacker trajectory space
+  rounds_root_relative_to_repo: rounds
+  require_outcome_success: true
+  require_numeric_delta: true
+  cap_per_bucket: 110                    # bumped from 40 to give headroom above n≥100 floor targeted by bench_v2 release gate
+  max_domain_fraction_in_bucket: 0.85    # relaxed from 0.50 because workspace-only restriction makes stricter fraction meaningless when only one eligible domain exists
+  domain_scope_restriction: workspace    # NEW FIELD introduced by bench_v2 design owner direction dated 2026-08-02
+  buckets:
+    - imm
+    - d1
+    - d2
+    - d3
+    - d4
+  sampling_seed: ${experiment.seed}
+  bench_output_dir_relative_to_repo: bench
+
+entropy:
+  granularities_reported:
+    - token_mean_full_response
+    - first_k_mean_at_K_eq_64
+    - normalized_token_mean
+  aux_columns_also_emitted:
+    - token_std_full_response
+    - argmax_mass_mean
+    - whitespace_filtered_variant
+  effective_K_for_normalization_floor: 20
+  first_k_window_size: 64
+
+stats:
+  bootstrap_iters: 10000
+  ci_level: 0.95
+  alpha_overall: 0.05                   # declared UPFRONT before analyses are run
+  planned_pairwise_comparisons:
+    - ["imm", "d1"]
+    - ["d1", "d2"]
+    - ["d2", "d3"]
+    - ["d3", "d4"]
+  bonferroni_correction_count: 4         # k=4 planned contrasts -> alpha_per_test = 0.05/4 = 0.0125
+  random_state_for_resampling: ${experiment.seed}
+
+output_dir_template: rounds/_preliminary/{run_timestamp}
+dry_run: false                           # flip true for offline smoke validation stage
+logging_level: INFO
