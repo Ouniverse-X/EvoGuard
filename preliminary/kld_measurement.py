@@ -53,7 +53,8 @@ def compute_kl_from_logits(logits_post, logits_pre, *, eps: float = 1e-12) -> fl
 
     def _to_np(x):
         if hasattr(x, "detach"):
-            x = x.detach().cpu().numpy()
+            # torch tensor (may be bfloat16); .float() -> float32 before numpy conversion
+            x = x.float().detach().cpu().numpy()
         return np.asarray(x, dtype="float64")
 
     lp = _to_np(logits_post)
