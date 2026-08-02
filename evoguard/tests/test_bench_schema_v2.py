@@ -444,6 +444,38 @@ def test_extract_seeds_reads_existing_low_mid_buckets_returning_enriched_triplet
     assert all(getattr(s,"origin_scenario_id","")!="?" for s in seeds)
 
 
+def test_enumerate_candidates_respects_floor_at_least_minus_target_delta_step_remaining_room(tmp_path=None):
+    sr=_sr()
+    fake_seed=sr.SynthSeed(origin_scenario_id="x",bucket_origin="d1",delta_value_orig=1,
+                          domain="workspace",task_id="tk",toolkit_signature="foo",
+                          channel_class_hint="",canonical_technique_id="tech_xx",
+                          poisoned_observation_text="[INJ]",
+                          context_prefix_actions_verbatim=[{"thought":"","tool_call":{"name":"X"},"observation":""}]*4,
+                          injection_target_turn_index_original=0,
+                          clean_trajectory_actions_full=[],metadata_notes={})
+    candidates=list(sr.enumerate_candidates(seed=fake_seed,target_deltas=(3,),near_miss_sink=[]))
+    # With |clean|=0 effectively unavailable ⇒ J-set should be EMPTY (cannot satisfy room-for-divergence requirement)
+    assert candidates== []
+
+
+def test_enumerate_candidates_yields_positions_within_factor_cap_of_clean_traj_length(monkeypatch=None,tmp_path=None):
+    tmp_path=_opt_tmp(tmp_path)
+    sr=_sr()
+    long_fake_actions=[{"thought":"","tool_call":{"name":f"T{i}"},"observation":f"o{i}"} for i in range(10)]
+    seed=sr.SynthSeed(origin_scenario_id="long_seed",bucket_origin="d1",delta_value_orig=1,
+                     domain="workspace",task_id="tk_long",toolkit_signature="T0|T1|T2",
+                     channel_class_hint="",canonical_technique_id="tech_xy",
+                     poisoned_observation_text="[INJ]",
+                     context_prefix_actions_verbatim=long_fake_actions[:2],
+                     injection_target_turn_index_original=0,
+                     clean_trajectory_actions_full=long_fake_actions,
+                     metadata_notes={})
+    cands=list(sr.enumerate_candidates(seed=seed,target_deltas=(3,4),near_miss_sink=[]))
+    positions_proposed=set(c.proposed_injection_turn_index for c in cands)
+    assert len(positions_proposed)>0
+    assert max(positions_proposed) <= int(len(long_fake_actions)*_bc().MAX_CANDIDATE_POSITIONS_PER_SEED_FACTOR)
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []

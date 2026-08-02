@@ -134,4 +134,67 @@ def extract_seeds(*,bench_root:str,source_buckets:Sequence[str]=("imm","d1","d2"
     return seeds
 
 
-__all__=["SynthSeed","CandidateShiftPosition","extract_seeds"]
+def enumerate_candidates(*,seed:SynthSeed,target_deltas:Sequence[int]=(3,4),
+                         near_miss_sink:list[tuple[CandidateShiftPosition,str]]|None=None)->Iterator[CandidateShiftPosition]:
+    """Yield legal shift-target positions satisfying spec §7β-2 geometric bounds.
+
+    Channel-compatibility treated permissively initially: structural mismatch logged into ``near_miss_sink``
+    diagnostic parameter WITHOUT filtering out candidate (matches spec §7β-2 compatibility-note clause).
+    """
+    clean_len=len(seed.clean_trajectory_actions_full)
+    if clean_len==0:
+        return                                              # exhausted early yields nothing
+
+    ceiling_pos=int(clean_len*_cap_factor())                # global positional cap regardless of target_delta
+    yielded_set:set[tuple[int,int]]=set()
+
+    for tgt in target_deltas:
+        budget=tgt+_lookahead_buffer()                       # lookahead window length
+        max_legal_position=clean_len-(budget+1)              # leave room for divergence detection loop
+        if max_legal_position<0: continue
+
+        upper=min(max_legal_position,ceiling_pos)
+
+        for j in range(upper+1):
+            if j==seed.injection_target_turn_index_original: continue
+            if (j,tgt) in yielded_set: continue
+
+            # Compatibility probe: log mismatch reasons without rejecting (spec-permissive mode).
+            compat_reason=_probe_channel_compat(j,seed)
+            if compat_reason!="OK" and near_miss_sink is not None:
+                cp=CandidateShiftPosition(seed=seed,
+                                         proposed_injection_turn_index=j,
+                                         target_delta=tgt,
+                                         estimated_max_lookahead_budget=budget)
+                near_miss_sink.append((cp,f"channel-compat-warning::{compat_reason}"))
+
+            yield CandidateShiftPosition(seed=seed,
+                                        proposed_injection_turn_index=j,
+                                        target_delta=tgt,
+                                        estimated_max_lookahead_budget=budget)
+            yielded_set.add((j,tgt))
+
+
+def _cap_factor()->float:
+    from evoguard.process.bench_constants import MAX_CANDIDATE_POSITIONS_PER_SEED_FACTOR
+    return MAX_CANDIDATE_POSITIONS_PER_SEED_FACTOR
+
+
+def _lookahead_buffer()->int:
+    from evoguard.process.bench_constants import REPLAY_LOOKAHEAD_BUFFER_STEPS
+    return REPLAY_LOOKAHEAD_BUFFER_STEPS
+
+
+def _probe_channel_compat(proposed_position:int,seed:SynthSeed)->str:
+    """Heuristic compatibility logger. Returns 'OK' or human-readable warning category string."""
+    if not seed.clean_trajectory_actions_full: return "no-clean-traj-available"
+    if proposed_position>=len(seed.clean_trajectory_actions_full): return "position-out-of-range"
+    toolcall_obj=seed.clean_trajectory_actions_full[proposed_position].get("tool_call") or {}
+    tool_nm=str(toolcall_obj.get("name","")).lower()
+    forbidden_suffixes=("_numeric_lookup","_balance_check")  # tools unlikely admitting prose-channel splice
+    if any(tool_nm.endswith(fsuf) for fsuf in forbidden_suffixes):
+        return f"structural-tool-type-restrictive:{tool_nm}"
+    return "OK"
+
+
+__all__=["SynthSeed","CandidateShiftPosition","extract_seeds","enumerate_candidates"]
