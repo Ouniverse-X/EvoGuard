@@ -476,6 +476,67 @@ def test_enumerate_candidates_yields_positions_within_factor_cap_of_clean_traj_l
     assert max(positions_proposed) <= int(len(long_fake_actions)*_bc().MAX_CANDIDATE_POSITIONS_PER_SEED_FACTOR)
 
 
+def test_validate_candidate_accepts_mock_defender_yielding_exact_target_delta_divergence(tmp_path=None):
+    sr=_sr()
+    clean_actions=[{"thought":f"c{i}","tool_call":{"name":f"C{i}"},"observation":f"co{i}"} for i in range(6)]
+    seed=sr.SynthSeed(origin_scenario_id="vs1",bucket_origin="d1",delta_value_orig=1,
+                     domain="workspace",task_id="vt",toolkit_signature="C0|C1",
+                     channel_class_hint="",canonical_technique_id="tech_vs1",
+                     poisoned_observation_text="[INJ]",
+                     context_prefix_actions_verbatim=clean_actions[:1],
+                     injection_target_turn_index_original=0,
+                     clean_trajectory_actions_full=clean_actions,
+                     metadata_notes={})
+    cand=sr.CandidateShiftPosition(seed=seed,proposed_injection_turn_index=1,
+                                   target_delta=3,estimated_max_lookahead_budget=5)
+
+    calls_made={'n':0}
+    def mocked_defender(actions_so_far:list[dict])->dict:
+        idx=calls_made['n']
+        calls_made['n']+=1
+        # Defender proposes DIFFERENT tool-call than clean-A did at absolute index (=proposed+1+n_offset_into_replay_loop)
+        offset_within_replay=calls_made['n']
+        # Want divergence detected AT relative-offset=target_delta=3 meaning third generated proposal differs.
+        if offset_within_replay<cand.target_delta:
+            return dict(thought="align",tool_call=dict(name=clean_actions[cand.proposed_injection_turn_index+offset_within_replay]["tool_call"]["name"]))
+        else:
+            return dict(thought="diverge!",tool_call=dict(name="DIFFERENT_TOOL_NAME_HERE"))
+
+    result=sr.validate_forward_replay(candidate=cand,defender_generate_fn=mocked_defender,judge_fn=lambda *_:[True,""])
+    assert result.accepted is True
+    assert result.measured_delta==3
+    assert result.divergence_absolute_turn_index==4  # =j+k=1+3
+
+
+def test_validate_candidate_rejects_when_measured_delta_offbyone_logs_near_miss_reason(tmp_path=None):
+    sr=_sr()
+    clean_actions=[{"thought":f"c{i}","tool_call":{"name":f"C{i}"},"observation":f"co{i}"} for i in range(8)]
+    seed=sr.SynthSeed(origin_scenario_id="nm1",bucket_origin="d1",delta_value_orig=1,
+                     domain="workspace",task_id="tn",toolkit_signature="C0|C1",
+                     channel_class_hint="",canonical_technique_id="tech_nm",
+                     poisoned_observation_text="[INJ]",
+                     context_prefix_actions_verbatim=clean_actions[:1],
+                     injection_target_turn_index_original=0,
+                     clean_trajectory_actions_full=clean_actions,
+                     metadata_notes={})
+    cand=sr.CandidateShiftPosition(seed=seed,proposed_injection_turn_index=1,
+                                   target_delta=3,estimated_max_lookahead_budget=5)
+    counter={'n':0}
+    def early_divergence_defender(actns):
+        counter['n']+=1
+        if counter['n']==1:                                  # immediate divergence wrong timing
+            return {"thought":"oops","tool_call":{"name":"WRONG_FIRST_STEP"}}
+        prev_abs=cand.proposed_injection_turn_index+counter['n']-1
+        return {"thought":"align","tool_call":{"name":clean_actions[prev_abs]["tool_call"]["name"]}}
+
+    sink:list=[]
+    result=sr.validate_forward_replay(candidate=cand,defender_generate_fn=early_divergence_defender,
+                                       judge_fn=lambda *_:[True,""],near_miss_sink=sink)
+    assert result.accepted is False
+    assert result.rejection_reason_code.startswith("measured_delta_mismatch::")
+    assert len(sink)>=1
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []

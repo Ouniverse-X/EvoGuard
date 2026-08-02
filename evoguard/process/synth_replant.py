@@ -197,4 +197,98 @@ def _probe_channel_compat(proposed_position:int,seed:SynthSeed)->str:
     return "OK"
 
 
-__all__=["SynthSeed","CandidateShiftPosition","extract_seeds","enumerate_candidates"]
+@dataclass
+class ReplayValidationResult:
+    accepted:bool
+    candidate:"CandidateShiftPosition"
+    measured_delta:int|None=None
+    divergence_absolute_turn_index:int|None=None
+    rejection_reason_code:str=""
+
+
+_SENTINEL_END_OF_TRAJECTORY="__END_OF_CLEAN_A__"
+
+
+def validate_forward_replay(*,candidate:CandidateShiftPosition,
+                             defender_generate_fn:"Callable[[list[dict]],dict]",
+                             judge_fn:"Callable[[dict,CandidateShiftPosition],tuple[bool,str]]"|None=None,
+                             near_miss_sink:list[tuple[CandidateShiftPosition,str]]|None=None)->ReplayValidationResult:
+    """Execute local forward-replay validation per spec §7β-3 pseudocode.
+
+    Returns ReplayValidationResult carrying acceptance verdict plus diagnostic measurements.
+    """
+    from typing import Callable  # late import avoids cycle risk
+
+    seed=candidate.seed
+    clean_actions=seed.clean_trajectory_actions_full
+    j=candidate.proposed_injection_turn_index
+    tgt=candidate.target_delta
+    budget=candidate.estimated_max_lookahead_budget
+
+    if len(clean_actions)<=j:
+        rr="insufficient-room-on-clean-traj"
+        if near_miss_sink is not None:near_miss_sink.append((candidate,rr))
+        return ReplayValidationResult(False,candidate,None,None,rr)
+
+    # Build augmented context-prefix up through injection site replacing observation at position j.
+    augmented_ctx=[dict(a) for a in clean_actions[:j]]
+    inj_action_template=dict(clean_actions[j])
+    orig_obs=inj_action_template.get("observation","")
+    modified_obs=f"{orig_obs}\n\n{seed.poisoned_observation_text}".rstrip()
+    inj_action_template["observation"]=modified_obs
+    augmented_ctx.append(inj_action_template)
+
+    divergence_abs:int|None=None
+    for k_offset in range(1,budget+1):
+        proposed=defender_generate_fn(list(augmented_ctx))
+        proposed_sig=_signature_of(proposed)
+        abs_idx=j+k_offset
+        if abs_idx<len(clean_actions):
+            counterpart_sig=_signature_of(clean_actions[abs_idx])
+        else:
+            counterpart_sig=_SENTINEL_END_OF_TRAJECTORY
+
+        if proposed_sig!=counterpart_sig:
+            divergence_abs=abs_idx;break
+
+        # No divergence observed at this step; extend ctx with CLEAN twin's next action VERBATIM maintaining faithful continuation history.
+        extended_act=dict(clean_actions[abs_idx])
+        extended_act["thought"]=proposed.get("thought",extended_act.get("thought",""))
+        augmented_ctx.append(extended_act)
+
+    if divergence_abs is None:
+        rr="no_divergence_within_budget"
+        if near_miss_sink is not None:near_miss_sink.append((candidate,rr))
+        return ReplayValidationResult(False,candidate,None,None,rr)
+
+    measured=divergence_abs-j
+    if measured!=tgt:
+        rr=f"measured_delta_mismatch::got_{measured}_want_{tgt}"
+        if near_miss_sink is not None:near_miss_sink.append((candidate,rr))
+        return ReplayValidationResult(False,candidate,measured,divergence_abs,rr)
+
+    # Judge gate delegated externally if supplied; absence means accept purely based on geometry criterion.
+    if judge_fn is not None:
+        ok,msg=judge_fn(dict(replay_artifact=augmented_ctx,divergence_step=divergence_abs),candidate)
+        if not ok:
+            rr=f"judge_disagree::{msg}"
+            if near_miss_sink is not None:near_miss_sink.append((candidate,rr))
+            return ReplayValidationResult(False,candidate,measured,divergence_abs,rr)
+
+    return ReplayValidationResult(True,candidate,measured,divergence_abs,"ACCEPTED")
+
+
+def _signature_of(action_like:dict)->str:
+    tc=action_like.get("tool_call") or {}
+    nm=str(tc.get("name","")).lower().strip()
+    args_blob_parts=[]
+    args=tc.get("arguments") or {}
+    if isinstance(args,dict):
+        items_sorted=sorted(args.items())
+        for k,v in items_sorted[:3]:                                          # truncate arg-keyspace deterministically
+            args_blob_parts.append(f"{k}:{type(v).__name__}")
+    return f"{nm}|{'/'.join(args_blob_parts)}"
+
+
+__all__=["SynthSeed","CandidateShiftPosition","extract_seeds","enumerate_candidates",
+         "validate_forward_replay","ReplayValidationResult"]
