@@ -642,6 +642,54 @@ def test_release_gate_decision_consistent_between_evaluations_until_inputs_chang
     assert v1["stagegate_decision"]==v2["stagegate_decision"]
 
 
+def test_end_to_end_smoke_produces_complete_v2_directory_tree_using_mock_components(tmp_path=None):
+    sr=_sr(); bm=_bm(); bg=_bg(); bc=_bc()
+    tmp_path=_opt_tmp(tmp_path)
+    src=tmp_path/"smoke_src"; dst=tmp_path/"smoke_dst"
+    src.mkdir()
+    # Build minimal plausible preliminary_bench_v1 input spanning all five buckets
+    for bkt_i,bkt in enumerate(["imm","d1","d2","d3","d4"]):
+        rows=[{"scenario_id":f"smoke_{bkt}_{i:>03}_paddingXXXXXX"[:31]+"yyyz","bucket":bkt,
+               "delta_value_orig":bkt_i,"domain":"workspace","task_id":f"tsk_{bkt}_{i}",
+               "method":"authority_directive" if i%2 else "",
+               "context_prefix_actions":[{"thought":"","tool_call":{"name":"dummy_tool"},"observation":"benign"}],
+               "injection_target_turn_index":0,
+               "original_signals_for_reference":{"injection_point":0,"turning_point":bkt_i,"delta":bkt_i},
+               "_provenance":{"clean_record_record_id":f"mock-{bkt}-{i}"}} for i in range(5)]
+        (src/f"corpus_{bkt}.jsonl").write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+    (src/"manifest.json").write_text("{}")
+
+    mig_sum=bm.migrate(src_dir=str(src),dst_dir=str(dst),
+                        canonical_aliases_out=str(dst/"techniques"/"aliases.jsonl"))
+    assert mig_sum["records_total_processed"]==25
+
+    # Stub defender generating aligned proposals forever (forces no-divergence outcome saturating near-misses safely)
+    def fake_aligned_defender(actns):
+        idx_next=len(actns)
+        return {"thought":"aligned","tool_call":{"name":f"MATCHING_FAKE_T{idx_next}"}}
+
+    pipe_outcome=sr.run_pipeline(bench_root=str(dst),
+                                 target_buckets=("d3","d4"),
+                                 rounds_root="/nonexistent-intentional-best-effort",
+                                 dry_run=False,
+                                 defender_generate_fn=fake_aligned_defender,
+                                 live_judge_factory=None,
+                                 per_bucket_quota=2,
+                                 family_ceiling=bc.FAMILY_CONCENTRATION_CEILING)
+    assert "buckets_written" in pipe_outcome
+
+    verdict=bg.evaluate_release_state(bench_root=str(dst),planned_contrasts_count=4)
+    assert verdict["stagegate_decision"].startswith(("BLOCKED","DEV_SNAPSHOT","PUBLIC_RELEASE"))
+
+    # Confirm critical structural elements present
+    expected_dirs=[dst/"scenarios",dst/"scenarios"/"_synthetic",dst/"techniques",dst/"diagnostics"]
+    for ed in expected_dirs: assert ed.is_dir(),f"Missing expected subdir {ed}"
+    for ef in [("techniques","registry.jsonl"),("techniques","aliases.jsonl"),
+               ("diagnostics","pool_audit.json"),("diagnostics","power_calc.json"),
+               ("diagnostics","confound_report.json")]:
+        assert (dst/ef[0]/ef[1]).exists(),f"Missing expected file {'/'.join(ef)}"
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
