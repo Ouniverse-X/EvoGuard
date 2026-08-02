@@ -407,6 +407,43 @@ def test_gate_decision_function_blocks_release_below_threshold_ratio_passes_abov
     assert decision_blocked["decision"]=="BLOCKED_BELOW_HALF_FLOOR_OR_DEV_THRESHOLD"
 
 
+def _sr():
+    return importlib.import_module("evoguard.process.synth_replant")
+
+
+def test_extract_seeds_reads_existing_low_mid_buckets_returning_enriched_triplets(tmp_path=None):
+    sr=_sr(); bm=_bm()
+    _t=_opt_tmp(tmp_path)
+    src=_t/"src"; dst=_t/"dst"; src.mkdir(parents=True,exist_ok=True)
+    lowmid_sample=[{"scenario_id":"seed_aaabbbbbbbbbbbbb","bucket":"d1","delta_value_orig":1,
+                    "domain":"workspace","task_id":"ws_task_seed_A","method":"authority_directive",
+                    "context_prefix_actions":[{"thought":"","tool_call":{"name":"search_calendar_events"},
+                                              "observation":"raw benign obs text"}],
+                    "injection_target_turn_index":0,
+                    "original_signals_for_reference":{"injection_point":0,"turning_point":1},
+                    "_provenance":{"clean_record_record_id":"abc-def-ghi-jkl-mnopqrstuvwx-yz"}}
+                   ,{"scenario_id":"seed_bbbbbaaaaaaaaaaa","bucket":"d2","delta_value_orig":2,
+                    "domain":"workspace","task_id":"ws_task_seed_B","method":"developer_override_immediate_invoke",
+                    "context_prefix_actions":[{"thought":"","tool_call":{"name":"send_email"},"observation":"ok"}],
+                    "injection_target_turn_index":0,
+                    "original_signals_for_reference":{"injection_point":0,"turning_point":2},
+                    "_provenance":{"clean_record_record_id":""}}]
+    (src/"corpus_d1.jsonl").write_text(json.dumps(lowmid_sample[0])+"\n")
+    (src/"corpus_d2.jsonl").write_text(json.dumps(lowmid_sample[1])+"\n")
+    (src/"manifest.json").write_text("{}")
+    bm.migrate(src_dir=str(src),dst_dir=str(dst),
+               canonical_aliases_out=str(dst/"techniques"/"aliases.jsonl"))
+
+    seeds=sr.extract_seeds(bench_root=str(dst),
+                           source_buckets=("imm","d1","d2"),
+                           rounds_root="/nonexistent_intentional_skip_clean_twin_load")
+    assert len(seeds)>=2
+    payloads_present=sum(1 for s in seeds if getattr(s,"poisoned_observation_text","").strip())
+    payloads_empty=sum(1 for s in seeds if not getattr(s,"poisoned_observation_text","").strip())
+    assert payloads_present+payloads_empty==len(seeds)
+    assert all(getattr(s,"origin_scenario_id","")!="?" for s in seeds)
+
+
 def _main() -> int:
     fns = [(k,v) for k,v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = []
