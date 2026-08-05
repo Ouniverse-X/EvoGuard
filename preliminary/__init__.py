@@ -1,20 +1,33 @@
-"""Preliminary experiment: IPI alertness-entropy vs Delta.
+"""Preliminary sequence-probe: AS-vs-AF internal-representation divergence analysis.
 
-A self-contained measurement harness that mines successful indirect-prompt-injection
-attacks from prior EvoGuard rounds, buckets them by their historical ``Delta`` value
-(imm / d1 / d2 / d3 / d4), replays each scenario against a bare Qwen2.5-7B-Instruct
-served by vLLM, and computes per-token Shannon entropy of the agent's first response
-after exposure to the injected tool observation.
+Tier-1 (multi-domain x longer-thought joint expansion) + Tier-2 (temperature-
+sweep deconfounder) pipeline for testing whether successful vs failed prompt-
+injection attacks produce distinguishable internal-monologue representations
+in a defender LLM.
 
-Hypothesis under test (see ``docs/superpowers/specs/2026-08-02-preliminary-ipi-alertness-entropy-design.md``):
-    As bucket label moves {imm -> d4}, mean entropy decreases monotonically.
-    Equivalently Spearman rho(bucket_ordinal, mean_entropy) < 0 at alpha=0.05.
+Three core modules drive the pipeline:
 
-Public surface intentionally minimal; consumers should drive the pipeline via the CLI:
-    python -m preliminary.cli --config configs/preliminary_entropy.yaml --stage all
+1. ``alertness_v3_harness`` -- Phase-1 rollout collection. Produces per-scenario
+   triplet (clean + N attacked) rollouts. Supports multi-domain suites via
+   ``--suites`` and temperature-sweep via comma-separated ``--sampling-temperature``.
+
+2. ``as_vs_af_sequence_probe`` -- Phase-2 feature extraction. Feeds each
+   rollout's own recorded thought tokens past a shared scaffold, captures
+   per-position softmax-derived scalars (entropy / top1 / refuse_mass / nll)
+   and truncated top-K distribution snapshots along the decoded span.
+   Default ``--max-thought-tokens=128`` (Tier-1 raise from v0's 64).
+
+3. ``as_vs_af_sequence_analyze`` -- Phase-3 statistical analysis. Plan A
+   runs segment-aggregated Wilcoxon tests across early/mid/late/extended bands
+   with Bonferroni FWER control (alpha = 0.05 / (4 bands * 3 pairwise)).
+   Plan B computes time-resolved paired-JS-divergence curves between AS and AF
+   average distributions. Auto-discovers temperature strata and emits both
+   pooled and nested per-T-stratum analyses.
+
+Spec: ``docs/superpowers/specs/2026-08-04-sequence-probe-tier1-tier2-design.md``
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 __all__ = ["__version__"]
