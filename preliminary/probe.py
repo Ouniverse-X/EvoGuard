@@ -51,10 +51,10 @@ if __package__ in (None, ""):
 
 import numpy as np
 
-from preliminary.alertness_v3_harness import _build_context_messages
+from preliminary.collect import _build_context_messages
 
 
-logger = logging.getLogger("preliminary.as_vs_af_sequence_probe")
+logger = logging.getLogger("preliminary.probe")
 
 EVALUATOR_VERSION = "as_vs_af_seq_probe_v1"
 TOP_K = 256               # truncate vocab snapshot to top-K per position

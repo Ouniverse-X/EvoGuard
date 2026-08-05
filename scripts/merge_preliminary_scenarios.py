@@ -1,6 +1,6 @@
 """Merge multiple ``all_scenarios.json`` files emitted by
-``preliminary.alertness_v3_harness`` into one consolidated bundle suitable for
-feeding into ``as_vs_af_sequence_probe``.
+``preliminary.collect`` into one consolidated bundle suitable for
+feeding into ``preliminary.probe``.
 
 Use case (Tier-1 multi-domain × longer-thought joint expansion):
     * An earlier workspace-only run produced 100 valid scenarios tagged

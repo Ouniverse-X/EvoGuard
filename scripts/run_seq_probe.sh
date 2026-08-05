@@ -33,7 +33,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
     echo "[launcher] attempt $attempt firing on GPU#$target_gpu max_thought_tokens=${MAX_THOUGHT_TOKENS:-<default 128>}"
     CUDA_VISIBLE_DEVICES=$target_gpu \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    /ssd1/conda_envs/evoguard/bin/python -m preliminary.as_vs_af_sequence_probe \
+    /ssd1/conda_envs/evoguard/bin/python -m preliminary.probe \
         --scenarios-json "$SCENARIOS_JSON" \
         --output-dir "$OUTPUT_DIR" \
         --cuda-visible-devices "$target_gpu" \
