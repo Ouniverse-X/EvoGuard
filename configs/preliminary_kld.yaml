@@ -1,0 +1,13 @@
+# Preliminary IPI tool-return KL-divergence surprise experiment (v3 single-step).
+# See docs/superpowers/specs/2026-08-02-preliminary-ipi-tool-return-kld-surprise-design.md
+model_path: /ssd1/models/qwen2.5-7b-it
+cuda_visible_devices: "2"
+judge_base_url: http://localhost:8002/v1
+judge_model: llama3-8b-judge
+data_path: data/toolsafe/agentdojo-tragj/workspace.json
+neutral_default_observation: "Done."
+eps: 1.0e-12
+max_new_tokens: 256
+max_input_length: 32000
+output_dir: rounds/_preliminary
+seed: 42

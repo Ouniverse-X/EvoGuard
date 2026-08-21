@@ -51,12 +51,46 @@ class OpenAIClient(LLMClient):
         self.config = config
         # A vLLM server ignores the api key but the SDK requires a non-empty one.
         api_key = config.api_key or "EMPTY"
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=config.base_url,
-            timeout=config.timeout,
-            max_retries=0,  # we implement our own retry/backoff loop below
-        )
+
+        # Build a hardened httpx.Client that DISABLES HTTP keep-alive entirely.
+        # Motivation: long-running experiments against local vLLM servers were
+        # hitting chronic timeouts because the OpenAI SDK's default transport
+        # reuses pooled connections; when the server eventually closes an idle
+        # keep-alive socket the client side may remain in CLOSE_WAIT and every
+        # subsequent request dispatched on it hangs until read-timeout fires.
+        # Setting max_keepalive_connections=0 forces each call to open a fresh
+        # TCP connection, eliminating the failure mode at the cost of ~few ms
+        # extra handshake overhead per LLM call -- negligible vs inference time.
+        try:
+            import httpx as _httpx
+            _hardened_http = _httpx.Client(
+                timeout=_httpx.Timeout(
+                    connect=30.0,
+                    read=float(config.timeout),
+                    write=30.0,
+                    pool=10.0,
+                ),
+                limits=_httpx.Limits(
+                    max_keepalive_connections=0,  # KEY: no persistent conns.
+                    max_connections=32,
+                    keepalive_expiry=1.0,
+                ),
+            )
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=config.base_url,
+                timeout=config.timeout,
+                max_retries=0,  # we implement our own retry/backoff loop below
+                http_client=_hardened_http,
+            )
+        except ImportError:
+            # Fallback: SDK-only construction (older envs without httpx tweak).
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=config.base_url,
+                timeout=config.timeout,
+                max_retries=0,
+            )
         # When a LoRA adapter is configured, address it as the model name; the
         # vLLM server resolves adapters registered under that served name.
         self._model = config.lora_adapter or config.model

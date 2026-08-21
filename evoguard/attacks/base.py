@@ -1,9 +1,6 @@
 """
 The attacker is an LLM that proposes injection strategies (:class:`AttackSpec`
-genomes) and applies genetic variation operators to them. It is split into an
-:class:`AttackGenerator` (the LLM primitives: seed generation, crossover,
-mutation) and the genetic loop in :mod:`evoguard.attacks.genetic`, which owns
-selection / elitism / diversity accounting.
+genomes) and applies genetic variation operators to them.
 """
 
 from __future__ import annotations
@@ -15,8 +12,6 @@ from evoguard.core.types import AttackSpec, Task, ToolSpec
 
 
 class AttackGenerator(abc.ABC):
-    """LLM primitives that produce and recombine attack genomes."""
-
     @abc.abstractmethod
     def seed(
         self,

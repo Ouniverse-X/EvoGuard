@@ -10,12 +10,13 @@ from typing import Callable
 
 from evoguard.config import EnvConfig
 from evoguard.envs.base import SimulatedToolEnv, ToolEnv
-from evoguard.envs.toolsafe import AgentDojoEnv, AgentHarmEnv
+from evoguard.envs.toolsafe import AgentDojoEnv, AgentDojoSplitEnv, AgentHarmEnv
 from evoguard.llm import build_client
 from evoguard.llm.base import LLMClient
 
 _REGISTRY: dict[str, Callable[..., ToolEnv]] = {
     "agentdojo": AgentDojoEnv,
+    "agentdojo_split": AgentDojoSplitEnv,
     "agentharm": AgentHarmEnv,
 }
 
@@ -31,14 +32,6 @@ def available_envs() -> list[str]:
 
 
 def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int = 0) -> ToolEnv:
-    """Construct the environment named by ``config.dataset``.
-
-    ``executor`` is the LLM that simulates tool execution; if omitted it is built
-    from ``config.tool_executor_llm``. A separate ``utility_judge`` client is
-    also constructed from :attr:`EnvConfig.utility_judge_llm` and forwarded to
-    envs that support benign-completion scoring (currently the toolsafe family).
-    """
-
     if config.dataset not in _REGISTRY:
         raise ValueError(
             f"Unknown dataset {config.dataset!r}; available: {available_envs()}"
@@ -48,8 +41,6 @@ def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int
     utility_judge_client = None
     try:
         # Build a dedicated judge client for utility scoring fallback path.
-        # Failure here (e.g. missing creds for qianfan backend) must NOT block
-        # environment construction -- score_utility handles None gracefully.
         utility_judge_client = build_client(config.utility_judge_llm, seed=seed + 1)
     except Exception as exc:
         from evoguard.utils.logging import get_logger
@@ -68,7 +59,6 @@ def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int
             utility_judge=utility_judge_client,
         )
     except TypeError:
-        # Env doesn't accept utility_judge kwarg yet; fall back to legacy signature.
         return builder(
             executor,
             data_root=config.data_root,
@@ -81,6 +71,7 @@ __all__ = [
     "ToolEnv",
     "SimulatedToolEnv",
     "AgentDojoEnv",
+    "AgentDojoSplitEnv",
     "AgentHarmEnv",
     "build_env",
     "register_env",

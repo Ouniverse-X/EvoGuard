@@ -1,16 +1,9 @@
-"""CLI entry point for running an EvoGuard experiment.
-
+"""
 Usage::
 
     python -m evoguard.run --config configs/example.yaml
     python -m evoguard.run --smoke            # quick mock-only sanity run
-
-The ``--config`` form loads an :class:`ExperimentConfig` from YAML/JSON and
-runs the co-evolution loop to completion (or until termination criteria fire).
-``--smoke`` is shorthand for the deterministic offline smoke test defined in
-:mod:`evoguard.tests.smoke_test`.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -33,7 +26,6 @@ def main(argv=None) -> int:
     args = _build_argparser().parse_args(argv)
 
     if args.smoke:
-        # Defer import so that --help / arg parsing stay fast.
         from evoguard.tests import smoke_test
         rc = smoke_test.main()
         return int(rc or 0)

@@ -24,6 +24,9 @@ the next generation.
 from __future__ import annotations
 
 import random
+import statistics
+import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence
 
@@ -61,7 +64,19 @@ class GeneticAttacker:
         self.rng = rng or random.Random(config.random_seed)
         self.generation = 0
         self._population: list[AttackSpec] = []
-        
+        # Stagnation tracking for immigrant-injection alternative trigger.
+        # ``_last_improvement_gen`` records the generation index at which the
+        # population's best fitness strictly increased; reset to 0 on first run.
+        self._last_improvement_gen: int = -1
+        self._prev_best_fitness_for_stagnation: Optional[float] = None
+        # Behavioral-novelty archive (rolling deque of canonical signatures
+        # drawn from successful B-trajectory elites). Used to give small
+        # additive bonus to offspring whose behavior signature has rarely been
+        # seen before, encouraging exploration of distinct action sequences
+        # rather than re-discovering the same immediate-trigger attack.
+        archive_cap = max(0, int(getattr(config, "behavioral_archive_size", 20)))
+        self._behavior_archive: deque[str] = deque(maxlen=archive_cap if archive_cap > 0 else 1)
+
         ctrl_cap = int(defense_max_turns) if defense_max_turns else None
         if ctrl_cap is not None:
             self._inject_turn_ceiling = max(1, ctrl_cap)
@@ -138,28 +153,96 @@ class GeneticAttacker:
         ]
         elites = [self.sanitize_spec(s) for s in elites]
 
-        # Detect premature convergence: when mean best fitness drops sharply
-        # vs the previous generation we inject random immigrants to escape the
-        # local optimum (prevents r5-style collapse seen in evoguard_agentdojo_full).
+        # Detect premature convergence via TWO complementary triggers:
+        #
+        # (a) Drop-based: best_fit collapsed by > fitness_drop_threshold vs prev gen.
+        #     Catches the original r5-style sudden collapse pattern.
+        #
+        # (b) Stagnation-based: ``immigrant_stagnation_gens`` consecutive gens
+        #     passed without ANY strict improvement in elite_fitness.  This
+        #     catches the flat-zero plateau observed in evoguard_banking_local_improved
+        #     where drop-rule never fired because there was nothing left to drop.
         current_best = float(ranked[0].fitness) if ranked else 0.0
         prev_best = getattr(self, "_prev_gen_best_fitness", None)
-        trigger_immigrants = (
+        self._prev_gen_best_fitness = current_best
+
+        if (
+            self._prev_best_fitness_for_stagnation is None
+            or current_best > self._prev_best_fitness_for_stagnation + 1e-9
+        ):
+            self._last_improvement_gen = self.generation
+            self._prev_best_fitness_for_stagnation = current_best
+
+        stagnation_window = max(0, int(getattr(self.config, "immigrant_stagnation_gens", 0)))
+        stagnation_elapsed = (
+            (self.generation - self._last_improvement_gen)
+            if self._last_improvement_gen >= 0 else 0
+        )
+        trigger_by_drop = (
             prev_best is not None
             and current_best < prev_best * self.config.fitness_drop_threshold
-            and current_best <= 0.0  # only kick in on actual collapse to zero
+            and current_best <= 0.0
         )
-        self._prev_gen_best_fitness = current_best
+        trigger_by_stagnation = (
+            stagnation_window > 0
+            and stagnation_elapsed >= stagnation_window
+            and current_best <= 0.0   # only kick in when we're truly stuck at zero, not when holding steady on real signal
+        )
+        trigger_immigrants = bool(trigger_by_drop or trigger_by_stagnation)
+
         if trigger_immigrants:
+            why = "drop" if trigger_by_drop else f"stagnation({stagnation_elapsed}g)"
             logger.warning(
-                "Task %s gen %d->%d: best_fit %.4f -> %.4f below threshold; "
+                "Task %s gen %d->%d: best_fit %.4f -> %.4f (%s); "
                 "injecting random immigrants at rate=%.2f",
                 self.task.task_id,
                 self.generation,
                 self.generation + 1,
                 prev_best or 0.0,
                 current_best,
+                why,
                 self.config.immigrant_injection_rate,
             )
+
+        # Adaptive mutation-rate scaling: when phenotypic variance of the just-
+        # evaluated population collapses near zero, scale mutation probability UP
+        # for THIS generation only so offspring get perturbed harder -- this is a
+        # cheap-but-effective anti-premature-convergence lever that doesn't need
+        # extra LLM calls beyond what crossover/mutation already cost us.
+        eff_mutation_rate: float = float(self.config.mutation_rate)
+        adaptive_enabled = bool(getattr(self.config, "adaptive_mutation_enabled", False))
+        mut_min = float(getattr(self.config, "mutation_rate_min", 0.05))
+        mut_max = float(getattr(self.config, "mutation_rate_max", 0.85))
+        if adaptive_enabled:
+            fit_vals = [float(e.fitness) for e in evaluated]
+            try:
+                if len(fit_vals) >= 3:
+                    stdev_pop = statistics.pstdev(fit_vals) or 0.0
+                    mean_pop = statistics.fmean(fit_vals) or 0.0
+                    cv_pop = (stdev_pop / abs(mean_pop)) if abs(mean_pop) > 1e-12 \
+                             else stdev_pop
+                    # Coefficient-of-variation below ~0.25 => high homogeneity =>
+                    # boost mutation multiplicatively toward ceiling; otherwise keep nominal.
+                    if cv_pop < 0.25:
+                        scaled = min(
+                            mut_max,
+                            eff_mutation_rate * (1.0 + (0.25 - cv_pop) / 0.30),
+                        )
+                        scaled = max(scaled, eff_mutation_rate)  # only ever raise it.
+                        if scaled > eff_mutation_rate:
+                            logger.info(
+                                "Task %s gen %d->%d: low pop-variance(cv=%.4f) -> "
+                                "raising mutation_rate %.2f -> %.4f for this generation.",
+                                self.task.task_id,
+                                self.generation,
+                                self.generation + 1,
+                                cv_pop,
+                                eff_mutation_rate,
+                                scaled,
+                            )
+                            eff_mutation_rate = float(min(mut_max, max(mut_min, scaled)))
+            except Exception as exc:                                            # noqa: BLE001
+                logger.debug("adaptive-mutation scaling skipped: %s", exc)
 
         # Build offspring via crowding-aware tournament selection + crossover/mutation.
         offspring: list[AttackSpec] = []
@@ -207,11 +290,26 @@ class GeneticAttacker:
             else:
                 child = _clone_as(p1.spec, generation=self.generation + 1, origin="crossover")
 
-            if self.rng.random() < self.config.mutation_rate:
+            if self.rng.random() < eff_mutation_rate:
                 child = self.generator.mutate(
                     self.task, self.tools, child, generation=self.generation + 1
                 )
             offspring.append(self.sanitize_spec(child))
+
+        # Update behavioral-novelty archive using this round's successful elites'
+        # canonical (method, target_turn) signatures. Future generations get a
+        # small additive fitness boost when their signature is rare in the
+        # archive -- implemented inside ``_adjusted_fitness`` via the bonus weight.
+        try:
+            for e in ranked[: max(0, int(getattr(self.config, "elite_size", 0)))]:
+                if not getattr(e, "success", False):
+                    continue
+                sig = f"{e.spec.method or ''}|t{int(e.spec.target_turn)}"
+                if sig in set(self._behavior_archive):
+                    continue   # dedup so the deque stays diverse.
+                self._behavior_archive.append(sig)
+        except Exception:
+            pass
 
         self.generation += 1
         self._population = offspring[:target_offspring] + elites
@@ -294,20 +392,54 @@ class GeneticAttacker:
         shares the same method label. Each duplicate multiplies the fitness by
         ``(1 - diversity_penalty)``, so coverage over position and method is
         rewarded.
+
+        Additionally, when ``behavioral_archive_size`` > 0 a small additive
+        bonus is granted for individuals whose (method, target_turn) signature
+        is rare in the rolling archive of past successful elites. This nudges
+        tournament selection toward genuinely novel attack behaviors rather
+        than re-discovering the same immediate-trigger pattern.
         """
 
         base = candidate.fitness
-        if base <= 0.0 or not selected_history:
-            return base
-        window = self.config.diversity_position_window
-        duplicates = 0
-        for prior in selected_history:
-            close_pos = abs(prior.target_turn - candidate.spec.target_turn) <= window
-            same_method = prior.method == candidate.spec.method
-            if close_pos and same_method:
-                duplicates += 1
-        factor = (1.0 - self.config.diversity_penalty) ** duplicates
-        return base * factor
+        if base <= 0.0:
+            # Failed attacks have zero raw fitness; we still allow novelty
+            # bonus to lift them slightly so they survive selection pressure
+            # during early exploration rounds where everything fails.
+            bonus_only_base: float = 0.0
+        else:
+            bonus_only_base = base
+
+        if not selected_history:
+            score_no_bonus = base
+        else:
+            window = self.config.diversity_position_window
+            duplicates = 0
+            for prior in selected_history:
+                close_pos = abs(prior.target_turn - candidate.spec.target_turn) <= window
+                same_method = prior.method == candidate.spec.method
+                if close_pos and same_method:
+                    duplicates += 1
+            factor = (1.0 - self.config.diversity_penalty) ** duplicates
+            score_no_bonus = base * factor
+
+        # Behavioral-novelty additive bonus.
+        archive_size_cap = max(0, int(getattr(self.config, "behavioral_archive_size", 0)))
+        if (
+            archive_size_cap > 0
+            and len(self._behavior_archive) > 0
+            and getattr(self.config, "novelty_bonus_weight", 0.0) > 0.0
+        ):
+            sig_cand = f"{candidate.spec.method or ''}|t{int(candidate.spec.target_turn)}"
+            unique_total = float(len(set(self._behavior_archive)) or 1)
+            matches = sum(
+                1 for s in self._behavior_archive if s == sig_cand
+            )
+            rarity_ratio = 1.0 - min(1.0, matches / max(1.0, unique_total))
+            weight = float(getattr(self.config, "novelty_bonus_weight", 0.03))
+            bonus = weight * rarity_ratio * (1.0 if bonus_only_base >= 0 else 0.0)
+            return score_no_bonus + bonus
+
+        return score_no_bonus
 
 
 def _clone_as(spec: AttackSpec, *, generation: int, origin: str) -> AttackSpec:

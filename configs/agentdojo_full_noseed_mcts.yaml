@@ -1,0 +1,153 @@
+# EvoGuard experiment: AgentDojo FULL — NO PREWARM SEEDS (MCTS ablation).
+#
+# Purpose: ablation study measuring what happens when the MCTS co-evolution loop
+# starts from scratch without any pre-seeded injection skeletons.
+# All *_seeds.json files cleared to empty `{"seeds":[]}` before launch.
+# ALL other params identical to v8_contrastive for fair comparison.
+
+name: evoguard_agentdojo_full_noseed_mcts
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    base_url: null
+    api_key: null
+    temperature: 0.95
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    max_retries: 5  # 429/5xx now retried with Retry-After-aware backoff; 5 attempts rides out RPM windows
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  # MCTS-specific knobs (identical to v8_contrastive)
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+  mcts_failure_credit_eps: 0.03
+  mcts_tau_window_size: 8
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /ssd1/yx/models/qwen2.5-7b-it
+
+  method: sft_then_native_grpo
+
+  # LoRA (identical to v8_contrastive: rank 32, 7 modules including MLP)
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  # Cold-start SFT (identical to v8_contrastive)
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+
+  # Native-GRPO (identical to v8_contrastive)
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 32
+  grpo_min_new_successes: 3
+
+  # Advantage shaping (identical to v8_contrastive)
+  grpo_advantage_curriculum_lambda: 1.5
+
+  # bs=2 OOMs at the FIRST GRPO backward (40G card; run-2 2026-08-16 crashed
+  # every round R1-R11). bs=1 + accum=8 is the known-good memory footprint of
+  # all prior working runs; eff_batch stays 8.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  # GPU1 taken by foreign Triton "safeshield" deployment (2026-08-16);
+  # GPU2/3 freed (user-authorized kill); trainer pins GPU3. vLLM primary on GPU0.
+  cuda_visible_devices: "3"
+  native_max_steps_per_round: 400
+
+  # Probe disabled (identical to v8_contrastive)
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  validation_fraction: 0.15
+  # task_concurrency also sizes the MCTS precompute/evolve thread pools
+  # (rollout.py phase-0 + driver.evolve_after_round) — 8 workers cut the
+  # no-seed cold-start MCTS generation from ~2h37m to ~20min.
+  task_concurrency: 8
+  attack_concurrency: 16
+
+evo_data_subdir: "agentdojo"

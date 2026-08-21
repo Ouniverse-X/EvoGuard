@@ -1,26 +1,4 @@
-"""Sequence-level AS-vs-AF probe — feeds *each rollout's own recorded thought*
-as continuation past the shared scaffolded prefix, then extracts per-position
-softmax signals along the entire decoded span.
-
-Why this fixes the design flaw of ``as_vs_af_mechanism_probe.py``:
--------------------------------------------------------------------
-The old probe ran ONE forward pass over ``[chat_prefix + scaffold]`` only,
-producing the predicted next-token distribution AT POSITION 0 inside the
-thinking frame. Because success-rollouts and fail-rollouts receive LITERALLY
-IDENTICAL prefixes (only ``injected_obs`` is fed into BOTH buckets while
-outcome divergence happens later during temperature-sampled generation),
-the greedy argmax / softmax at pos-0 collapses bit-for-bit equal between
-buckets -- making any direct AS↔AF comparison trivially degenerate by
-construction.
-
-The fix: append EACH ROLLOUT'S OWN RECORDED-thought-text tokens after the
-scaffold (' {"thought": "') before doing the forward pass. Now every
-rollout has a UNIQUE conditioning context starting from position-T_scaffold
-onward, so the conditional distributions p(y_t | prefix, y_<t) DO depend
-on the specific sampled trajectory the agent produced -- giving us real
-signal-carriers for distinguishing attack-success outcomes from attack-fail
-outcomes beyond just immediate post-exposure surprise.
-
+"""
 Outputs land in <output_dir>/seq_probe/
     feats.jsonl         : one record per rollout with per-position scalars
                           (entropy/top1/refuse_mass/nll_actual_yt arrays).

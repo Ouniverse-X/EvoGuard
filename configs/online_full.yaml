@@ -1,0 +1,186 @@
+# EvoGuard experiment: AgentDojo FULL local v7_online_single_stage =
+#   v6_probed_lora BASELINE + Δ-GUIDED online co-evolution trainer.
+#
+# Single delta vs configs/agentdojo_full_probed_lora.yaml (v6):
+#   * training.method flipped  sft_then_native_grpo  ->  sft_then_online_grpo
+#
+# What changes semantically: r0 cold-start SFT runs UNCHANGED via
+#   evoguard.training.native_runner.train_native_sft(). Every round >=r1
+#   switches FROM local model.generate()-driven GRPO sampling INTO
+#   external controller-driven trio rollouts producing G genuine siblings
+#   per prompt row, scored through compute_evoguard_reward(judge_call=...)
+#   threading live outcome verdicts back. See
+#   /root/.claude/plans/partitioned-swimming-hartmanis.md and module
+#   docstring at top of online/trio_controller.py.
+#
+# Dispatcher wiring landed 2026-07-28 (Option-A per user decision):
+#   evoguard/training/__init__.py recognises 'sft_then_online_grpo' as a new
+#   explicit-method case; >=r1 rounds lazily import
+#   online.trio_controller.train_online_grpo and route there directly.
+#   Production-mode callers MUST attach a callable returning fresh fully-wired
+#   LogpAgent-wrapped Controller onto `dataset_builder._online_ctrl_factory`
+#   attribute upstream before invoking dispatcher with dry_run=False.
+#   Dry-run mode substitutes a safe stub guarding against None -- verified
+#   end-to-end via inline dispatch proof script 2026-07-28 producing expected
+#   _plan.json artifact under <exp>/grpo_native/<label>/_plan.json carrying
+#   {"phase":"plan_emitted","mode":"dry_run_short_circuit"} payload.
+#   Launching this config verbatim via scripts/run_real.sh works out-of-box
+#   for Step-2 verification harness reads of plan artifacts.
+#
+# Expected runtime log marker sequence each >=r1 round:
+#   "[train_defender][native-grpo] <rN> starting from <prior_adapter_dir>"
+#       -> immediately followed by ->
+#   "[online_grpo] <rN> DRY-RUN MODE active -> rendered plan artifacts only..."
+#       OR (when dry_run=false) "[online-trio]: invoking controller-driven G-sibling sampling g=N"
+
+name: evoguard_agentdojo_full_v7_online_single_stage
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                        # base served model; LoRA adapter overlaid each round after hot-load fix.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                              # vLLM ignores key value but SDK requires non-empty string.
+    temperature: 0.2                            # greedy-ish defense policy during rollouts (GRPO uses its own temp below).
+    max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8                                  # cap applies uniformly across all suites for cost-bounded rollouts.
+
+attacker:
+  llm:
+    backend: qianfan                            # remote GLM API identical to v5_mcts/v6_probed_lora baselines.
+    model: glm-5.2                              # attacker uses GLM-5.2 ; judge stays llama3 locally unchanged.
+    base_url: null                              # QianFanClient直连qianfan.baidubce.com不走openai base_url路径
+    api_key: null                               # creds走EVOGUARD_QIANFAN_APPID/TOKEN env vars(sh/qianfan_run.sh内置默认字面量兜底)
+    temperature: 0.95                           # 前次成功值(原local vllm=1.1随机性偏大)
+    top_p: 0.95                                 # 同前次成功值
+    max_tokens: 4096                            # 从8192降到4096匹配前次成功(GLM输出长度够用省配额)
+    timeout: 300                                # 从180升到300给远程API更长容错窗口
+    max_retries: 3
+    lora_adapter: null                          # remote endpoint不支持LoRA hot-load概念留空即可
+    enable_thinking: false                      # 关闭隐藏CoT预算确保JSON完整可见不被thinking截断
+
+  population_size: 15                           # MCTS batch size N per round (GA fields retained ignored).
+  offspring_size: 10                            # GA-only; ignored by MCTS.
+  elite_size: 3                                 # GA-only; ignored by MCTS.
+  tournament_k: 3                               # GA-only; ignored by MCTS.
+  crossover_rate: 0.9                           # GA-only; ignored by MCTS.
+  mutation_rate: 0.5                            # GA-only; ignored by MCTS.
+  diversity_penalty: 0.4                        # GA-only; ignored by MCTS.
+  diversity_position_window: 1                 # GA-only; ignored by MCTS.
+  crowding_factor: 2                           # GA-only; ignored by MCTS.
+  immigrant_injection_rate: 0.20                # GA-only; ignored by MCTS.
+  fitness_drop_threshold: 0.50                  # GA-only; ignored by MCTS.
+  random_seed: 42
+
+  search_method: mcts_delta                     # MCTS backend same as v5_mcts/v6_probed_lora comparators.
+  mcts_ucb_c: 1.414                             # classic UCB1 exploration coefficient (= sqrt(2)).
+  mcts_lambda_delta: 0.6                        # weight of delta-potential term in UCB-delta selection score.
+  mcts_failure_credit_eps: 0.03                # fraction of late-caught-failure tau converted into partial credit.
+  mcts_tau_window_size: 8                       # sliding window of recent C-class taus kept per node.
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:                                       # full coverage of all locally-available AgentDojo v1 suite snapshots under data/toolsafe/.
+    - banking                                   # dedup'd unique instructions: ~5-6 per suite
+    - slack                                     # workspace dominates total volume (~36 unique)
+    - travel                                    # combined target sample budget ~=54 distinct prompts after loader-side instruction-deduplication pass.
+    - workspace
+  max_tasks: 100                                # generous upper bound above expected unique-task total (~54).
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge                      # served-name registered on secondary judge vllm :8002 today.
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0                             # deterministic simulated tool outputs preferred across reruns.
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /ssd1/models/qwen2.5-7b-it        # local path beats HF repo-id avoiding network fetches mid-run.
+
+  method: sft_then_online_grpo                  # THE DELTA vs v6_probed_lora: r0 native_sft; >=r1 routes to
+                                                # online.trio_controller.train_online_grpo() replacing TRL's internal
+                                                # generate() sampler with external controller-driven trio rollouts.
+                                                # NOTE see INTEGRATION CAVEAT atop file re:dispatcher wiring gap.
+
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                                              # Overwritten at runtime iff lora_probe_artifact_path resolves to an
+                                              # existing targets.json carrying non-empty recommended_target_modules;
+                                              # override happens inside native_runner.py r0 cold-start branch only.
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0                               # cold-start phase only.
+  sft_learning_rate: 1.0e-4
+
+  grpo_learning_rate: 5.0e-6                    # shared between native_grpo + online_trio paths identically.
+  grpo_beta: 0.01
+  grpo_group_size_g: 8                          # G genuine sibling trajectories sampled PER prompt-row directly via
+                                                # repeated controller.run_attacked() invocations sharing prompt-state.
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90                # defense-agent action-sampling temp during trio rollout collection.
+  grpo_max_prompts_per_round: 32
+  grpo_min_new_successes: 3
+
+  per_device_batch_size: 1
+  gradient_accumulation: 8                       # eff_batch=8 stabilises updates.
+
+  dry_run: false                                 # REAL EXPERIMENT MODE -- user instruction 2026-07-28 'nohup全量运行'.
+                                                # Genuine weight updates every viable round; torch+CUDA+LoRA SFT/GRPO stack active.
+                                                # RESTART 2026-07-28 evening: previous attempt on card#4 hung after first SFT
+                                                # optimizer step likely due to host kernel<5.5 incompatibility per [RANK 0]
+                                                # runtime warning ("can cause the process to hang"). Switching trainer onto an
+                                                # idle dedicated card (#2 verified free at relaunch time) avoiding any shared-GPU
+                                                # contention with the parallel-running v7_integrated baseline holding card#4.
+  use_native_trainer: true                       # bypass vendored llamafactory-cli / verl CLIs entirely.
+  cuda_visible_devices: "2"                      # idle A100 card#2 selected for clean-restart (verified <1 MiB resident at
+                                                # 2026-07-28 relaunch time); avoids colliding w/ ongoing v7_integrated PID24466
+                                                # now occupying card#4 (~31 GiB resident doing its own GRPO).
+  native_max_steps_per_round: 200                # triple optimizer steps/round mirrors v5_mcts/v6_probed_lora settings exactly.
+
+  lora_probe_enabled: false                       # disabled -- user instruction 'use default strategy' = vanilla q/k/v/o proj spread across all blocks.
+                                                 # Setting enabled=false alone is insufficient because runner reads artifact path below regardless;
+                                                 # also BLANKING path string forces silent fallback to default ['q','k','v','o']_proj spread.
+  lora_probe_method: attn_kl                     # informational only when probe disabled.
+  lora_probe_top_k_blocks: 8                     # informational only when probe disabled.
+  lora_probe_max_pairs: 80                       # informational only when probe disabled.
+  lora_probe_artifact_path: ""                   # INTENTIONALLY EMPTY -> override silently no-ops falling back to default target_modules spread above;
+                                                 # matches user request dated 2026-07-28: 'probe use default strategy'.
+
+pipeline:
+  max_rounds: 12                                 # same horizon as v5_mcts/v6_probed_lora for fair ASR/F1/BU tier-table fill-in.
+  patience_rounds: 5                             # K=5 consecutive strict-asr<threshold rounds triggers termination state machine.
+  asr_threshold: 0.05                            # epsilon plan.md default.
+  stop_on_zero_success: false
+  validation_fraction: 0.15
+  task_concurrency: 8
+  attack_concurrency: 8
+
+evo_data_subdir: "agentdojo"

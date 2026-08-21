@@ -3,7 +3,7 @@
 # Improvements enabled (vs evoguard_agentdojo_full baseline):
 #   * Part 1 — utility scoring via native_lite + LLM rubric fallback
 #     → new metrics clean_completion_rate / attacked_benign_preserved_rate /
-#       dos_overblock_rate populated each round under results/.
+#       blocked_unfinished_rate populated each round under results/.
 #   * Part 2 — attacker max_tokens raised 4096→8192 AND thinking mode disabled
 #     on QianFan-style backends. Here we use local vLLM which doesn't expose a
 #     thinking toggle; enable_thinking flag is harmlessly ignored by OpenAIClient.
@@ -15,7 +15,7 @@
 # All LLM roles point at the single localhost vLLM instance serving
 # qwen2.5-7b-it with --enable-lora so freshly-trained adapters hot-load.
 
-name: evoguard_banking_local_improved
+name: evoguard_banking_local_realtrain_v1
 
 defense:
   llm:
@@ -89,8 +89,9 @@ process:
 
 training:
   enabled: true                          # keep training machinery wired in case user flips dry_run later.
-  base_model: Qwen/Qwen2.5-7B-Instruct
-  method: sft_then_grpo                  # r0 cold-start SFT then GRPO thereafter via Part-3 skip logic.
+  base_model: /ssd1/models/qwen2.5-7b-it   # local path beats HF repo-id: avoids network fetches mid-run.
+  method: sft_then_grpo                  # nominal value kept for legacy runner compatibility;
+                                         # use_native_trainer below takes precedence over LF/AEPO paths.
   lora_rank: 16
   lora_alpha: 32
   lora_dropout: 0.05
@@ -99,12 +100,17 @@ training:
   verl_root: "evoguard/training/AEPO/verl_aepo_entropy"
   sft_epochs: 2.0
   sft_learning_rate: 1.0e-4
-  grpo_learning_rate: 1.0e-6
+  grpo_learning_rate: 1.0e-6             # unused under native_sft mode currently; reserved for future GRPO integration.
   per_device_batch_size: 1
-  gradient_accumulation: 8
-  sft_coldstart_only_round_zero: true    # NEW Part 3: avoid re-running cold-start every round.
-  grpo_min_new_successes: 3              # NEW Part 3: skip GRPO update unless ≥3 fresh B-trajectories available.
-  dry_run: true                          # keep dry-run true initially; flip false once pipeline proves stable locally.
+  gradient_accumulation: 8               # eff_batch=8 keeps updates stable across small per-round dataset sizes.
+  sft_coldstart_only_round_zero: false   # warm-start chain handled natively by latest_adapter_dir.txt marker between rounds,
+                                         # no separate cold-start gate needed anymore.
+  grpo_min_new_successes: 3              # NEW Part 3: skip incremental retrain unless ≥3 fresh B-trajectories available.
+  dry_run: false                         # FLIPPED FALSE -> genuine weight updates happen every viable round.
+  use_native_trainer: true               # BYPASS vendored llamafactory-cli / verl CLIs whose pinned deps clash with installed stack;
+                                         # route through evoguard.training.native_runner.train_native_sft wrapping trl.SFTTrainer directly.
+  cuda_visible_devices: "7"              # dedicate one fully-idle A100 to trainer; rollout-server stays put on its own card#6 process.
+  native_max_steps_per_round: 60         # cap each incremental fit ≤~60 optimizer steps so rounds stay bounded even if data balloons unexpectedly.
 
 pipeline:
   max_rounds: 10                         # cap iterations so we get final summary.json within budget even if termination never fires.

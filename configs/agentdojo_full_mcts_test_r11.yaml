@@ -1,0 +1,90 @@
+# EvoGuard STEPWISE TEST CONFIG — evaluate trained MCTS-experiment LoRA on
+# FULL vendored AgentDojo trajectory dataset (data/toolsafe/agentdojo-tragj).
+#
+# This is an EVAL-ONLY run: no rollouts, no attacker, no GRPO/SFT.
+# For every one of 1220 vendored records, the defender makes ONE next-action
+# decision given the prior history; that decision is judged as TP/FN (injected)
+# or TN/FP (benign). Output goes under rounds/stepwise_eval_<cfg>_<adapter>/ .
+#
+# Updated 2026-07-31: pointing at FINAL checkpoint R19 produced by configs/
+# agentdojo_full_mcts_v6seedsV3.yaml (=seeds-v0.3 simplified ×22 entries,
+# sft_then_native_grpo method, max_rounds=20). Train-side peak metrics were
+# recall=0.947/f1=0.972/asr=0.053 @R15; final R19 slightly weaker at
+# recall=0.837/asr=0.163 per user choice to evaluate last-round artifact.
+#
+# Adapter chain below reflects exactly what vLLM currently has hot-loaded;
+# early rounds r0-r7 were evicted from active chain due to length cap (~12).
+
+name: evoguard_agentdojo_mcts_test_v6r19
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                        # served base model; lora_adapter below is overlaid via /v1/load_lora_adapter chain registered during training.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                              # vLLM ignores key value; SDK requires non-empty string.
+    temperature: 0.0                            # greedy decoding at TEST time so results are deterministic & reproducible across reruns.
+    max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
+    timeout: 120.0
+    max_retries: 5
+    # THE TRAINED DEFENDER ADAPTER CHAIN ENDING AT R19 from rounds/evoguard_agentdojo_full_v6_mcts/
+    # (seeds-v0.3 simplified; sft_then_native_grpo method; max_rounds=20).
+    lora_adapter: "evoguard_r8_grpo_weights::evoguard_r9_grpo_weights::evoguard_r10_grpo_weights::evoguard_r11_grpo_weights::evoguard_r12_grpo_weights::evoguard_r13_grpo_weights::evoguard_r14_grpo_weights::evoguard_r15_grpo_weights::evoguard_r16_grpo_weights::evoguard_r17_grpo_weights::evoguard_r18_grpo_weights::evoguard_r19_grpo_weights"
+  max_turns: 8                                  # unused by stepwise_eval (single decision per record) but kept for schema validity.
+
+attacker:
+  llm:
+    backend: qianfan                            # required field even though no attacks happen in this mode.
+    model: glm-5.2
+    api_key: null
+    temperature: 0.95
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    enable_thinking: false
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:                                       # full coverage of all locally-available AgentDojo suite snapshots -> all 1220 records tested.
+    - banking                                   # ~? injected/benign mix
+    - slack                                     #
+    - travel                                    #
+    - workspace                                 #
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge                      # secondary :8002 process serves llama3 used both as judge and simulated tool_executor.
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5                     # unused by stepwise_eval; kept for schema.
+  normalize_by: clean_length                    #
+
+training:
+  enabled: false                                # EVAL ONLY - never invoke any trainer here.
+  method: sft_then_native_grpo                  # kept nominal value, ignored since enabled=false.
+  dry_run: true                                 # belt-and-suspenders: trainer would be a pure no-op if accidentally invoked.
+  cuda_visible_devices: ""                      # don't pin anything; we're not loading models in-process.
+
+pipeline:
+  max_rounds: 1                                 # single pass through all records.

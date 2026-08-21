@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Launch a vLLM OpenAI-compatible server serving the local qwen2.5-7b-it
-# checkpoint on GPU #6, port 8000.
+# Launch the PRIMARY vLLM OpenAI-compatible server: the LoRA-enabled defender
+# backend that evoguard points `defense.llm.base_url` at.
 #
 # The server is launched in the background via nohup; logs go to
 # rounds/vllm.log and the PID is recorded under rounds/vllm.pid so callers can
 # stop it cleanly later (`scripts/stop_vllm.sh`).
 #
-# We deliberately use the pre-existing /ssd1/conda_envs/stabletool Python which
-# has a known-working vLLM 0.8.5 install; installing a fresh copy into evoguard
-# would have required recompiling torch + flash-attn from source on this box's
-# gcc-9 toolchain.
+# Interpreter: /root/yangxiao/envs/vllm085 (vllm 0.8.5.post1 + torch 2.6.0+cu124).
+# It is deliberately SEPARATE from the training venv: vllm 0.8.5 pins
+# transformers ~4.51 while the native TRL trainers run on transformers 5.x.
+# Keeping two venvs lets each side hold its own pins without conflict.
+#
+# GPU_ID accepts a comma-separated list; tensor-parallel size is derived from
+# how many devices are listed (e.g. EVOGUARD_VLLM_GPU="0,1" -> --tensor-parallel-size 2).
 
 set -euo pipefail
 
@@ -17,12 +20,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT"
 
-MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/ssd1/models/qwen2.5-7b-it}"
+MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/downloads/qwen2.5-7b-instruct}"
 PORT="${EVOGUARD_VLLM_PORT:-8000}"
-GPU_ID="${EVOGUARD_VLLM_GPU:-6}"
+GPU_ID="${EVOGUARD_VLLM_GPU:-0,1}"
 SERVED_NAME="${EVOGUARD_VLLM_NAME:-qwen2.5-7b-it}"
 MEM_UTIL="${EVOGUARD_VLLM_MEM_UTIL:-0.90}"
 MAX_MODEL_LEN="${EVOGUARD_VLLM_MAXLEN:-16384}"
+
+# Tensor-parallel size = number of devices listed in GPU_ID unless overridden.
+_TP_FROM_GPUS=$(awk -F',' '{n=0; for(i=1;i<=NF;i++) if ($i != "") n++; print n}' <<<"$GPU_ID")
+TP_SIZE="${EVOGUARD_VLLM_TP:-$_TP_FROM_GPUS}"
 
 # Dynamic-LoRA support flags. When ENABLE_LORA != "0" we pass ``--enable-lora``
 # along with rank/capacity hints so newly-trained adapters can be hot-loaded
@@ -34,7 +41,20 @@ MAX_LORA_RANK="${EVOGUARD_VLLM_MAX_LORA_RANK:-64}"
 MAX_LORAS="${EVOGUARD_VLLM_MAX_LORAS:-4}"
 LORA_MODULES_CSV="${EVOGUARD_VLLM_LORA_MODULES:-}"
 
-VLLM_PY="/ssd1/conda_envs/stabletool/bin/python"
+# Resolve which python interpreter launches the vLLM server.
+#
+# Priority order (highest first):
+#   1. EVOGUARD_VLLM_PYBIN explicit override (e.g. /opt/conda/envs/foo/bin/python)
+#   2. EVOGUARD_PY_BIN exported by scripts/setup_evoguard_env.sh's activation hook
+#   3. The dedicated vllm-serving venv built for this box.
+if [[ -n "${EVOGUARD_VLLM_PYBIN:-}" && -x "$EVOGUARD_VLLM_PYBIN" ]]; then
+    VLLM_PY="$EVOGUARD_VLLM_PYBIN"
+elif [[ -n "${EVOGUARD_PY_BIN:-}" && -x "$EVOGUARD_PY_BIN" ]]; then
+    VLLM_PY="$EVOGUARD_PY_BIN"
+else
+    VLLM_PY="/root/yangxiao/envs/vllm085/bin/python"
+fi
+echo "   python_bin   : $VLLM_PY"
 
 mkdir -p rounds
 LOG_FILE="rounds/vllm.log"
@@ -49,7 +69,7 @@ echo "Launching vLLM server:"
 echo "   model         : $MODEL_PATH"
 echo "   served_name   : $SERVED_NAME"
 echo "   port          : $PORT"
-echo "   gpu           : cuda:$GPU_ID"
+echo "   gpu           : cuda:$GPU_ID (tensor_parallel_size=$TP_SIZE)"
 echo "   mem_util      : $MEM_UTIL"
 echo "   max_model_len : $MAX_MODEL_LEN"
 if [[ "$ENABLE_LORA" != "0" ]]; then
@@ -82,12 +102,28 @@ if [[ "$ENABLE_LORA" != "0" ]]; then
     fi
 fi
 
+# vLLM 0.8.x gates the /v1/load_lora_adapter + /v1/unload_lora_adapter HTTP
+# routes behind env var VLLM_ALLOW_RUNTIME_LORA_UPDATING (see
+# vllm/entrypoints/openai/api_server.py:783). Passing --enable-lora alone is NOT
+# enough -- without this env flag the routes never register and our pipeline's
+# per-round hot-load call (scripts/register_vllm_lora.sh) returns HTTP 404.
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING="${VLLM_ALLOW_RUNTIME_LORA_UPDATING:-1}"
+
+# Force LEGACY engine path. The experimental V1 engine in vllm 0.8.x does NOT
+# fully initialize lora_manager when --enable-lora is passed, causing every
+# POST /v1/load_lora_adapter call to fail with
+#   AttributeError: 'GPUModelRunner' object has no attribute 'lora_manager'
+# The legacy engine handles dynamic LoRA hot-loading correctly end-to-end as
+# verified on 2026-07-21 with a probe server launched under evoguard python3.12.
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+
 CUDA_VISIBLE_DEVICES="$GPU_ID" \
 nohup "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
     --model             "$MODEL_PATH" \
     --served-model-name "$SERVED_NAME" \
     --port              "$PORT" \
     --host              127.0.0.1 \
+    --tensor-parallel-size "$TP_SIZE" \
     --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len     "$MAX_MODEL_LEN" \
     --trust-remote-code \

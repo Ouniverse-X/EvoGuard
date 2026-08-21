@@ -42,7 +42,16 @@ def _load_prewarm_skeletons_all() -> dict[str, list[dict]]:
         return _PREWARM_CACHE
 
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
+    candidates = []
+    # Explicit opt-in override. Highest priority so an experiment can name its
+    # own seed artifact (e.g. EVOGUARD_PREWARM_SEEDS_DIR=data/seeds to use the
+    # fixed cross-dataset universal_seeds.json) without mutating the dataset dir
+    # or changing the default for every other caller.
+    override = (os.environ.get("EVOGUARD_PREWARM_SEEDS_DIR") or "").strip()
+    if override:
+        candidates.append(override)
+        candidates.append(os.path.join(here, "..", "..", override))
+    candidates += [
         os.path.join(os.getcwd(), "data", "toolsafe", "agentdojo-tragj"),
         os.path.join(here, "..", "..", "data", "toolsafe", "agentdojo-tragj"),
     ]
@@ -86,12 +95,14 @@ def _load_prewarm_skeletons_all() -> dict[str, list[dict]]:
             cache[suite_key] = entry_list
             n_loaded_for_this_dir += len(entry_list)
         if cache:
+            if cache.get("universal"):
+                cache = {"universal": cache["universal"]}
             logger.info(
                 "[prewarm] loaded skeletons from %s across %d suites "
                 "(total=%d entries).",
                 rdir, len(cache), sum(len(v) for v in cache.values()),
             )
-            break  
+            break
 
     _PREWARM_CACHE = cache  
     return _PREWARM_CACHE
@@ -329,7 +340,10 @@ class DeltaGuidedMCTSAttacker:
         if not suite:
             return
 
-        entries = skel_by_suite.get(suite)
+        # A fixed universal set takes precedence over dataset-specific files;
+        # suite files remain a backward-compatible fallback when no universal
+        # seed artifact is present.
+        entries = skel_by_suite.get("universal") or skel_by_suite.get(suite)
         if not isinstance(entries, list) or not entries:
             return
 
@@ -339,9 +353,11 @@ class DeltaGuidedMCTSAttacker:
         for ent in entries:
             if not isinstance(ent, dict):
                 continue
-            turn_raw = ent.get("turn")
+            turn_raw = ent.get("turn", ent.get("target_turn"))
             method = str(ent.get("method") or "").strip()
-            tmpl = str(ent.get("payload_template") or "").strip()
+            tmpl = str(
+                ent.get("payload_template", ent.get("payload")) or ""
+            ).strip()
             try:
                 t_val = int(turn_raw)
             except (TypeError, ValueError):
@@ -493,7 +509,12 @@ class DeltaGuidedMCTSAttacker:
         if node.level == "L2_method":
             t_val = self._lookup_ancestor_turn_value(node.node_id)
             # 构造一个最小化的展位，作为变异器的输入种子
-            placeholder = _construct_seed_from_cell(t_val, node.discriminator.get("method"), self.task)
+            placeholder = _construct_seed_from_cell(
+                t_val,
+                node.discriminator.get("method"),
+                self.task,
+                payload=node.cached_payload_text or "",
+            )
             # 基于占位 spec 生成一个具体的攻击 payload 文本
             mutated = self.generator.mutate(self.task, self.tools, placeholder, generation=self.generation)
             sig_hash = _short_hash(mutated.payload or "")

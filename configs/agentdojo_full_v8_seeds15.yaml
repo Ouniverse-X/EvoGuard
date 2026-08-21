@@ -1,0 +1,144 @@
+# EvoGuard experiment: AgentDojo FULL v8_seeds15
+#
+# Seed ablation: identical to v8_contrastive but using curated 15-seed subset
+# (from seeds_backup_227 → 15 diverse seeds across 4 domains).
+# Goal: measure MCTS evolution quality vs. full 227-seed population.
+
+name: evoguard_agentdojo_full_v8_seeds15
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    base_url: null
+    api_key: null
+    temperature: 0.95
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  # ---- MCTS attacker ---- #
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+  mcts_failure_credit_eps: 0.03
+  mcts_tau_window_size: 8
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /ssd1/yx/models/qwen2.5-7b-it
+
+  method: sft_then_native_grpo
+
+  # ---- LoRA (same as v8_contrastive) ---- #
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  # ---- Cold-start SFT knobs (only used by r0) ---- #
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+
+  # ---- Native-GRPO knobs ---- #
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 32
+  grpo_min_new_successes: 3
+
+  # === Δ-aware advantage shaping === #
+  grpo_advantage_curriculum_lambda: 1.5
+
+  # ---- Trainer infrastructure ---- #
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  cuda_visible_devices: "4"
+  native_max_steps_per_round: 400
+
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  validation_fraction: 0.15
+  task_concurrency: 4
+  attack_concurrency: 4
+
+evo_data_subdir: "agentdojo"

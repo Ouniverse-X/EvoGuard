@@ -242,6 +242,87 @@ class TestDeltaGuidedMCTSAttacker(unittest.TestCase):
         total_succ = sum(int(getattr(n,'n_success',0)) for n in att._nodes_by_id.values())
         self.assertGreater(total_succ, 0)
 
+    def test_prewarm_accepts_existing_concrete_seed_fields(self):
+        import evoguard.attacks.mct_searcher as mcts
+
+        mcts._PREWARM_CACHE = {
+            "legacy": [{
+                "target_turn": 0,
+                "method": "legacy_concrete_seed",
+                "payload": "legacy payload",
+            }]
+        }
+        try:
+            task = Task(
+                task_id="test:legacy:prewarm",
+                instruction="dummy instruction",
+                suite="legacy",
+                dataset="legacy",
+                tool_names=[],
+            )
+            attacker = DeltaGuidedMCTSAttacker(
+                task=task,
+                tools=[],
+                generator=_StubGenerator(),
+                config=AttackerConfig(search_method="mcts_delta", population_size=8),
+                defense_max_turns=5,
+            )
+            methods = {
+                str(node.discriminator.get("method") or "")
+                for node in attacker._nodes_by_id.values()
+                if node.level == "L2_method"
+            }
+            self.assertIn("legacy_concrete_seed", methods)
+        finally:
+            mcts._PREWARM_CACHE = None
+
+    def test_universal_prewarm_seeds_apply_to_unseen_suite(self):
+        import evoguard.attacks.mct_searcher as mcts
+
+        mcts._PREWARM_CACHE = None
+        skel_by_suite = mcts._load_prewarm_skeletons_all()
+        if not skel_by_suite.get("universal"):
+            self.skipTest("no universal prewarm seeds present; skipping")
+        self.assertEqual(set(skel_by_suite), {"universal"})
+        # Count is read from the artifact rather than hard-coded: the universal
+        # seed set is revised over time (v1 -> v2 28 seeds -> v2r 20 seeds) and a
+        # literal here fails on every revision without indicating a real defect.
+        self.assertGreater(len(skel_by_suite["universal"]), 0)
+
+        task = Task(
+            task_id="test:agent_security_bench:universal_prewarm",
+            instruction="dummy instruction",
+            suite="agent_security_bench",
+            dataset="agent_security_bench",
+            tool_names=[],
+        )
+        cfg = AttackerConfig(
+            search_method="mcts_delta",
+            population_size=8,
+            random_seed=42,
+        )
+        attacker = DeltaGuidedMCTSAttacker(
+            task=task, tools=[], generator=_StubGenerator(), config=cfg,
+            defense_max_turns=5,
+        )
+        methods = {
+            str(node.discriminator.get("method") or "")
+            for node in attacker._nodes_by_id.values()
+            if node.level == "L2_method"
+        }
+        expected = {str(seed["method"]) for seed in skel_by_suite["universal"]}
+        self.assertEqual(methods, expected)
+
+        seed = skel_by_suite["universal"][0]
+        seed_node = next(
+            node for node in attacker._nodes_by_id.values()
+            if node.level == "L2_method"
+            and node.discriminator.get("method") == seed["method"]
+        )
+        child = attacker._expand_frontier(seed_node)
+        self.assertIsNotNone(child)
+        self.assertTrue(child.cached_payload_text.startswith(seed["payload_template"]))
+
     def test_prewarm_skeleton_injection_adds_l2_branches_for_matching_suite(self):
         """Skeletons from *_seeds.json should appear as L2_method children of L1.
 
@@ -252,11 +333,16 @@ class TestDeltaGuidedMCTSAttacker(unittest.TestCase):
         from evoguard.attacks.mct_searcher import _load_prewarm_skeletons_all
 
         skel_by_suite = _load_prewarm_skeletons_all()
-        if not skel_by_suite:
-            self.skipTest("no prewarm skeleton files present; skipping integration test")
+        # The loader returns a key per *_seeds.json file it finds, so a dict of
+        # empty lists is the normal state when the seed files are empty stubs
+        # (as in the noseed baseline). Only suites with actual entries are
+        # testable here.
+        populated = [s for s, e in skel_by_suite.items() if e]
+        if not populated:
+            self.skipTest("no prewarm skeleton entries present; skipping integration test")
 
         # Pick any suite that has skeletons and build a task in that suite.
-        suite_name = next(iter(skel_by_suite))
+        suite_name = populated[0]
 
         task = Task(
             task_id=f"test:{suite_name}:prewarm_probe",

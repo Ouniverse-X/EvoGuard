@@ -1,0 +1,311 @@
+# EvoGuard experiment: AgentDojo FULL — two-class SFT cold start + S1 three-term reward.
+#
+# Byte-identical to configs/agentdojo_full_p1p4_reward.yaml except for `name` and
+# the three sft_* fields below. Two interventions are under test together, and
+# NEITHER lives in this file:
+#
+#  1. Cold start: two-class SFT (the sft_* fields here). Class 1 = clean (A)
+#     rollouts with utility>=0.5; class 2 = attacked-and-defended (C) rollouts
+#     with utility>=0.5. B contributes nothing, so no refusal template is ever
+#     emitted -- 677 rows, 0 refusal rows, versus 3156 rows / 116 refusal rows
+#     under the previous recipe.
+#  2. Reward: the S1 THREE-component function in evoguard/training/grpo_reward.py
+#         R = r_safety + r_progress - p_drift
+#     replacing the six-term P1-P4 version this config originally shipped with.
+#     r_progress is a judged verdict in {advance, neutral, waste}; every keyword
+#     table that used to stand in for it is gone, as is the inline r_early term
+#     (Δ-monotonicity now lives entirely in grpo_advantage_curriculum_lambda,
+#     which is why it is set to 1.5 below rather than 0.0).
+#
+# What that fixes, measured. The p1p4 clean arm degraded by announcing an
+# injection that is not there and then calling tools until the turn budget ran
+# out -- final-answer rate 89.4% (r0, base model) -> 85.1% (r1, SFT-only) ->
+# 27.7% (r6), injection-flag rate 0.0% -> 0.0% -> 59.6%, mean steps 4.3 -> 7.6
+# against max_turns=8, zero-tool-call flat at 0.0%. GRPO owns the whole
+# regression. Under the six-term reward that step scored a NET POSITIVE +1.85;
+# under S1 it scores -3.00 attacked / -0.50 clean, strictly below every
+# productive behaviour, while "flag the injection AND take the correct next step"
+# scores the ceiling (+3.20 with judges live). No seventh penalty term was added
+# to get there -- the term that was already there was made to measure something.
+#
+# Trade-off, recorded rather than hidden: dropping the refusal-keyword safety
+# credit moves the break-even p(judged unsafe) at which refusing beats acting
+# from 16.2% to 34.6%, so measured ASR may rise from the 2.02% recorded for
+# p1p4-r6. That 2.02% was bought with a clean-arm utility mean of 0.1009 and a
+# false-alarm rate of 0.7237; report both sides.
+#
+# Do not re-point this config at another run's directory; the separate `name`
+# keeps rounds/evoguard_agentdojo_full_p1p4_reward/ intact for comparison.
+#
+# Launch MUST export BOTH of:
+#   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds        (see the prewarm note below)
+#   EVOGUARD_JUDGE_LLM_BASE_URL=http://127.0.0.1:8003/v1
+# scripts/run_grpo_experiment.sh sets neither. Without the second one BOTH judges
+# run degraded and r_progress collapses onto its structural pre-check -- which is
+# survivable but discards most of the signal this run exists to test. Nothing in
+# the repository exported that variable before 2026-08-21, so every GRPO round
+# ever run scored r_safety from the heuristic fallback. Confirm the log shows
+# `[native_grpo][reward_fn] progress judge active at ...` and no WARNING naming
+# either env var.
+#
+# ---------------------------------------------------------------------------
+# Original header of the seeded-split config follows.
+# ---------------------------------------------------------------------------
+# EvoGuard experiment: AgentDojo FULL — WITH PREWARM SEEDS (MCTS), stratified split.
+#
+# Every scientific hyperparameter is identical to
+# configs/agentdojo_full_noseed_split.yaml (population_size=15, max_rounds=12,
+# search_method=mcts_delta, same GA/MCTS/LoRA/GRPO values). The single
+# difference is that MCTS cold-start prewarming is ENABLED, making this the
+# seeded arm of the seeded/noseed pair.
+#
+# Inherited from configs/agentdojo_full_noseed_h800.yaml. Three changes, all about
+# experimental hygiene / infrastructure -- the scientific scope is untouched
+# (population_size=15, max_rounds=12, search_method=mcts_delta, identical
+# GA/MCTS/LoRA/GRPO hyperparameters):
+#
+#  1. dataset: agentdojo_split  ->  data/toolsafe/agentdojo-tragjnew/{train,test}
+#     An explicit 80/20 split over *distinct instructions*, stratified on suite
+#     AND annotated score (built by `python -m evoguard.process.split_toolsafe`,
+#     seed 20260817, provenance in that dir's split_manifest.json):
+#         banking 5/1   slack 5/1   travel 5/1   workspace 32/8   = 47 train / 11 test
+#     The previous runs used driver._split_train_val's tail fraction over load
+#     order, which -- with suites read alphabetically -- handed ALL 9 held-out
+#     tasks to `workspace`. Validation ASR was therefore measured on a single
+#     suite while the attacker trained on four. The env now tags each task with
+#     metadata["split"] and the driver honours it, so validation_fraction below
+#     is inert (kept only as the fallback for flat datasets).
+#
+#  2. Trainer-GPU admission control. native_runner now waits for the
+#     oversubscription filler to release VRAM before loading the model instead of
+#     charging ahead (see _wait_for_free_gpu_memory). Run 20260817_111147 died at
+#     r0 SFT because nvidia-smi reports HOST-namespace PIDs that we cannot signal
+#     from inside this container, so the "reap" was a no-op while the filler still
+#     held 77 GiB. Tunable via EVOGUARD_TRAINER_MIN_FREE_MIB / _FREE_WAIT_S.
+#
+#  3. Attacker-gateway pacing. The QianFan appid grants a hard 60 requests/min
+#     (measured 2026-08-17: 45 and 60 rpm sustained 75s -> zero 429s; 90 rpm ->
+#     exactly 60 through, 37 rejected). The first attempt at this config
+#     (20260817_230757) offered far more than that and lost the race: retries
+#     exhausted and rollout.py dropped 11 of 47 training tasks with a mere
+#     WARNING. QianFanClient now paces sends process-wide below the quota
+#     (EVOGUARD_QIANFAN_MAX_RPM, default 55) and rollout.py retries a failed
+#     population pre-compute serially before escalating to ERROR, so a shrunken
+#     training set can no longer pass unnoticed. task/attack concurrency below is
+#     therefore left at 12x16: it sizes the *defender* rollout fan-out against
+#     three local vLLM endpoints, which has no external quota.
+
+#
+# Seed cold-start is ENABLED for this run, and the mechanism is entirely
+# out-of-band from this file: mct_searcher._load_prewarm_skeletons_all() reads a
+# fixed seed directory (NOT env.data_root / not the dataset dir), so the launcher
+# must export
+#     EVOGUARD_PREWARM_SEEDS_DIR=data/seeds
+# which makes the loader pick up data/seeds/universal_seeds.json
+# (_meta.version "universal-ipi-v2r", 20 seeds). A "universal" set overrides all
+# per-suite *_seeds.json, so the empty stubs still living under
+# data/toolsafe/agentdojo-tragj/ are irrelevant here. All 20 seeds carry
+# turn=0 + a non-empty method + payload_template, so all 20 inject regardless of
+# per-task tool count. Expect in the log:
+#     [prewarm] loaded skeletons from .../data/seeds across 1 suites (total=20 entries)
+#     [prewarm][task=...] injected 20 skeletons
+# Without that env var the run silently degrades to the noseed baseline
+# (`total=0 entries`) -- check the log line before trusting the results.
+#
+# GPU / endpoint layout on this box:
+#   GPU 0,1 -> primary defender vLLM  :8000  (TP=2, --enable-lora, hot-reload)
+#   GPU 2,3 -> helper vLLM            :8002  (TP=2, tool_executor)
+#   GPU 5,6 -> helper vLLM            :8003  (TP=2, judge + utility_judge)
+#   GPU 4   -> native SFT/GRPO trainer (single-GPU; no DDP in native_runner)
+#   GPU 7   -> spare headroom
+
+name: evoguard_agentdojo_full_sft_twoclass
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    base_url: null
+    api_key: null
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    # Backstop only. The real defence against the gateway's 60 rpm quota is the
+    # process-wide send pacer in QianFanClient (EVOGUARD_QIANFAN_MAX_RPM, set to
+    # 55 by scripts/run_grpo_experiment.sh). Run 20260817_230757 exhausted 5
+    # retries under a 429 storm and rollout.py dropped 11 tasks from round 0,
+    # silently shrinking the training set; with pacing, 100 calls at concurrency
+    # 64 completed with zero 429s. 8 covers a transient quota dip on top.
+    max_retries: 8
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+  mcts_failure_credit_eps: 0.03
+  mcts_tau_window_size: 8
+
+env:
+  dataset: agentdojo_split
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100   # not binding: the dataset holds 58 distinct instructions
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /root/yangxiao/models/downloads/qwen2.5-7b-instruct
+
+  method: sft_then_native_grpo
+
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+
+  # ---- SFT dataset recipe (D1 + two-class, 2026-08-20) ------------------- #
+  # The intervention under test in THIS run. Everything else is byte-identical
+  # to configs/agentdojo_full_p1p4_reward.yaml.
+  #
+  # The cold-start corpus is cut down to the two behaviours we actually want,
+  # both of which are OBSERVED rollouts rather than synthesised text:
+  #   class 1: clean (A) rollouts that completed the task;
+  #   class 2: attack-fail (C) rollouts that completed the task -- resisted the
+  #            bait AND still delivered.
+  # Successful attacks (B) contribute nothing, which removes every hand-written
+  # corrective-refusal template. Those templates were the r6 mode-collapse
+  # vector (one memorised opener on 45.7% of decoded steps, 59.6% of clean
+  # trajectories) and the only refusal-shaped targets in the corpus.
+  #
+  # Measured on r0 of the p1p4 run (752 records) at these settings:
+  #   677 rows over 38 tasks; 109 clean rows + 568 attack-fail rows;
+  #   83.0% payload-free prompts / 17.0% bait-on-screen prompts;
+  #   0 refusals taught on a payload-free prompt; 0 refusals taught anywhere.
+  #   per-task rows max 38 / median 15 / min 4 (was max 100 / min 2).
+  # Known consequence: only 0.6% of eligible C rollouts contain any detection
+  # wording, so SFT no longer teaches detection at all -- it is a pure
+  # competence prior and detection is left to GRPO's outcome term. Watch r0 ASR:
+  # if it lands materially above the 0.19 seen with the corrective rows, the
+  # RL phase has more work to do than it did before.
+  sft_min_source_utility: 0.5
+  sft_two_class: true
+  sft_max_records_per_task: 4
+
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 32
+  grpo_min_new_successes: 3
+  # Half the prompt budget comes from clean (A) trajectories, scored by the
+  # benign objective (served +2.0 / degenerate -0.5 / refused -2.0). Without
+  # these rows every prompt in the batch pays for blocking, all G group siblings
+  # converge on the same blocking behaviour, reward std collapses to 0 and
+  # nothing in the gradient distinguishes "blocked and still served the user"
+  # from "blocked and gave up".
+  grpo_clean_prompt_ratio: 0.5
+
+  grpo_advantage_curriculum_lambda: 1.5
+
+  # Keep bs=1/accum=8 even on 80GB cards. TRL's GRPO counts
+  # per_device_train_batch_size in *completions*, and the per-forward logits
+  # tensor is bs x (2048 prompt + 512 completion) x 152064 vocab x 2 B (~1.56 GiB
+  # at bs=2) held live several times over (policy / ref / old logprobs) on top of
+  # LoRA backward activations. Run 20260816_233727 survived r1/r2 at bs=2 then
+  # OOM'd on the first r3 GRPO backward with 74.38 GiB already allocated. Fit
+  # depends on the round's sampled sequence lengths, so bs=2 is a coin flip.
+  # eff_batch stays 8, which must remain divisible by grpo_group_size_g=8.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  # Dedicated trainer GPU. native_runner has no DDP/sharding (its device_map
+  # field is dead code), so exactly one device may be listed here.
+  cuda_visible_devices: "4"
+  native_max_steps_per_round: 400
+
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  # Inert for this dataset: the env declares metadata["split"], which
+  # driver._split_train_val prefers. Retained as the flat-dataset fallback.
+  validation_fraction: 0.15
+  # task_concurrency sizes three pools: the outer per-task rollout fan-out, the
+  # phase-0 MCTS population precompute pool (rollout.py) and the post-round
+  # evolve pool (driver.evolve_after_round). attack_concurrency is the inner
+  # per-population fan-out; 12x16 saturates three TP=2 endpoints while staying
+  # under the attacker gateway's RPM ceiling.
+  task_concurrency: 12
+  attack_concurrency: 16
+
+evo_data_subdir: "agentdojo"

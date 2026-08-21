@@ -103,6 +103,15 @@ class _ToolSafeEnv(SimulatedToolEnv):
                 continue
             yield suite, os.path.join(self._data_dir, fname)
 
+    def _split_for_path(self, path: str) -> Optional[str]:
+        """Declared split ("train"/"test") for a data file, if the env has one.
+
+        Flat single-dir datasets have no declared split, so the pipeline falls
+        back to its tail-fraction heuristic. Overridden by
+        :class:`AgentDojoSplitEnv`.
+        """
+        return None
+
     def _load(self) -> None:
         # Preserve first-seen order of distinct instructions per suite.
         seen: "OrderedDict[str, Task]" = OrderedDict()
@@ -117,17 +126,21 @@ class _ToolSafeEnv(SimulatedToolEnv):
                 if uid in seen:
                     continue
                 tools = parse_env_info(rec.get("env_info", ""))
+                metadata = {
+                    "source_file": os.path.basename(path),
+                    "annotated_score": rec.get("score"),
+                    "annotated_history": rec.get("history", ""),
+                }
+                split = self._split_for_path(path)
+                if split:
+                    metadata["split"] = split
                 task = Task(
                     task_id=uid,
                     instruction=instruction,
                     suite=suite,
                     dataset=self.name,
                     tool_names=[t.name for t in tools],
-                    metadata={
-                        "source_file": os.path.basename(path),
-                        "annotated_score": rec.get("score"),
-                        "annotated_history": rec.get("history", ""),
-                    },
+                    metadata=metadata,
                 )
                 seen[uid] = task
                 self._tools_by_task[uid] = tools
@@ -159,6 +172,58 @@ class AgentDojoEnv(_ToolSafeEnv):
             suites=suites, max_tasks=max_tasks,
             utility_judge=utility_judge,
         )
+
+
+class AgentDojoSplitEnv(_ToolSafeEnv):
+    """AgentDojo tasks from a pre-split tree (``train/`` + ``test/`` subdirs).
+
+    Produced by :mod:`evoguard.process.split_toolsafe`: an explicit stratified
+    split over *distinct instructions*, balanced on both suite and annotated
+    score. Loading both subdirs (rather than one) keeps a single env instance
+    serving the whole dataset, exactly like the flat env -- the difference is
+    that each task now carries ``metadata["split"]``, so the pipeline can honour
+    the declared assignment instead of guessing a tail fraction.
+    """
+
+    name = "agentdojo_split"
+
+    def __init__(
+        self,
+        executor: LLMClient,
+        data_root: str = "data",
+        *,
+        suites: Optional[list[str]] = None,
+        max_tasks: int = 0,
+        utility_judge: Optional[LLMClient] = None,
+        subdir: str = "agentdojo-tragjnew",
+    ):
+        data_dir = os.path.join(data_root, "toolsafe", subdir)
+        super().__init__(
+            executor, data_dir,
+            suites=suites, max_tasks=max_tasks,
+            utility_judge=utility_judge,
+        )
+
+    def _iter_files(self):
+        if not os.path.isdir(self._data_dir):
+            raise FileNotFoundError(f"toolsafe split dir not found: {self._data_dir}")
+        # Train first so that, if ``max_tasks`` truncates, the training side is
+        # the part that survives.
+        for split in ("train", "test"):
+            sdir = os.path.join(self._data_dir, split)
+            if not os.path.isdir(sdir):
+                raise FileNotFoundError(f"missing split subdir: {sdir}")
+            for fname in sorted(os.listdir(sdir)):
+                if not fname.endswith(".json"):
+                    continue
+                suite = os.path.splitext(fname)[0]
+                if self._suite_filter and suite not in self._suite_filter:
+                    continue
+                yield suite, os.path.join(sdir, fname)
+
+    def _split_for_path(self, path: str) -> Optional[str]:
+        parent = os.path.basename(os.path.dirname(path))
+        return parent if parent in ("train", "test") else None
 
 
 class AgentHarmEnv(_ToolSafeEnv):

@@ -30,7 +30,12 @@ import os
 from dataclasses import dataclass, field
 
 from evoguard.agents import build_defense_agent
-from evoguard.attacks import GeneticAttacker, build_attack_generator
+from evoguard.attacks import (
+    DeltaGuidedMCTSAttacker,
+    GeneticAttacker,
+    build_attack_generator,
+    build_attacker,
+)
 from evoguard.config import ExperimentConfig
 from evoguard.controller import Controller
 from evoguard.envs import build_env
@@ -76,9 +81,26 @@ class ExperimentSummary:
 
 
 def _split_train_val(tasks: list, val_fraction: float):
-    """Deterministic split preserving dataset order; val takes tail fraction."""
+    """Split tasks into (train, val), preferring a split declared by the env.
+
+    Envs built from a pre-split tree (see
+    :class:`evoguard.envs.toolsafe.AgentDojoSplitEnv`) tag every task with
+    ``metadata["split"] in {"train","test"}``. Honour that when present: the
+    tail-fraction fallback below is order-based, and with ToolSafe's
+    alphabetically-loaded suites it hands the held-out set entirely to
+    ``workspace`` -- so validation ASR was never measured on the same suite mix
+    the attacker trained against.
+
+    Fallback (no declared split): deterministic tail fraction, unchanged.
+    """
     if not tasks:
         return [], []
+    declared_train = [t for t in tasks
+                      if (getattr(t, "metadata", None) or {}).get("split") == "train"]
+    declared_val = [t for t in tasks
+                    if (getattr(t, "metadata", None) or {}).get("split") == "test"]
+    if declared_train and declared_val:
+        return declared_train, declared_val
     n_val = max(0, min(len(tasks), int(round(len(tasks) * val_fraction))))
     if n_val == 0:
         return list(tasks), []
@@ -117,10 +139,6 @@ class Pipeline:
         # Held-out / training-task bookkeeping populated by :meth:`setup`.
         self._train_tasks: list = []
         self._val_tasks: list = []
-        # Latest training-side EvaluatedAttack list per task -- captured *before*
-        # ``evolve_after_round`` mutates populations so the validation phase can
-        # still inspect this round's measured elites ("the attacker generator's
-        # current best individual" per docs/plan.md line 9).
         self._latest_train_evals_by_task: dict[str, list] = {}
 
     # ------------------------------------------------------------------ #
@@ -135,11 +153,7 @@ class Pipeline:
         later (:meth:`run_validation`) using elites copied from the training
         side.
         """
-
-        # Build environment first so we know which tasks exist.
         env = build_env(self.cfg.env)
-
-        # Cache tasks & tool lists so downstream builders stay cheap.
         tasks_all = env.get_tasks()
         train_tasks, val_tasks = _split_train_val(
             tasks_all, self.cfg.pipeline.validation_fraction
@@ -150,19 +164,16 @@ class Pipeline:
             "Setup complete: %d total tasks (%d train, %d val)",
             len(tasks_all), len(train_tasks), len(val_tasks),
         )
-
-        # Judge uses its own client configured separately in EnvConfig.judge_llm.
         judge = AttackJudge(self.cfg.env.judge_llm)
         gen = build_attack_generator(self.cfg.attacker, seed=self.cfg.seed)
 
         # Pre-instantiate GAs ONLY for training tasks. Validation will reuse
         # elite genomes copied verbatim from training side rather than running
-        # its own evolutionary search -- otherwise val would leak signal back
-        # into stopping criteria defeating independence.
-        attackers: dict[str, GeneticAttacker] = {}
+        # its own evolutionary search 
+        attackers: dict[str, GeneticAttacker | DeltaGuidedMCTSAttacker] = {}
         for t in train_tasks:
             tools = env.get_tools(t)
-            ga = GeneticAttacker(
+            ga = build_attacker(
                 t, tools, gen, self.cfg.attacker,
                 defense_max_turns=self.cfg.defense.max_turns,
             )
@@ -188,7 +199,7 @@ class Pipeline:
         *,
         env,
         judge,
-        attackers: dict[str, "GeneticAttacker"],
+        attackers: dict[str, GeneticAttacker | DeltaGuidedMCTSAttacker],
         round_id: int,
         tasks_subset=None,
     ) -> RoundResult:
@@ -241,13 +252,31 @@ class Pipeline:
                 os.path.join(self.exp_dir, "metrics.jsonl"),
                 json_dump(metrics.to_dict()),
             )
-            # Per docs/todo.md item #4: stream safety metrics (acc / f1 /
-            # recall + existing ASR/delta signals) into <exp>/results/.
             try:
                 append_safety_metrics_jsonl(self.exp_dir, metrics)
             except Exception as exc:
                 logger.warning(
                     "[round %d] results/ JSONL write failed: %s", round_id, exc,
+                )
+            # Categorized trajectory export to <exp_dir>/evo_data/<suffix>/{clean,attack_success_B,attack_failure_C}/r<N>/
+            # so downstream fine-tuning pipelines can sample by outcome without
+            # re-parsing records.jsonl.
+            try:
+                from evoguard.process.evo_data_exporter import (
+                    export_round_trajectories,
+                )
+                evo_data_suffix = (
+                    getattr(self.cfg, "evo_data_subdir", "") or ""
+                )
+                export_round_trajectories(
+                    result_obj.records,
+                    exp_dir=self.exp_dir,
+                    round_id=round_id,
+                    bucket_parent_suffix=evo_data_suffix,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[round %d] evo_data/ export failed: %s", round_id, exc,
                 )
             logger.info("[round %d] saved %d records -> %s", round_id,
                         len(result_obj.records), paths["records"])
@@ -258,16 +287,43 @@ class Pipeline:
 
     def evolve_after_round(self, attackers, result_obj):
         """Advance every task's population based on this round's evals."""
-        for tid, evals in getattr(result_obj, "evaluations", {}).items():
-            ga = attackers.get(tid)
-            if ga is None:
-                continue
+        items = [
+            (tid, evals, attackers[tid])
+            for tid, evals in getattr(result_obj, "evaluations", {}).items()
+            if attackers.get(tid) is not None
+        ]
+
+        def _evolve_one(tid, evals, ga):
             try:
                 ga.evolve(evals)
-            except Exception as exc:
+            except Exception as exc:                                      # noqa: BLE001
                 logger.warning("Evolution failed for task=%s: %s", tid, exc)
 
-    def maybe_train_defender(self, *, round_label: str, records, round_id: int = 0):
+        n_workers = max(
+            1,
+            min(
+                int(getattr(self.cfg.pipeline, "task_concurrency", 1) or 1),
+                len(items) or 1,
+            ),
+        )
+        if len(items) > 1 and n_workers > 1:
+            # Per-task attacker trees are independent; evolve() here does
+            # backprop + next-batch regeneration which issues blocking LLM
+            # calls, so cross-task fan-out directly cuts wall-clock.
+            from concurrent.futures import ThreadPoolExecutor
+
+            logger.info(
+                "evolve_after_round: evolving %d task populations with %d workers",
+                len(items), n_workers,
+            )
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                list(pool.map(lambda it: _evolve_one(*it), items))
+        else:
+            for tid, evals, ga in items:
+                _evolve_one(tid, evals, ga)
+
+    def maybe_train_defender(self, *, round_label: str, records,
+                              round_id: int = 0, env=None):
         """Build datasets/configs and optionally launch SFT+GRPO training.
 
         Honors ``TrainingConfig.sft_coldstart_only_round_zero``: when set (and an
@@ -276,11 +332,16 @@ class Pipeline:
         successful B-trajectories. This eliminates ~30-40 min/round of redundant
         cold-init compute observed in evoguard_agentdojo_full where every round
         re-ran SFT from scratch.
+
+        ``env`` (optional) is the live :class:`ToolEnv` instance from the outer
+        run loop; when method=='sft_then_online_grpo' we attach a fresh-Controller
+        factory closure onto the dataset_builder so dispatcher's online-grpo elif
+        branch can sample G genuine sibling trajectories per prompt-row during
+        incremental RL. Factory captures this env ref + cfg to rebuild defense
+        agent each invocation honoring latest registered LoRA adapter name.
         """
         if not self.cfg.training.enabled or self._dataset_builder is None:
             return None
-
-        # Skip SFT cold-start on rounds > 0 when configured + adapter already live.
         skip_cold_start = (
             self.cfg.training.sft_coldstart_only_round_zero
             and round_id > 0
@@ -315,8 +376,6 @@ class Pipeline:
             effective_cfg = self.cfg.training
             method_override = None
             if skip_cold_start:
-                # Switch this call's method to "grpo" so we don't redo cold start;
-                # we leave cfg.training.method untouched for next-round reference.
                 try:
                     import dataclasses as _dc
                     effective_cfg = _dc.replace(effective_cfg, method="grpo")
@@ -330,6 +389,18 @@ class Pipeline:
                 round_label=round_label,
                 dataset_builder=self._dataset_builder,
             )
+
+            # Online single-stage co-evolution trainer needs fresh-Controller
+            # factory attached onto dataset_builder so dispatcher's elif branch
+            # routing sft_then_online_grpo can drive trio rollouts during RL.
+            if (
+                (effective_cfg.method or "").lower() == "sft_then_online_grpo"
+                and env is not None
+                and not hasattr(self._dataset_builder, "_online_ctrl_factory")
+            ):
+                self._dataset_builder._online_ctrl_factory = \
+                    self._build_online_ctrl_factory(env)
+
             if method_override is not None:
                 logger.info(
                     "[train] skipping SFT cold-start at %s; running incremental "
@@ -344,10 +415,7 @@ class Pipeline:
             outcome = train_defender(**outcome_kwargs)
             # Only propagate the suggested adapter name into the live runtime
             # config when an actual LoRA artifact was trained AND loaded onto the
-            # serving backend. Under ``training.dry_run=True`` (or when
-            # ``new_lora_adapter_name`` is empty) we MUST keep ``lora_adapter``
-            # as-is, otherwise subsequent rounds try to request a non-existent
-            # model name and crash with HTTP 404 against vLLM.
+            # serving backend. 
             if (
                 outcome is not None
                 and outcome.new_lora_adapter_name
@@ -411,6 +479,49 @@ class Pipeline:
                     "[train] defense lora_adapter %r -> %r (%s)",
                     old_name, self.cfg.defense.llm.lora_adapter, action,
                 )
+
+                # Convenience symlink under repo-rooted ``results/saves/`` so
+                # downstream eval pipelines can glob one flat folder instead of
+                # walking nested ``round_<N>/`` trees to find adapter weights.
+                # Only fires when registration actually succeeded -- otherwise
+                # we'd shadow a stale link over the latest valid artifact.
+                if registered_ok:
+                    try:
+                        import os as _os2
+                        repo_root = _os2.path.abspath(
+                            _os2.path.join(_os2.path.dirname(__file__), "..", "..")
+                        )
+                        saves_root = _os2.path.join(repo_root, "results", "saves")
+                        _os2.makedirs(saves_root, exist_ok=True)
+                        # Symbolic name mirrors the latest segment in new_name so
+                        # eval scripts requesting 'evoguard_r9_weights' find it.
+                        leaf_name = str(outcome.new_lora_adapter_name).split("::")[-1]
+                        link_path = _os2.path.join(saves_root, f"{leaf_name}.adapter")
+                        target_abs = _os2.path.abspath(lora_path)
+                        if _os2.islink(link_path) or _os2.path.exists(link_path):
+                            _os2.remove(link_path)
+                        try:
+                            _os2.symlink(target_abs, link_path)
+                            logger.info(
+                                "[train] symlinked %s -> %s",
+                                link_path, target_abs,
+                            )
+                        except OSError as sym_exc:
+                            # Filesystem without symlink support -> copy directory tree as fallback.
+                            import shutil as _shutil
+                            if _os2.isdir(link_path):
+                                _shutil.rmtree(link_path)
+                            _shutil.copytree(target_abs, link_path)
+                            logger.info(
+                                "[train] copied adapter dir into %s "
+                                "(symlink unsupported: %s)",
+                                link_path, sym_exc,
+                            )
+                    except Exception as sav_hook_exc:                       # noqa: BLE001 - never crash round-loop here
+                        logger.warning(
+                            "[train] results/saves/ convenience hook failed: %s",
+                            sav_hook_exc,
+                        )
             elif outcome is not None and outcome.new_lora_adapter_name:
                 logger.info(
                     "[train] dry-run mode: keeping base defense LLM "
@@ -419,9 +530,35 @@ class Pipeline:
                 )
             return outcome
         except Exception as exc:
-            logger.error("[train] failed: %s", exc)
-            return None
-            return None
+            # A crashed trainer must ABORT the run: swallowing it here froze
+            # the defender at its previous adapter and burned every remaining
+            # round against a stale model (observed 2026-08-16: 11 rounds ran
+            # against frozen r0-SFT while per-round GRPO OOMs were silently
+            # eaten by this handler).
+            logger.exception("[train] failed (aborting run): %s", exc)
+            raise
+
+    # ------------------------------------------------------------------ #
+    # Online single-stage co-evolution trainer factory builder           #
+    # ------------------------------------------------------------------ #
+    def _build_online_ctrl_factory(self, env):
+        """Return nullary callable producing fresh LogpAgent-wrapped Controller.
+
+        Each invocation rebuilds the defense agent via :func:`_build_defense_agent`
+        so it picks up the latest ``self.cfg.defense.llm.lora_adapter`` name
+        registered onto vLLM between rounds. The agent is then wrapped by
+        :class:`online.logp_agent.LogpAgent` enabling server-side logprob capture
+        for sanity-check telemetry during G-sibling rollout collection driven
+        externally inside :class:`online.trio_controller._OnlineGRPOTrainer`.
+        """
+        def _factory():
+            from online.logp_agent import LogpAgent
+
+            inner = _build_defense_agent(self.cfg)  # honors current lora_adapter.
+            wrapped = LogpAgent(inner)
+            return Controller(wrapped, env, self.cfg.defense)
+
+        return _factory
 
     # ------------------------------------------------------------------ #
     # Full driver                                                       #
@@ -453,6 +590,7 @@ class Pipeline:
                 round_label=label,
                 records=[rec for rec in rr.rollouts.records],
                 round_id=rid,
+                env=env,
             )
 
             streak, stop_now, reason = update_termination_state(
@@ -470,7 +608,6 @@ class Pipeline:
                 term_reason = reason
                 break
 
-        # Persist final summaries + curve plot.
         try:
             from evoguard.utils.plots import plot_curves, write_metrics_csv
             png_out = os.path.join(self.exp_dir, "curves.png")
@@ -482,10 +619,6 @@ class Pipeline:
         except Exception as exc:
             logger.warning("[done] plotting failed: %s", exc)
             png_out = ""
-
-        # Per docs/todo.md item #4: also write a focused results/ folder with
-        # tabular CSV + summary.json keyed on acc/f1/recall/precision + ASR/delta
-        # signals so analysts can compare experiments without parsing JSONL.
         try:
             from evoguard.utils.metrics import (
                 write_safety_summary_block,
@@ -499,13 +632,12 @@ class Pipeline:
         except Exception as exc:
             logger.warning("[done] results-folder aggregation failed: %s", exc)
 
-        # Compute simple 'best-of-run' snapshot used in summary.json.
         best_asr_seen = None
         worst_delta_norm_mean = None
-        best_precision = None
-        best_recall = None
-        best_f1 = None
-        best_acc = None
+        best_cf_precision = None
+        best_cf_recall = None
+        best_cf_f1 = None
+        best_cf_acc = None
         for m in history_dicts:
             cur_asr = float(m.get("attack_success_rate", 0))
             cur_dnmean = float(m.get("delta_normalized_mean_on_success", 0))
@@ -523,26 +655,22 @@ class Pipeline:
                 return max(prev, fv) if (prev is not None and fv is not None) \
                     else (fv if fv is not None else prev)
 
-            best_precision = _best("safety_precision", best_precision)
-            best_recall = _best("safety_recall", best_recall)
-            best_f1 = _best("safety_f1", best_f1)
-            best_acc = _best("safety_acc", best_acc)
-
-        # Best defender-side safety scores are "highest seen across rounds".
-        # Attacker-side ASR/delta are reported as their peak observed value so a
-        # reader can immediately see how strong the red team got.
+            best_cf_precision = _best("cf_precision", best_cf_precision)
+            best_cf_recall = _best("cf_recall", best_cf_recall)
+            best_cf_f1 = _best("cf_f1", best_cf_f1)
+            best_cf_acc = _best("cf_acc", best_cf_acc)
         best_metrics_by_metric: dict[str, float] = {
             "max_attack_success_rate": best_asr_seen or 0.0,
             "max_delta_normalized_mean_on_success": worst_delta_norm_mean or 0.0,
         }
-        if best_precision is not None:
-            best_metrics_by_metric["max_safety_precision"] = round(best_precision, 6)
-        if best_recall is not None:
-            best_metrics_by_metric["max_safety_recall"] = round(best_recall, 6)
-        if best_f1 is not None:
-            best_metrics_by_metric["max_safety_f1"] = round(best_f1, 6)
-        if best_acc is not None:
-            best_metrics_by_metric["max_safety_acc"] = round(best_acc, 6)
+        if best_cf_precision is not None:
+            best_metrics_by_metric["max_cf_precision"] = round(best_cf_precision, 6)
+        if best_cf_recall is not None:
+            best_metrics_by_metric["max_cf_recall"] = round(best_cf_recall, 6)
+        if best_cf_f1 is not None:
+            best_metrics_by_metric["max_cf_f1"] = round(best_cf_f1, 6)
+        if best_cf_acc is not None:
+            best_metrics_by_metric["max_cf_acc"] = round(best_cf_acc, 6)
 
         summary = ExperimentSummary(
             config_path=os.path.abspath(cfg_snap),
@@ -566,7 +694,17 @@ class Pipeline:
         for t in all_tasks:
             tasks_map[t.task_id] = t
             tools_map[t.task_id] = env.get_tools(t)
-        self._dataset_builder = DefenderDatasetBuilder(tasks_map, tools_map)
+        self._dataset_builder = DefenderDatasetBuilder(
+            tasks_map,
+            tools_map,
+            min_source_utility=float(
+                getattr(self.cfg.training, "sft_min_source_utility", 0.0) or 0.0
+            ),
+            two_class=bool(getattr(self.cfg.training, "sft_two_class", False)),
+            max_records_per_task=int(
+                getattr(self.cfg.training, "sft_max_records_per_task", 0) or 0
+            ),
+        )
 
 
 # --------------------------------------------------------------------------- #

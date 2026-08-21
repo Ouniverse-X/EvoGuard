@@ -1,0 +1,19 @@
+{
+  "strategy": "mcts_evolution",
+  "elapsed_seconds": 6596.9,
+  "tasks_evaluated": 8,
+  "generations_per_task": 6,
+  "collected_by_delta": {
+    "d2": 47,
+    "d3": 12,
+    "d4": 0
+  },
+  "total_high_delta": 59,
+  "config": {
+    "population_size": 20,
+    "generations": 6,
+    "min_delta_accept": 2,
+    "lookahead_budget": 6,
+    "rng_seed": 137
+  }
+}

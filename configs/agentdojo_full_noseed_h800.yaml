@@ -1,0 +1,174 @@
+# EvoGuard experiment: AgentDojo FULL — NO PREWARM SEEDS (MCTS), 8x H800 layout.
+#
+# Scientific scope is IDENTICAL to configs/agentdojo_full_noseed_mcts.yaml
+# (max_tasks=100, population_size=15, max_rounds=12, search_method=mcts_delta,
+# all GA/MCTS/LoRA/GRPO hyperparameters unchanged). The only differences are
+# infrastructure: model/endpoint paths retargeted to this machine, and the
+# rollout fan-out + trainer batching enlarged to exploit 8x H800-80GB.
+#
+# Seed cold-start is disabled purely by the filesystem: every
+# data/toolsafe/agentdojo-tragj/*_seeds.json is `{"seeds": []}`, so
+# mct_searcher._inject_prewarm_skeletons() short-circuits. No config field
+# controls this.
+#
+# GPU / endpoint layout on this box:
+#   GPU 0,1 -> primary defender vLLM  :8000  (TP=2, --enable-lora, hot-reload)
+#   GPU 2,3 -> helper vLLM            :8002  (TP=2, tool_executor)
+#   GPU 5,6 -> helper vLLM            :8003  (TP=2, judge + utility_judge)
+#   GPU 4   -> native SFT/GRPO trainer (single-GPU; no DDP in native_runner)
+#   GPU 7   -> spare headroom
+# Splitting the three helper roles onto their own endpoint keeps the defender
+# server's scheduler free for the latency-critical policy rollouts.
+
+name: evoguard_agentdojo_full_noseed_h800
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    base_url: null
+    api_key: null
+    temperature: 0.95
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    max_retries: 5  # 429/5xx retried with Retry-After-aware backoff; rides out RPM windows
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+  mcts_failure_credit_eps: 0.03
+  mcts_tau_window_size: 8
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /root/yangxiao/models/downloads/qwen2.5-7b-instruct
+
+  method: sft_then_native_grpo
+
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 32
+  grpo_min_new_successes: 3
+
+  grpo_advantage_curriculum_lambda: 1.5
+
+  # bs=2 was tried first on the theory that an 80GB H800 has 2x the headroom of
+  # the 40GB cards where bs=1/accum=8 was established. It does not: run
+  # 20260816_233727 survived r1/r2 at bs=2 and then OOM'd at the first r3 GRPO
+  # backward (74.38 GiB already allocated by PyTorch, 304 MiB request refused).
+  # TRL's GRPO counts per_device_train_batch_size in *completions*, and the
+  # per-forward logits tensor is bs x (max_prompt 2048 + max_completion 512) x
+  # 152064 vocab x 2 bytes ~= 1.56 GiB at bs=2 vs 0.78 GiB at bs=1 -- held live
+  # several times over (policy / ref / old logprobs) on top of LoRA backward
+  # activations. Whether it fits depends on the round's sampled sequence
+  # lengths, so bs=2 is a coin flip that r3 lost. Back to the known-good
+  # footprint; eff_batch stays 8, which must remain divisible by
+  # grpo_group_size_g=8.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  # Dedicated trainer GPU. native_runner has no DDP/sharding (its device_map
+  # field is dead code), so exactly one device may be listed here.
+  cuda_visible_devices: "4"
+  native_max_steps_per_round: 400
+
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  validation_fraction: 0.15
+  # task_concurrency sizes three pools: the outer per-task rollout fan-out, the
+  # phase-0 MCTS population precompute pool (rollout.py) and the post-round
+  # evolve pool (driver.evolve_after_round). With no prewarm seeds every task
+  # must generate its skeletons from scratch, which is the dominant cold-start
+  # cost, so this is the main wall-clock lever. attack_concurrency is the inner
+  # per-population fan-out; 12x16 saturates three TP=2 endpoints.
+  task_concurrency: 12
+  attack_concurrency: 16
+
+evo_data_subdir: "agentdojo"

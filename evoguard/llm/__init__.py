@@ -23,11 +23,13 @@ def build_client(config: LLMConfig, *, seed: int = 0) -> LLMClient:
 
         return OpenAIClient(config)
     if backend == "qianfan":
-        # Baidu QianFan v2 gateway -- uses custom appid/Bearer headers so it
-        # needs its own HTTP client rather than the openai SDK.
         from evoguard.llm.qianfan_client import QianFanClient
 
         return QianFanClient(config)
+    if backend in ("llamacpp", "llama_cpp", "llama.cpp"):
+        from evoguard.llm.llamacpp_client import LlamaCppClient
+
+        return LlamaCppClient(config)
     raise ValueError(f"Unknown LLM backend: {config.backend!r}")
 
 

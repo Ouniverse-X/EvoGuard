@@ -45,8 +45,12 @@ def plot_curves(metrics: Sequence["dict"], out_path: str) -> str | None:
     ]
     immediate_share = [float(m.get("delta_immediate_share", 0.0)) for m in metrics]
     latent_share = [float(m.get("delta_latent_share", 0.0)) for m in metrics]
+    cf_prec = [float(m.get("cf_precision", 0.0)) for m in metrics]
+    cf_rec = [float(m.get("cf_recall", 0.0)) for m in metrics]
+    cf_f1 = [float(m.get("cf_f1", 0.0)) for m in metrics]
+    cf_acc = [float(m.get("cf_acc", 0.0)) for m in metrics]
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
 
     ax = axes[0][0]
     ax.plot(rounds, asr, marker="o", label="ASR")
@@ -70,6 +74,16 @@ def plot_curves(metrics: Sequence["dict"], out_path: str) -> str | None:
     ax.plot(rounds, latent_share, marker="^", label="latent share (Δ≥3)")
     ax.set_title("Attack latency mix on successes")
     ax.set_xlabel("round"); ax.set_ylabel("share"); ax.set_ylim(-0.02, 1.02); ax.legend()
+
+    ax = axes[2][0]
+    ax.plot(rounds, cf_prec, marker="o", label="precision")
+    ax.plot(rounds, cf_rec, marker="s", label="recall")
+    ax.plot(rounds, cf_f1, marker="^", label="f1")
+    ax.plot(rounds, cf_acc, marker="d", label="acc")
+    ax.set_title("Confusion-matrix metrics (cf_*)\n(higher is better)")
+    ax.set_xlabel("round"); ax.set_ylabel("score ∈[0,1]"); ax.set_ylim(-0.02, 1.02); ax.legend()
+
+    axes[2][1].axis("off")  # spare panel reserved for future signals
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)

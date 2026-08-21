@@ -31,13 +31,36 @@ verbatim into the payload body. If the API rejects it (400 mentioning
 response_format / json_schema / guided_decoding) we transparently retry once
 without that field and flip an instance-level capability flag sticky-false,
 mirroring :class:`evoguard.llm.openai_client.OpenAIClient`.
+
+Rate limiting
+-------------
+
+The gateway enforces a hard requests-per-minute quota, measured at **60 rpm**
+for this appid on 2026-08-17 (45 and 60 rpm sustained for 75 s produced zero
+429s; 90 rpm let exactly 60 through and rejected the remaining 37). Reactive
+backoff alone cannot cope with that: the pipeline's rollout fan-out
+(``task_concurrency x attack_concurrency``) offers hundreds of attacker calls
+per minute, so a synchronised herd of retries keeps re-colliding until
+``max_retries`` is exhausted -- and an exhausted attacker call makes
+``rollout.py`` drop the whole task from the round, silently shrinking the
+training set.
+
+A process-wide limiter therefore paces *sends* evenly below the quota, turning
+rejection into orderly queueing. Even spacing matters as much as the total: a
+burst of 55 admitted as fast as threads arrive still draws 429s even though 55
+is a legal per-minute count, while 60 requests spaced 1 s apart draw none. Every
+client instance shares one limiter because the quota is per-appid, not
+per-object. Tune with ``EVOGUARD_QIANFAN_MAX_RPM`` (default 55, a ~10% margin
+under the measured ceiling); set it to 0 to disable pacing entirely.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import threading
 import time
 from typing import Optional, Sequence
 
@@ -49,6 +72,64 @@ from evoguard.utils.logging import get_logger
 logger = get_logger("llm.qianfan")
 
 _ENDPOINT_URL = "https://qianfan.baidubce.com/v2/chat/completions"
+
+# Measured ceiling is 60 rpm; default to 55 so clock skew between our window and
+# the gateway's cannot push a burst over the edge.
+_DEFAULT_MAX_RPM = 55
+
+
+class _SlidingWindowLimiter:
+    """Admit acquisitions at an evenly-spaced ``rpm`` rate.
+
+    Spacing rather than a plain 60-second window cap, because the gateway
+    rejects bursts even when the per-minute total is legal: pacing 60 requests
+    at a fixed 1 s interval drew zero 429s, whereas letting 55 through as fast
+    as threads arrived (a legal count for a 60 rpm window) still produced a
+    steady stream of them. Sends are therefore scheduled onto a shared timeline
+    advancing ``60 / rpm`` seconds per admission.
+
+    ``rpm <= 0`` disables the limiter.
+    """
+
+    def __init__(self, rpm: int):
+        self._rpm = int(rpm)
+        self._interval = 60.0 / self._rpm if self._rpm > 0 else 0.0
+        self._next_slot = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self._rpm <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _build_shared_limiter() -> _SlidingWindowLimiter:
+    raw = os.environ.get("EVOGUARD_QIANFAN_MAX_RPM", "").strip()
+    try:
+        rpm = int(raw) if raw else _DEFAULT_MAX_RPM
+    except ValueError:
+        logger.warning(
+            "EVOGUARD_QIANFAN_MAX_RPM=%r is not an integer; using default %d.",
+            raw, _DEFAULT_MAX_RPM,
+        )
+        rpm = _DEFAULT_MAX_RPM
+    if rpm > 0:
+        logger.info("[qianfan] pacing sends at <=%d requests/min (process-wide).", rpm)
+    else:
+        logger.warning("[qianfan] request pacing DISABLED; expect 429 storms.")
+    return _SlidingWindowLimiter(rpm)
+
+
+# One limiter per process: the quota is per-appid, so per-instance limiters
+# would multiply the offered rate by the number of roles using this backend.
+_SHARED_LIMITER = _build_shared_limiter()
+
 
 # Error-message fragments indicating structured-output rejection vs transient failure.
 _SCHEMA_REJECT_RE = re.compile(
@@ -193,6 +274,7 @@ class QianFanClient(LLMClient):
         for attempt in range(1, self.config.max_retries + 1):
             try:
                 import requests as rq
+                _SHARED_LIMITER.acquire()
                 http_resp = rq.post(
                     self._endpoint_url,
                     data=encoded_body,
@@ -224,6 +306,39 @@ class QianFanClient(LLMClient):
                         and bool(_SCHEMA_REJECT_RE.search(err_blob))
                     ):
                         raise _SchemaRejectError(err_blob) from api_err
+                    if status_code == 429 or status_code >= 500:
+                        # Rate-limit / transient server errors are retriable.
+                        # Honor Retry-After when provided, else exponential
+                        # backoff capped at 60s to cover per-minute RPM
+                        # windows (parallel MCTS evolve bursts depend on this;
+                        # before this branch every 429 raised RuntimeError
+                        # immediately with zero retries).
+                        last_exc = api_err
+                        retry_after = getattr(
+                            http_resp, "headers", {}
+                        ).get("Retry-After")
+                        try:
+                            ra_secs = float(retry_after) if retry_after else None
+                        except (TypeError, ValueError):
+                            ra_secs = None
+                        backoff = (
+                            max(1.0, ra_secs) if ra_secs
+                            else min(2.0 ** attempt, 60.0)
+                        )
+                        # Jitter: without it every thread rejected in the same
+                        # window retries in the same instant and collides again.
+                        backoff += random.uniform(0.0, min(5.0, backoff))
+                        logger.warning(
+                            "[qianfan] transient %d (attempt %d/%d): %s; "
+                            "retrying in %.1fs",
+                            status_code,
+                            attempt,
+                            self.config.max_retries,
+                            err_blob[:120],
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
                     last_exc = api_err
                     raise RuntimeError(str(api_err))
 

@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-08-11T16:07:18Z",
+  "sources": [
+    "evoguard_agentdojo_full_v4_grpo_v2/round_0",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_0",
+    "evoguard_agentdojo_full_v6_mcts/round_0",
+    "evoguard_agentdojo_full_v6_probed_lora/round_0",
+    "evoguard_agentdojo_full_v7_integrated/round_0",
+    "evoguard_agentdojo_full_v7_online_single_stage/round_0",
+    "_abandoned_20260728_170429_online_crashed_after_step1/round_0",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_1",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_2",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_3",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_4",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_5",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_6",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_7",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_8",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_9",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_10",
+    "evoguard_agentdojo_full_v5_mcts_failed_oom_20260726/round_11"
+  ],
+  "total_candidates": 4505,
+  "total_verified": 2593,
+  "total_deduped": 504,
+  "duplicates_removed": 1613,
+  "per_bucket": {
+    "imm": 100,
+    "d1": 150,
+    "d2": 120,
+    "d3": 100,
+    "d4": 34
+  },
+  "target_counts": {
+    "imm": 100,
+    "d1": 150,
+    "d2": 120,
+    "d3": 100,
+    "d4": 50
+  },
+  "judge_model": "qwen2.5-7b-it",
+  "judge_url": "http://localhost:8000/v1"
+}

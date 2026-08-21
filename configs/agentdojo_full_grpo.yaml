@@ -1,0 +1,172 @@
+# EvoGuard experiment: AgentDojo FULL local run v4 = v3_glmatk BASELINE +
+# NATIVE-GRPO defender RL enabled.
+#
+# Single delta vs configs/agentdojo_full_glmattacker.yaml (v3):
+#   * training.method switched sft_then_grpo -> sft_then_native_grpo
+#     so r0 still does cold-start LoRA-SFT exactly as before,
+#     but every round >= r1 runs incremental online-policy gradient updates through
+#       evoguard.training.native_grpo_runner.train_native_grpo()
+#     instead of repeating cold-start SFT each round like v3 did.
+#   * Explicit grpo_* hyperparameters populated under `training:` block per spec §4.2
+#     (see docs/superpowers/specs/2026-07-22-evoguard-native-grpo-design.md).
+#   * cuda_visible_devices moved card#4 -> card#1 because secondary judge vllm is currently
+#     resident on #7 (not gemma-fallback as it was when v3 was written); cards#0/#1/#5 are idle today.
+#
+# Everything else kept identical to enable apples-to-apples cf_metric comparison vs v3_glmatk.
+# All LLM role routing unchanged:
+#         defense.llm                       -> :8000 primary (qwen2.5-7b-it + LoRA hot-load)
+#         attacker.llm                      -> remote GLM-5.2 via QianFan API
+#         env.{tool_executor,judge,utility}_llm -> :8002 secondary llama3-8b-judge process
+
+name: evoguard_agentdojo_full_v4_grpo_v2
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                        # base served model; LoRA adapter overlaid each round after r6-style hot-load fix applied last session.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                              # vLLM ignores key value but SDK requires non-empty string.
+    temperature: 0.2                            # greedy-ish defense policy during rollouts (GRPO uses its own temp below).
+    max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8                                  # cap applies uniformly across all suites for cost-bounded rollouts.
+
+attacker:
+  llm:
+    backend: qianfan                            # 远程GLM API per user instruction; creds走EVOGUARD_QIANFAN_APPID/TOKEN env vars(sh/qianfan_run.sh内置默认字面量兜底)
+    model: glm-5.2                              # 与v3成功run一致(attacker用5.2;judge本exp仍用本地llama3不变)
+    base_url: null                              # QianFanClient直连qianfan.baidubce.com不走openai base_url路径
+    api_key: null                               # 不内嵌pipe-separated literal保持yaml干净可commit安全
+    temperature: 0.95                           # 前次成功值(原local vllm=1.1随机性偏大)
+    top_p: 0.95                                 # 同前次成功值
+    max_tokens: 4096                            # 从8192降到4096匹配前次成功(GLM输出长度够用省配额)
+    timeout: 300                                # 从180升到300给远程API更长容错窗口
+    max_retries: 3
+    lora_adapter: null                          # remote endpoint不支持LoRA hot-load概念留空即可
+    enable_thinking: false                      # 关闭隐藏CoT预算确保JSON完整可见不被thinking截断(qianfan_client.py注释强调此关键)
+
+  population_size: 15                           # === USER-SPECIFIED VALUE === initial seed size; subsequent generations sized by offspring_size+elite_size below.
+  offspring_size: 10                            # === USER-SPECIFIED VALUE === number of children bred each generation via crossover/mutation/immigrant injection paths.
+  elite_size: 3                                 # === USER-SPECIFIED VALUE === top-E individuals retained verbatim between generations.
+  tournament_k: 3                               # standard GA selection pressure unchanged.
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4                        # mild discount when position+method duplicate prior selections within tournament bracket window.
+  diversity_position_window: 1
+  crowding_factor: 2                            # Part4 anti-stagnation: cap same-method individuals per tournament bracket forcing method-niche exploration.
+  immigrant_injection_rate: 0.20                # Part4 fallback: replace worst 20% with fresh genomes when fitness collapse OR stagnation triggers fire.
+  fitness_drop_threshold: 0.50                  # relative-drop trigger threshold comparing consecutive-generation best fitnesses.
+  random_seed: 42
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:                                       # full coverage of all locally-available AgentDojo v1 suite snapshots under data/toolsafe/.
+    - banking                                   # dedup'd unique instructions: ~5-6 per suite
+    - slack                                     # workspace dominates total volume (~36 unique)
+    - travel                                    # combined target sample budget ~=54 distinct prompts after loader-side instruction-deduplication pass.
+    - workspace
+  max_tasks: 100                                # generous upper bound above expected unique-task total (~54) ensuring nothing gets truncated prematurely.
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge          # TEMPORARY FALLBACK served-name registered on the live vllm instance listening at :8002 today;
+                                                # standing in for intended qwen3.6-27b-it while scripts/setup_evoguard_env.sh builds evoguard_full conda env able to load Qwen3_5 arch.
+    base_url: http://127.0.0.1:8002/v1           # CHANGED from planned :8001 because host loopback :8001 got hijacked by foreign docker-proxy mapping another team's containerised Qwen3-VL-32B-Instruct onto hostnet.
+    api_key: EMPTY
+    temperature: 0.0                             # deterministic simulated tool outputs preferred for reproducibility across reruns.
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge          # see tool_executor_llm.model rationale above (temporary fallback until env upgrade completes)
+    base_url: http://127.0.0.1:8002/v1            # see tool_executor_llm.base_url rationale above (:8001 hijacked by foreign docker-proxy)
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge          # see tool_executor_llm.model rationale above (temporary fallback until env upgrade completes)
+    base_url: http://127.0.0.1:8002/v1            # see tool_executor_llm.base_url rationale above (:8001 hijacked by foreign docker-proxy)
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /ssd1/models/qwen2.5-7b-it        # local path beats HF repo-id avoiding network fetches mid-run.
+
+  # ---------------------------------------------------------------- #
+  # METHOD dispatch table (see evoguard/training/__init__.py):        #
+  #   sft_then_native_grpo ->                                         #
+  #       r0 label endswith 'r0' & no existing marker file            #
+  #         ==> train_defender routes through train_native_sft().      #
+  #       every later round                                            #
+  #         ==> train_defender calls train_native_grpo() which requires #
+  #             latest_adapter_dir.txt pointing at valid prior adapter  #
+  #             dir or hard-errors out (NO silent fallback).            #
+  #                                                                    #
+  # This is THE delta vs v3 which used legacy string sft_then_grpo      #
+  # that mapped onto repeated cold-start SFT each round under use_native_trainer=True. #
+  # ---------------------------------------------------------------- #
+  method: sft_then_native_grpo
+
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  llamafactory_root: ""                          # unused when use_native_trainer=True ; left empty avoids spurious warnings.
+  verl_root: ""
+
+  # ---- Cold-start SFT knobs (only used by r0) ----------------------- #
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+
+  # ---- Native-GRPO knobs ------------------------------------------- #
+  # v2 TUNING (2026-07-24): based on v4 r0-r8 results showing ASR monotonically
+  # rising to ~0.46 despite stable pipeline. Diagnosis: updates too weak vs
+  # attacker GA search capacity.
+  #   * lr            1e-6 -> 5e-6   : 5x stronger policy gradient per step so
+  #                                   defender can actually move toward safer
+  #                                   refusal behavior within a round.
+  #   * beta_KL       0.04 -> 0.01   : relax reference-policy anchor letting
+  #                                   LoRA explore genuinely new defense modes
+  #                                   instead of staying near SFT-warm-start.
+  #   * max_steps     60   -> 200    : triple optimizer steps/round giving
+  #                                   more chances for reward signal to shape
+  #                                   adapter weights before next attack wave.
+  grpo_learning_rate: 5.0e-6                     # WAS 1e-6 -- v1 run ASR climbed from .286->.46 over 8 rounds; need stronger signal vs fast-evolving attacker
+                                                 # Reference logprobs come FREE from PeftModel.disable_adapter context-manager trick when args.beta>0 -- no separate frozen copy needed.
+  grpo_beta: 0.01                                # WAS 0.04 -- relaxed KL anchor lets policy drift further from SFT warm start into novel defense behaviors
+  grpo_group_size_g: 8                           # G=8 completions sampled per prompt for group-relative advantage estimation.
+  grpo_clip_epsilon: 0.20                        # PPO-style ratio clipping ε standard value.
+  grpo_rollout_temperature: 0.90                 # inner-loop sampling temp (>defense.temp) encourages exploration of refusal-vs-compliance modes against injected states.
+  grpo_max_prompts_per_round: 32                 # cap prompts fed into trainer each round bounds runtime added wall-clock vs SFT-only rounds observed empirically.
+  grpo_min_new_successes: 3                      # skip incremental retrain unless >=3 fresh B-trajectories collected this round preventing noisy micro-updates late in convergence tail.
+
+  # ---- Trainer infrastructure shared by both phases ------------------ #
+  per_device_batch_size: 1
+  gradient_accumulation: 8                       # eff_batch=8 stabilises updates given smallish per-round dataset sizes typical of overnight runs.
+
+  dry_run: false                                 # FLIPPED FALSE -> genuine weight updates happen every viable round producing real safetensors artifacts hot-loadable onto running vllm.
+  use_native_trainer: true                       # bypass vendored llamafactory-cli / verl CLIs whose pinned deps clash with installed stack.
+  cuda_visible_devices: "1"                      # CHANGED FROM "4" -> GPU4 unknown residual state today; GPUs#0,#1,#5 all truly empty (<1MB resident).
+                                                 # Primary qwen2.5 lives on GPU6 (37G), secondary judge llama3 on GPU7 (34G), so picking isolated GPU1 keeps fit() OOM-free.
+  native_max_steps_per_round: 200                # WAS 60 -- v2 tuning triples optimizer steps so reward signal can actually shape adapter weights before next attack wave arrives.
+
+pipeline:
+  max_rounds: 12                                 # UNCHANGED vs v3 fair-comparison basis; early-stop ε=0.05 K=5 patience may fire sooner if GRPO actually improves defense faster than SFT did.
+  patience_rounds: 5                             # K=5 consecutive strict-asr<threshold rounds triggers termination when achieved.
+  asr_threshold: 0.05                            # epsilon plan.md default retained.
+  stop_on_zero_success: false                    # don't terminate just because round had zero successful attacks -- oscillation patterns observed previously would otherwise kill promising trajectories too eagerly.
+  validation_fraction: 0.15                      # held-out tail fraction reserved for independent early-stop signalling.
+  task_concurrency: 8                            # outer fan-out elevated matching v3 setup exploiting freed throughput now judge moved offline away from main shared server.
+  attack_concurrency: 8                          # inner fan-out matched symmetrically; effective burst ~64 simultaneous requests fits comfortably inside one PCIe-A100 batching envelope.
+
+evo_data_subdir: "agentdojo"

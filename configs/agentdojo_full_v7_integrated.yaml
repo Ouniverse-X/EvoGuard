@@ -1,0 +1,179 @@
+# EvoGuard experiment: AgentDojo FULL local v7_integrated = v6_probed_lora BASELINE +
+# Δ-AWARE ADVANTAGE SHAPING (方案乙 / spec §3 explicit coupling).
+#
+# Tonight's three integrated improvements over v5_mcts baseline:
+#   1. MCTS attacker simplification (mct_searcher.py fixes from 2026-07-25/26:
+#      expansion-eligibility deadlock fix + dead-code removal)
+#   2. LoRA layer selection coupling with Δ-derived weights (commit f60a045):
+#        pair_collector.py collects delta/delta_normalized per ProbePair;
+#        ranking.py::aggregate_pair_scores accepts optional weights param;
+#        probes/runner.py Step-D applies per-pair Δ_norm as importance weighting.
+#      Phase-A rerun of scripts/run_lora_probe.sh regenerates targets.json so the
+#      top-K block selection now reflects latent-attack pair influence directly,
+#      not just equal-mean sensitivity aggregation as in v6's pre-coupling artifact.
+#   3. GRPO RL optimization (commits c9f0b55 + 1a120e7):
+#        a) Advantage shaping: Ã⁽ᵍᵖ⁾ = (1+λ·δ_p)·A⁽ᵍᵖ⁾ via lazy-defined subclass
+#           _DeltaShapedGRPOTrainer overriding _generate_and_score_completions;
+#           λ = grpo_advantage_curriculum_lambda (set to 1.0 below, essence §3 default).
+#        b) r_recover coefficient bump {+0.30,+0.15,-0.30,0} -> {+1.20,+0.60,-1.00,-0.15}
+#           to suppress the V4_GRPO_V2 bias where pure refusal out-scored acting.
+
+name: evoguard_agentdojo_full_v7_integrated
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                        # base served model; LoRA adapter overlaid each round after hot-load fix.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                              # vLLM ignores key value but SDK requires non-empty string.
+    temperature: 0.2                            # greedy-ish defense policy during rollouts (GRPO uses its own temp below).
+    max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8                                  # cap applies uniformly across all suites for cost-bounded rollouts.
+
+attacker:
+  llm:
+    backend: qianfan                            # remote GLM API matching v5_mcts/v6 baselines exactly.
+    model: glm-5.2                              # attacker uses GLM-5.2 ; judge stays llama3 locally unchanged.
+    base_url: null                              # QianFanClient直连qianfan.baidubce.com不走openai base_url路径
+    api_key: null                               # creds走EVOGUARD_QIANFAN_APPID/TOKEN env vars(sh/qianfan_run.sh内置默认字面量兜底)
+    temperature: 0.95                           # 前次成功值(原local vllm=1.1随机性偏大)
+    top_p: 0.95                                 # 同前次成功值
+    max_tokens: 4096                            # 从8192降到4096匹配前次成功(GLM输出长度够用省配额)
+    timeout: 300                                # 从180升到300给远程API更长容错窗口
+    max_retries: 3
+    lora_adapter: null                          # remote endpoint不支持LoRA hot-load概念留空即可
+    enable_thinking: false                      # 关闭隐藏CoT预算确保JSON完整可见不被thinking截断
+
+  # ---- GA fields retained for backward-compat config loading; MCTS backend
+  #      ignores all of these EXCEPT population_size (used as batch size N).
+  population_size: 15                           # MCTS: batch size per round (N traversals of the shared tree).
+  offspring_size: 10                            # GA-only; ignored by MCTS.
+  elite_size: 3                                 # GA-only; ignored by MCTS.
+  tournament_k: 3                               # GA-only; ignored by MCTS.
+  crossover_rate: 0.9                           # GA-only; ignored by MCTS.
+  mutation_rate: 0.5                            # GA-only; ignored by MCTS.
+  diversity_penalty: 0.4                        # GA-only; ignored by MCTS.
+  diversity_position_window: 1                 # GA-only; ignored by MCTS.
+  crowding_factor: 2                            # GA-only; ignored by MCTS.
+  immigrant_injection_rate: 0.20                # GA-only; ignored by MCTS.
+  fitness_drop_threshold: 0.50                  # GA-only; ignored by MCTS.
+  random_seed: 42
+
+  # ---- MCTS-specific knobs (identical to v5_mcts/v6_probed_lora for fair comparison) ----- #
+  search_method: mcts_delta                     # MCTS backend instead of GA -- same as v5_mcts baseline.
+  mcts_ucb_c: 1.414                             # classic UCB1 exploration coefficient (= sqrt(2)).
+  mcts_lambda_delta: 0.6                        # weight of the delta-potential term in UCB-Δ selection score.
+  mcts_failure_credit_eps: 0.03                # fraction of late-caught-failure tau converted into partial credit.
+  mcts_tau_window_size: 8                       # sliding window of recent C-class taus kept per node.
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:                                       # full coverage of all locally-available AgentDojo v1 suite snapshots under data/toolsafe/.
+    - banking                                   # dedup'd unique instructions: ~5-6 per suite
+    - slack                                     # workspace dominates total volume (~36 unique)
+    - travel                                    # combined target sample budget ~=54 distinct prompts after loader-side instruction-deduplication pass.
+    - workspace
+  max_tasks: 100                                # generous upper bound above expected unique-task total (~54) ensuring nothing gets truncated prematurely.
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge          # TEMPORARY FALLBACK served-name registered on the live vllm instance listening at :8002 today.
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0                             # deterministic simulated tool outputs preferred for reproducibility across reruns.
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /ssd1/models/qwen2.5-7b-it        # local path beats HF repo-id avoiding network fetches mid-run.
+
+  method: sft_then_native_grpo                  # r0 cold-start SFT; >=r1 incremental native GRPO (same as v5_mcts/v6).
+
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                                              # NOTE: This static YAML value is OVERWRITTEN at runtime when
+                                              #       lora_probe_artifact_path below resolves to an existing file.
+                                              #       The override happens inside evoguard.training.native_runner.py's
+                                              #       cold-start SFT branch where target_modules_list gets replaced
+                                              #       wholesale with recommended_target_modules drawn from probe JSON.
+  llamafactory_root: ""
+  verl_root: ""
+
+  # ---- Cold-start SFT knobs (only used by r0) ----------------------- #
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+
+  # ---- Native-GRPO knobs -------------------------------------------- #
+  grpo_learning_rate: 5.0e-6
+  grpo_beta: 0.01                               # KL coefficient toward reference policy β -- matches v5_mcts/v6.
+  grpo_group_size_g: 8                          # G completions sampled per prompt for group-relative advantage.
+  grpo_clip_epsilon: 0.20                        # PPO clip range ε.
+  grpo_rollout_temperature: 0.90                 # sampling temp during inner-loop generation (>defense temp encourages exploration).
+  grpo_max_prompts_per_round: 32                # cap prompts fed to trainer each round bounds runtime.
+  grpo_min_new_successes: 3                     # skip retraining if too few novel B-trajectories accumulated since last round.
+
+  # === 方案乙 NEW KNOB: Δ-aware advantage shaping curriculum factor === #
+  # Multiplicative scale applied DIRECTLY on top of group-relative advantages before PPO ratio computation:
+  #     Ã⁽ᵍᵖ⁾ = (1 + λ · δ_p) · A⁽ᵍᵖ⁾
+  # Default proposal λ=1.0 from spec §3 starting recommendation; tune down if diagnostics show gradient explosion symptoms.
+  # Setting to 0 disables shaping entirely and reproduces legacy GRPO behaviour bit-for-bit.
+  grpo_advantage_curriculum_lambda: 1.0         # THE primary delta vs v5_mcts/v6_probed_lora on defender RL side.
+
+  # ---- Trainer infrastructure shared by both phases ------------------ #
+  per_device_batch_size: 1
+  gradient_accumulation: 8                       # eff_batch=8 stabilises updates.
+
+  dry_run: false                                # genuine weight updates every viable round.
+  use_native_trainer: true                       # bypass vendored llamafactory-cli / verl CLIs.
+  cuda_visible_devices: "4"                      # GPU#4 idle during launch window; isolated card avoids OOM collision w/ ongoing services on cards#0/1/2/3/6/7.
+                                                # Phase-A probe runs concurrently on GPU#5 leaving this card free for the multi-hour main pipeline.
+  native_max_steps_per_round: 200                # triple optimizer steps/round.
+
+  # ---- PROBE ARTIFACT REFERENCE (regenerated tonight under phase-A) --- #
+  lora_probe_enabled: true                        # informational flag only; runner.py reads artifact path below directly regardless.
+  lora_probe_method: attn_kl                     # matches what was used during collection phase-A.
+  lora_probe_top_k_blocks: 8                     # expected count present inside artifact JSON selected_blocks_sorted_desc array.
+  lora_probe_max_pairs: 80                       # nominal record of phase-A budget cap actually achieved ~58 pairs collected previously.
+                                                # Phase-A run launched today refreshes this file incorporating new weighted-aggregation logic.
+  lora_probe_artifact_path: /ssd1/yx/yangxiao26/EvoGuard/rounds/evoguard_agentdojo_full_local/probe_results/targets.json
+                                                 # ABSOLUTE PATH pointing at JSON produced by bash scripts/run_lora_probe.sh
+                                                 # invoked against configs/agentdojo_full_local.yaml pinning GPU#5.
+                                                 # At time-of-read inside native_runner.train_native_sft() this file MUST exist &
+                                                 # contain valid schema_version='1' payload carrying non-empty recommended_target_modules list,
+                                                 # else override silently no-ops falling back to default ['q','k','v','o']_proj spread.
+
+pipeline:
+  max_rounds: 12                                 # same as v5_mcts/v6_probed_lora.
+  patience_rounds: 5                             # K=5 consecutive strict-asr<threshold rounds triggers termination.
+  asr_threshold: 0.05                            # epsilon plan.md default.
+  stop_on_zero_success: false                    # keep iterating even after a perfect-defense round to verify stability across multiple rounds.
+  validation_fraction: 0.15
+  task_concurrency: 8
+  attack_concurrency: 8
+
+evo_data_subdir: "agentdojo"

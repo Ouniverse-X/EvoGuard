@@ -7,6 +7,12 @@
 /rounds/
 /results/
 /sh/
+/baselines
+/eval_out/
+
+# --- Core dumps -------------------------------------------------------------
+# A 21 GB `core.1189660` was sitting in the repo root; never commit these.
+core.*
 
 # --- Stray experiment artifacts anywhere in tree -----------------------------
 *.log
@@ -15,7 +21,9 @@
 nohup.out
 *.tmp
 *.bak
+*.bak_*
 *.swp
+*_backup_*/
 
 # --- Build artifacts --------------------------------------------------------
 __pycache__/

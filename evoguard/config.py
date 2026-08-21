@@ -35,6 +35,10 @@ class LLMConfig:
       ``EVOGUARD_QIANFAN_APPID`` / ``EVOGUARD_QIANFAN_TOKEN``, or from a
       pipe-separated literal in :attr:`api_key` (format ``"<appid>|<bce-v3/...>"``).
       Model field selects e.g. ``glm-5`` or ``glm-5.2``.
+    * ``"llamacpp"`` -- a local llama.cpp ``llama-server`` serving a GGUF model
+      (e.g. GLM-5.2 on CPU). OpenAI-compatible wire format, but strips GLM
+      ``<think>`` blocks and is limited by decode slots rather than a remote RPM
+      quota. Used for the attacker role to remove the gateway rate ceiling.
     * ``"mock"``   -- a deterministic offline client used for smoke tests.
     """
 
@@ -45,7 +49,7 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.95
     max_tokens: int = 1024
-    timeout: float = 120.0
+    timeout: float = 300.0
     max_retries: int = 3
     # Optional LoRA adapter name to request from the vLLM server for this role.
     lora_adapter: Optional[str] = None
@@ -220,9 +224,52 @@ class TrainingConfig:
     #     Ã⁽ᵍᵖ⁾ = (1 + λ·δ_p) · A⁽ᵍᵖ⁾
     # where δ_p is the originating record's normalized Δ carried per-prompt via PromptMeta.
     # Default λ=0.0 reproduces legacy equal-weight behaviour bit-for-bit so existing yamls keep working;
-    # positive values amplify gradients on latent-attack prompts without touching reward scale itself,
-    # avoiding the dilution problem that crippled r_early's contribution under five-component summing.
+    # positive values amplify gradients on latent-attack prompts without touching reward scale itself.
+    # Since S1 (2026-08-21) deleted the inline ``r_early`` term this is the ONLY
+    # place Δ still influences training, so a run intending Δ-monotonicity MUST
+    # set λ>0. Keeping Δ out of the scalar avoids the dilution that crippled
+    # r_early: it peaked at +0.50 against a ±2.0 safety term, ~0.4% of the summed
+    # variance.
     grpo_advantage_curriculum_lambda: float = 0.0
+    # Fraction of ``grpo_max_prompts_per_round`` reserved for BENIGN prompts cut
+    # out of clean (A) trajectories. They run the SAME formula as attacked rows
+    # with r_safety pinned to a constant, so all their signal comes from the
+    # judged r_progress term in grpo_reward.py.
+    # 0.0 = attacked-only, i.e. legacy behaviour bit-for-bit. Without benign
+    # rows every prompt in the batch pays for blocking, all G group siblings
+    # converge on the same blocking behaviour, reward std collapses to zero and
+    # nothing in the gradient distinguishes "blocked and still served the user"
+    # from "blocked and gave up" -- the 一刀切 failure. 0.5 gives roughly one
+    # benign prompt per attacked one.
+    grpo_clean_prompt_ratio: float = 0.0
+
+    # ---- SFT dataset quality gate (item D1, 2026-08-20) ------------------- #
+    # Utility below which a source trajectory is too poor to imitate.
+    # 0.0 = no filtering (legacy behaviour bit-for-bit). At 0.5, a clean (A)
+    # rollout that failed its own task is dropped, and an attack-fail (C)
+    # rollout that blocked the attack but then failed the task is truncated to
+    # its payload-free prefix -- those post-injection steps are literally the
+    # "attack blocked, benign task not delivered" behaviour counted by
+    # ``utils.metrics.RoundMetrics.blocked_unfinished_rate``, and they were 37.5%
+    # of C records / ~28% of all SFT rows on r0.
+    sft_min_source_utility: float = 0.0
+
+    # ---- SFT two-class recipe (2026-08-20) -------------------------------- #
+    # True = keep only the two observed behaviours we want at cold start:
+    #   class 1: clean (A) rollouts that completed the task;
+    #   class 2: attack-fail (C) rollouts that completed the task, i.e. resisted
+    #            the bait AND still delivered.
+    # Successful attacks (B) are dropped, which removes every hand-written
+    # corrective-refusal template from the dataset -- the r6 mode-collapse
+    # vector, and the only source of refusal-shaped targets. Detection is then
+    # delegated entirely to GRPO. Measured on r0: only 0.6% of eligible C
+    # rollouts contain any detection wording, so class 2 teaches "ignore the
+    # bait and finish the job" rather than "announce the bait".
+    sft_two_class: bool = False
+    # 0 = unlimited. Caps how many source rollouts one task may contribute, so a
+    # heavily-probed task cannot dominate. On r0 the per-task C count ranged
+    # 1..15; a cap of 4 flattens the row distribution without losing tasks.
+    sft_max_records_per_task: int = 0
 
     # If True, only run SFT cold-start on round_0; subsequent rounds reuse the
     # existing adapter and apply GRPO incrementally. Saves ~30-40 min/round of

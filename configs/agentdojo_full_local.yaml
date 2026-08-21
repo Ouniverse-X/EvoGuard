@@ -1,0 +1,145 @@
+# EvoGuard experiment: AgentDojo FULL four-domain LOCAL backend, used ONLY as
+# INPUT to scripts/run_lora_probe.sh during phase-A LoRA-layer-probe collection.
+#
+# Mirrors the LLM endpoint wiring of configs/agentdojo_full_mcts.yaml so that
+# pair_collector hits the same live vLLM (:8000 qwen2.5-7b-it) for defense +
+# secondary judge server (:8002 llama3-8b-judge) for tool_executor / judge /
+# utility_judge. Attacker block here uses GA defaults because pair_collector
+# builds its own minimal AttackSpec internally; it never goes through
+# build_attacker() factory, so search_method value does not affect probe output.
+#
+# Probe-specific knobs under training.lora_probe_* are honoured directly by
+# evoguard.training.probes.runner.run_lora_layer_probe():
+#
+#   lora_probe_enabled:        true  -> runner skips warning banner.
+#   lora_probe_method:         attn_kl -> only MVP scorer implemented today.
+#   lora_probe_top_k_blocks:   8     -> pick top-8 most-sensitive Transformer blocks.
+#   lora_probe_max_pairs:      80    -> stratified cap = ~20 pairs/suite across 4 suites.
+#   lora_probe_artifact_path:  ""    -> empty means runner emits to default
+#                                        <exp_dir>/probe_results/targets.json automatically;
+#                                        CLI --override-gpu etc still take precedence over these
+#                                        values when invoked from bash launcher.
+#
+# Output destination after successful completion:
+#   rounds/evoguard_agentdojo_full_local/probe_results/targets.json
+
+name: evoguard_agentdojo_full_local
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it                        # base served model on :8000 ; no adapter overlay needed during probing.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY                              # vLLM ignores key value but SDK requires non-empty string.
+    temperature: 0.2                            # greedy-ish defense policy mirrors production rollout conditions.
+    max_tokens: 1024                            # defense agent needs room for tool args + final answer JSON blob.
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8                                  # uniform across all four suites for cost-bounded rollouts.
+
+attacker:
+  llm:
+    backend: openai                             # reuse same local :8000 server for any incidental attacker-side calls.
+                                             # NOTE: pair_collector bypasses build_attacker() entirely, building its own
+                                             # AttackSpec via _make_attack_spec_for_probe(); this llm client may go unused,
+                                             # but keeping it wired avoids ExperimentConfig validation errors downstream.
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.1
+    max_tokens: 8192
+    enable_thinking: false
+    timeout: 180.0
+  population_size: 12                           # GA-only fields kept populated to satisfy schema; ignored by MCTS backend AND by pair_collector.
+  offspring_size: 10
+  elite_size: 2
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+env:
+  dataset: agentdojo
+  data_root: data
+  suites:                                       # full coverage of all locally-available AgentDojo v1 suite snapshots under data/toolsafe/.
+    - banking                                   # dedup'd unique instructions: ~5-6 per suite
+    - slack                                     # workspace dominates total volume (~36 unique)
+    - travel                                    # combined target sample budget ~=54 distinct prompts after loader-side instruction-deduplication pass.
+    - workspace
+  max_tasks: 100                                # generous upper bound above expected unique-task total (~54).
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it                      # consolidated onto primary vLLM :8000 after :8002 llama3-8b degraded.
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0                            # deterministic simulated tool outputs preferred for reproducibility.
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true                                # required true so TrainingConfig validates even though we never invoke train_native_sft/grpo from probe pipeline.
+  base_model: /ssd1/models/qwen2.5-7b-it       # local path beats HF repo-id avoiding network fetches mid-run.
+
+  method: sft_then_grpo                         # nominal placeholder; never executed during probe-only invocation.
+
+  lora_rank: 16                                 # legacy values retained for reference; not consumed by probe code paths.
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0                               # unused but kept for completeness vs sibling yamls.
+  sft_learning_rate: 1.0e-4
+  grpo_learning_rate: 5.0e-6                    # unused but kept for completeness vs sibling yamls.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false                                # MUST stay false or dry-run branch short-circuits before real work begins.
+  use_native_trainer: false                     # not relevant since training.* phases aren't triggered at all in probe mode.
+  cuda_visible_devices: "3"                     # default pin matches plan.md §五 GPU allocation convention; override via --override-gpu flag.
+
+  native_max_steps_per_round: 60                # unused but kept for completeness vs sibling yamls.
+
+  # ---- PROBE-SPECIFIC FIELDS (consumed by evoguard.training.probes.runner) ---- #
+  lora_probe_enabled: true                      # explicit opt-in flag acknowledged by runner with INFO log instead of WARNING.
+  lora_probe_method: attn_kl                    # only MVP scorer implemented today; grad_attr/act_patch raise NotImplementedError via select_scorer().
+  lora_probe_top_k_blocks: 8                    # plan.md §三 spec picks top-K=8 Transformer blocks out of Qwen2.5-7B's total of 28 layers.
+  lora_probe_max_pairs: 80                      # plan.md §一 budget cap ~=20 pairs per suite *4 suites; CLI override possible via --max-pairs flag.
+  lora_probe_artifact_path: ""                  # empty string means runner auto-emits artifact into <exp>/probe_results/targets.json using _default_artifact_dir() helper.
+
+pipeline:
+  max_rounds: 1                                 # nominal only; probe runs do NOT iterate co-evolution loop.
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  validation_fraction: 0.15
+  task_concurrency: 4                           # conservative fan-out since main mcts experiment already running concurrently.
+  attack_concurrency: 4
+
+evo_data_subdir: "agentdojo"

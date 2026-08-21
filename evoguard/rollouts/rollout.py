@@ -31,6 +31,7 @@ in-flight requests stays comfortably below Baidu Qianfan's default tier ceiling
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -65,6 +66,90 @@ class RoundRollouts:
 
     def attack_total(self) -> int:
         return len(self.attacked_records())
+
+
+_VLLM_HEALTH_MAX_WAIT = 600  # seconds to wait for vLLM to come back
+_VLLM_HEALTH_POLL_INTERVAL = 10  # poll interval
+
+
+def _ensure_vllm_healthy(controller: Controller) -> None:
+    """Block until the defender vLLM endpoint responds, restarting if needed.
+
+    The MCTS attacker population pre-compute phase can take hours calling remote
+    QianFan API; meanwhile the local vLLM server may crash / get killed / run OOM.
+    This check runs AFTER population pre-compute and BEFORE any clean/attacked
+    rollout dispatch, giving us the chance to detect+restart vLLM so rollouts
+    don't all fail with Connection errors.
+    """
+    import subprocess
+
+    # Extract base_url from the defense agent's LLM client config.
+    agent = controller.agent
+    base_url = getattr(getattr(agent, "config", None), "llm", None)
+    if base_url is None:
+        return
+    base_url_str = getattr(base_url, "base_url", None) or "http://127.0.0.1:8000/v1"
+    # Strip /v1 suffix to get health URL.
+    health_url = base_url_str.rstrip("/")
+    if health_url.endswith("/v1"):
+        health_url = health_url[:-3]
+    models_url = health_url.rstrip("/") + "/v1/models"
+
+    def _is_healthy() -> bool:
+        try:
+            import urllib.request
+            req = urllib.request.Request(models_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    if _is_healthy():
+        logger.info("[vllm_health] defender endpoint responsive at %s", models_url)
+        return
+
+    logger.warning(
+        "[vllm_health] defender endpoint NOT responding at %s; "
+        "attempting restart via scripts/start_vllm.sh",
+        models_url,
+    )
+
+    # Try restarting vLLM via the project's start script.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    start_script = os.path.join(repo_root, "scripts", "start_vllm.sh")
+
+    if os.path.isfile(start_script):
+        # Remove stale PID file so start_vllm.sh doesn't bail early.
+        pid_file = os.path.join(repo_root, "rounds", "vllm.pid")
+        if os.path.isfile(pid_file):
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
+
+        try:
+            subprocess.run(
+                ["bash", start_script],
+                cwd=repo_root,
+                timeout=_VLLM_HEALTH_MAX_WAIT,
+                capture_output=True,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.error("[vllm_health] start_vllm.sh failed: %s", exc)
+
+    # Poll until healthy or timeout.
+    deadline = time.time() + _VLLM_HEALTH_MAX_WAIT
+    while time.time() < deadline:
+        if _is_healthy():
+            logger.info("[vllm_health] defender endpoint recovered at %s", models_url)
+            return
+        time.sleep(_VLLM_HEALTH_POLL_INTERVAL)
+
+    logger.error(
+        "[vllm_health] defender endpoint STILL not responding after %ds; "
+        "rollouts will likely fail.",
+        _VLLM_HEALTH_MAX_WAIT,
+    )
 
 
 def collect_tri_rollouts(
@@ -107,18 +192,78 @@ def collect_tri_rollouts(
     # Each task gets exactly ONE seeding call now regardless of how much we
     # later parallelize downstream rollout work.
     precomputed_populations: dict[str, list] = {}
-    for t in tasks:
-        ga = attackers.get(t.task_id)
-        if ga is None:
-            continue
-        try:
-            precomputed_populations[t.task_id] = list(ga.current_population())
-        except Exception as exc:                                          # noqa: BLE001
-            logger.warning(
-                "Round %d task %s: population pre-compute failed (%s); skipping.",
-                round_id, t.task_id, exc,
-            )
-            precomputed_populations[t.task_id] = []
+    eligible_pairs = [
+        (t.task_id, attackers[t.task_id])
+        for t in tasks
+        if attackers.get(t.task_id) is not None
+    ]
+
+    def _precompute_one(tid, ga):
+        return tid, list(ga.current_population())
+
+    # Tasks whose seeding raised. A task left with an empty population
+    # contributes zero attacked trajectories, which shrinks the round's
+    # training set without any error surfacing -- historically caused by the
+    # attacker gateway's RPM quota exhausting the client's retries. Retried
+    # serially below (the QianFan client paces process-wide, so a serial retry
+    # sees an uncontended window) before being reported as data loss.
+    failed_precompute: dict[str, str] = {}
+
+    n_precompute_workers = max(
+        1, min(int(task_concurrency), len(eligible_pairs) or 1)
+    )
+    if len(eligible_pairs) > 1 and n_precompute_workers > 1:
+        # Attacker trees are per-task instances with no shared mutable state
+        # (prewarm cache is read-only by now; QianFan/openai clients issue
+        # stateless per-call HTTP requests), so cross-task fan-out is safe.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        logger.info(
+            "Round %d pre-computing populations for %d tasks with %d workers",
+            round_id, len(eligible_pairs), n_precompute_workers,
+        )
+        with ThreadPoolExecutor(max_workers=n_precompute_workers) as pool:
+            futures = {
+                pool.submit(_precompute_one, tid, ga): tid
+                for tid, ga in eligible_pairs
+            }
+            for fut in as_completed(futures):
+                tid = futures[fut]
+                try:
+                    _, pop = fut.result()
+                    precomputed_populations[tid] = pop
+                except Exception as exc:                                  # noqa: BLE001
+                    failed_precompute[tid] = str(exc)
+    else:
+        for tid, ga in eligible_pairs:
+            try:
+                precomputed_populations[tid] = list(ga.current_population())
+            except Exception as exc:                                      # noqa: BLE001
+                failed_precompute[tid] = str(exc)
+
+    if failed_precompute:
+        attacker_by_tid = dict(eligible_pairs)
+        logger.warning(
+            "Round %d: %d task(s) failed population pre-compute; retrying serially: %s",
+            round_id, len(failed_precompute), ", ".join(sorted(failed_precompute)),
+        )
+        for tid in sorted(failed_precompute):
+            try:
+                precomputed_populations[tid] = list(
+                    attacker_by_tid[tid].current_population()
+                )
+                del failed_precompute[tid]
+            except Exception as exc:                                      # noqa: BLE001
+                failed_precompute[tid] = str(exc)
+
+    for tid, err in sorted(failed_precompute.items()):
+        precomputed_populations[tid] = []
+        logger.error(
+            "Round %d task %s: population pre-compute FAILED after serial retry "
+            "(%s). This task contributes NO attacked trajectories -- the round's "
+            "training set is incomplete.",
+            round_id, tid, err,
+        )
 
     n_total_attacks_planned = sum(len(v) for v in precomputed_populations.values())
     logger.info(
@@ -127,6 +272,29 @@ def collect_tri_rollouts(
         round_id, len(tasks), n_total_attacks_planned,
         max(1, int(task_concurrency)), max(1, int(attack_concurrency)),
     )
+
+    # ------------------------------------------------------------------ #
+    # Ensure vLLM defender server is reachable before starting rollouts   #
+    # ------------------------------------------------------------------ #
+    _ensure_vllm_healthy(controller)
+
+    # Warm-up: send a single trivial request to wake up vLLM's engine
+    # and allocate GPU cache before blasting it with concurrent requests.
+    try:
+        from evoguard.core.types import Message, Role
+        from evoguard.llm import build_client
+        warmup_client = build_client(controller.agent.config.llm)
+        warmup_resp = warmup_client.chat([Message(role=Role.USER, content="hello")])
+        logger.info("[warmup] vLLM warmed up successfully (got %d tokens)", warmup_resp.completion_tokens)
+    except Exception as warmup_exc:                                      # noqa: BLE001
+        logger.warning("[warmup] failed (non-fatal): %s", warmup_exc)
+        # If warmup fails, wait and retry once more to give vLLM time to ready
+        time.sleep(15)
+        try:
+            warmup_resp = warmup_client.chat([Message(role=Role.USER, content="hello")])
+            logger.info("[warmup] vLLM warmed up on retry (got %d tokens)", warmup_resp.completion_tokens)
+        except Exception:                                                # noqa: BLE001
+            logger.error("[warmup] vLLM still unresponsive after retry; rollouts will likely fail")
 
     result = RoundRollouts()
 
@@ -148,9 +316,26 @@ def collect_tri_rollouts(
         try:
             clean_record = clean_runner.rollout(task)
         except Exception as exc:                                          # noqa: BLE001
-            logger.error("Round %d task %s CLEAN rollout failed: %s",
-                         round_id, task.task_id, exc)
-            return None, {}
+            # Retry once after a short wait — vLLM may have been transiently
+            # unreachable (e.g. just finishing model reload after LoRA hot-load).
+            err_str = str(exc).lower()
+            if "connection" in err_str or "refused" in err_str or "timeout" in err_str:
+                logger.warning(
+                    "Round %d task %s CLEAN rollout failed (transient: %s); "
+                    "waiting 30s then retrying once.",
+                    round_id, task.task_id, exc,
+                )
+                time.sleep(30)
+                try:
+                    clean_record = clean_runner.rollout(task)
+                except Exception as exc2:                                  # noqa: BLE001
+                    logger.error("Round %d task %s CLEAN rollout retry also failed: %s",
+                                 round_id, task.task_id, exc2)
+                    return None, {}
+            else:
+                logger.error("Round %d task %s CLEAN rollout failed: %s",
+                             round_id, task.task_id, exc)
+                return None, {}
 
         pop_for_this_task = precomputed_populations.get(task.task_id) or []
         local_results: dict[int, tuple[TrajectoryRecord, EvaluatedAttack]] = {}
