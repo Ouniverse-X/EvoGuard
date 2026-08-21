@@ -704,6 +704,9 @@ class Pipeline:
             max_records_per_task=int(
                 getattr(self.cfg.training, "sft_max_records_per_task", 0) or 0
             ),
+            max_corrective_share=float(
+                getattr(self.cfg.training, "sft_max_corrective_share", 0.0) or 0.0
+            ),
         )
 
 

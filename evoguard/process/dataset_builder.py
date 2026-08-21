@@ -402,6 +402,7 @@ class DefenderDatasetBuilder:
         min_source_utility: float = 0.0,
         two_class: bool = False,
         max_records_per_task: int = 0,
+        max_corrective_share: float = 0.0,
     ):
         """
         ``min_source_utility`` (item D1) is the utility below which a source
@@ -429,6 +430,15 @@ class DefenderDatasetBuilder:
         single task may contribute, keeping the per-task row distribution flat.
         Ties are broken by utility (descending) then ``record_id``, so selection
         is deterministic and prefers the better-executed rollouts.
+
+        ``max_corrective_share`` (0.0 = uncapped, plan 乙) bounds the fraction of
+        emitted rows whose target is a ``corrective_refusal``. It is what makes
+        ``two_class=False`` safe again: detection supervision comes back, but as a
+        minority of the corpus rather than as an unbounded share. The r6 collapse
+        was not caused by the existence of those rows -- it was caused by their
+        weight (one memorised opener on 45.7% of decoded steps, emitted on 59.6%
+        of CLEAN trajectories). B records are admitted in ``record_id`` order
+        until the next one would breach the bound, so the result is reproducible.
         """
 
         self._tasks = tasks_by_id
@@ -436,6 +446,7 @@ class DefenderDatasetBuilder:
         self._min_source_utility = float(min_source_utility)
         self._two_class = bool(two_class)
         self._max_records_per_task = max(int(max_records_per_task), 0)
+        self._max_corrective_share = max(float(max_corrective_share), 0.0)
         #: Populated by every :meth:`build_sft` call; surfaced for run logs.
         self.last_sft_stats: dict[str, Any] = {}
 
@@ -449,23 +460,39 @@ class DefenderDatasetBuilder:
         return float(util) >= self._min_source_utility
 
     # ---- per-task cap ------------------------------------------------------- #
+    @staticmethod
+    def _cap_class(rec: TrajectoryRecord) -> str:
+        """Which scarcity bucket a record competes in for the per-task cap."""
+        if rec.kind is TrajectoryKind.CLEAN:
+            return "clean"
+        if rec.outcome is AttackOutcome.SUCCESS:
+            return "attack_success"
+        return "attack_fail"
+
     def _cap_per_task(
         self, records: list[TrajectoryRecord]
     ) -> list[TrajectoryRecord]:
         """Keep at most ``max_records_per_task`` rollouts per task *per class*.
 
-        The cap is keyed on ``(task_id, is_clean)`` rather than ``task_id`` alone.
+        The cap is keyed on ``(task_id, class)`` rather than ``task_id`` alone.
         Keying on the task alone lets the abundant class evict the scarce one:
         on r0 a task carries up to 15 attack-fail rollouts but exactly 1 clean
         rollout, so a task-only cap of 4 silently dropped 21 of the 29 clean
         records -- deleting most of class 1, the opposite of the intent.
+
+        There are THREE classes, not two (plan 乙, 2026-08-21). Two-class mode
+        filters successful attacks out before this point, so it only ever sees
+        ``clean`` and ``attack_fail`` and its behaviour is unchanged; but with
+        ``two_class=False`` the B records are back, they are the scarce class on
+        r0 (143 usable against 548 attack-fail), and folding them in with C would
+        let C evict the only detection supervision in the corpus.
         """
 
         if self._max_records_per_task <= 0:
             return records
-        by_task: dict[tuple[str, bool], list[TrajectoryRecord]] = {}
+        by_task: dict[tuple[str, str], list[TrajectoryRecord]] = {}
         for rec in records:
-            key = (rec.task_id, rec.kind is TrajectoryKind.CLEAN)
+            key = (rec.task_id, self._cap_class(rec))
             by_task.setdefault(key, []).append(rec)
         kept: list[TrajectoryRecord] = []
         for group in by_task.values():
@@ -509,7 +536,7 @@ class DefenderDatasetBuilder:
             cleans_by_task[rec.task_id] = rec.trajectory
 
         # Two-class mode selects its source rollouts up front: only A and C that
-        # passed the utility bar are eligible, and each task gets a bounded share.
+        # passed the utility bar are eligible.
         if self._two_class:
             eligible = [
                 rec for rec in records
@@ -525,11 +552,26 @@ class DefenderDatasetBuilder:
             stats["records_dropped_low_utility"] = sum(
                 1 for rec in records if not self._passes_utility(rec)
             )
-            records = self._cap_per_task(eligible)
+            records = eligible
+
+        # The per-task cap applies in BOTH modes (plan 乙): it used to sit inside
+        # the two-class branch, which meant ``sft_max_records_per_task`` silently
+        # became a no-op the moment ``two_class`` was turned off -- on r0 that is
+        # the difference between 745 and 2314 rows. The user's standing
+        # instruction on the SFT corpus is quality over volume, so the knob has to
+        # keep working. Two-class behaviour is bit-identical: it filters B out
+        # first, so it still only ever sees the same two buckets.
+        if self._max_records_per_task > 0:
+            records = self._cap_per_task(records)
             stats["records_after_cap"] = len(records)
 
         clean_rows: list[SFTExample] = []
         attacked_rows: list[SFTExample] = []
+        # B-derived groups are held back rather than appended in-line: the
+        # corrective share can only be evaluated once the size of the rest of the
+        # corpus is known. Each group is (record_id, rows) so admission order is
+        # a property of the data, not of iteration order.
+        corrective_groups: list[tuple[str, list[SFTExample]]] = []
         for rec in records:
             task = self._tasks.get(rec.task_id)
             if task is None:
@@ -565,15 +607,71 @@ class DefenderDatasetBuilder:
                     task, tools, rec,
                     clean_trajectory=cleans_by_task.get(rec.task_id),
                 )
-                attacked_rows.extend(produced)
+                if produced:
+                    corrective_groups.append((str(rec.record_id), produced))
                 stats["b_records_used" if produced else "b_records_dropped"] += 1
+
+        admitted, n_groups_over_cap = self._admit_corrective_groups(
+            corrective_groups, n_other_rows=len(clean_rows) + len(attacked_rows),
+        )
+        attacked_rows.extend(admitted)
+        stats["b_records_dropped_over_corrective_cap"] = n_groups_over_cap
 
         examples = clean_rows + attacked_rows
         stats["n_clean_rows"] = len(clean_rows)
         stats["n_attacked_rows"] = len(attacked_rows)
+        n_refusal_rows = sum(
+            1 for ex in examples if ex.meta.get("kind") == "corrective_refusal"
+        )
+        stats["n_corrective_refusal_rows"] = n_refusal_rows
+        stats["corrective_refusal_share"] = (
+            round(n_refusal_rows / len(examples), 6) if examples else 0.0
+        )
         stats.update(_prompt_level_composition(examples, records))
         self.last_sft_stats = dict(stats)
         return examples
+
+    def _admit_corrective_groups(
+        self,
+        groups: list[tuple[str, list[SFTExample]]],
+        *,
+        n_other_rows: int,
+    ) -> tuple[list[SFTExample], int]:
+        """Admit B-derived row groups while the refusal share stays under bound.
+
+        Returns ``(rows, n_groups_rejected)``. With ``max_corrective_share == 0``
+        every group is admitted, reproducing the uncapped corpus exactly.
+
+        The check is greedy over ``record_id``-sorted groups: admitting a group
+        raises both the numerator (its single ``corrective_refusal`` row) and the
+        denominator (all of its rows), so once a group fails, later ones are
+        tested against the same already-admitted state rather than being skipped
+        wholesale -- a group with a long phase-1/phase-3 tail can still fit where
+        a short one did not.
+        """
+
+        if self._max_corrective_share <= 0.0:
+            # Iteration order, not sorted order: this branch must reproduce the
+            # pre-乙 corpus byte-for-byte.
+            return [ex for _rid, rows in groups for ex in rows], 0
+
+        admitted: list[SFTExample] = []
+        n_refusal = 0
+        n_rejected = 0
+        for _rid, rows in sorted(groups, key=lambda g: g[0]):
+            group_refusals = sum(
+                1 for ex in rows if ex.meta.get("kind") == "corrective_refusal"
+            )
+            total_after = n_other_rows + len(admitted) + len(rows)
+            if total_after <= 0:
+                n_rejected += 1
+                continue
+            if (n_refusal + group_refusals) / total_after > self._max_corrective_share:
+                n_rejected += 1
+                continue
+            admitted.extend(rows)
+            n_refusal += group_refusals
+        return admitted, n_rejected
 
     def _imitate(
         self,

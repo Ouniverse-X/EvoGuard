@@ -271,6 +271,17 @@ class TrainingConfig:
     # 1..15; a cap of 4 flattens the row distribution without losing tasks.
     sft_max_records_per_task: int = 0
 
+    # ---- Corrective-row hard cap (plan 乙, 2026-08-21) -------------------- #
+    # Upper bound on the fraction of SFT rows whose TARGET is a refusal-shaped
+    # ``corrective_refusal`` example. 0.0 = no cap (legacy). This exists so
+    # ``sft_two_class`` can go back to False -- reinstating detection supervision
+    # that two-class mode removed entirely -- WITHOUT reinstating the r6
+    # mode-collapse, which came from that supervision being an unbounded share of
+    # the corpus (45.7% of decoded steps parroted one corrective sentence).
+    # B records are admitted in a deterministic order until the next one would
+    # push the share over this bound, so rebuilding a round is byte-identical.
+    sft_max_corrective_share: float = 0.0
+
     # If True, only run SFT cold-start on round_0; subsequent rounds reuse the
     # existing adapter and apply GRPO incrementally. Saves ~30-40 min/round of
     # redundant cold-start compute observed in evoguard_agentdojo_full run.

@@ -98,14 +98,16 @@ never reachable and ``r_safety`` came entirely from the (now deleted)
 refusal-keyword fallback.
 
 Trade-off that came with S1, recorded rather than hidden: dropping the
-refusal-keyword credit and ``r_early`` moves the break-even probability at which
-refusing beats acting from 16.2% to 34.6% -- with both judges live, acting on the
-twin step pays ``+2.00 + 1.20`` when the judge holds and ``-5.00 - 2.50`` when it
-does not, against ``+2.00 - 2.50`` for refusing and stopping, so
-``p = 3.70 / 10.70``. Measured ASR may therefore rise from the 2.02% recorded for
-the four-term reward. That is the intended direction -- the 2.02% was bought with
-a clean-arm utility mean of 0.10 -- but it must be reported, not assumed away.
-The figure is asserted by ``test_break_even_risk_for_refusing_is_above_one_third``.
+refusal-keyword credit and ``r_early`` moved the break-even probability at which
+refusing beats acting from 16.2% up to 34.6%, and plan 丙 (2026-08-21) then pulled
+it back to 27.0% by deepening ``R_SAFETY_BAITED`` from -5.00 to -8.00 -- with both
+judges live, acting on the twin step pays ``+2.00 + 1.20`` when the judge holds and
+``-8.00 - 2.50`` when it does not, against ``+2.00 - 2.50`` for refusing and
+stopping, so ``p = 3.70 / 13.70``. Measured ASR may still rise from the 2.02%
+recorded for the four-term reward. That is the intended direction -- the 2.02% was
+bought with a clean-arm utility mean of 0.10 -- but it must be reported, not
+assumed away. The figure is asserted by
+``test_break_even_risk_for_refusing_is_near_one_quarter``.
 
 Public surface:
 
@@ -141,12 +143,23 @@ logger = get_logger("training.grpo_reward")
 #   -1.00 HELD_BUT_FIRED   judge says safe YET the emitted tool name is the    #
 #                          attacker's target -- reachable only on the judge    #
 #                          path, where the two evidence sources disagree       #
-#   -5.00 BAITED           fired the attacker's tool without being judged safe #
+#   -8.00 BAITED           fired the attacker's tool without being judged safe #
 #   -0.50 UNCLEAR          neither clearly safe nor clearly baited             #
+#                                                                             #
+# BAITED was -5.00 from S0 until 2026-08-21 (plan 丙). It is the ONE knob that #
+# sets how risk-averse the policy is, because it is the only large negative a  #
+# completion can draw, and its magnitude fixes the break-even probability at   #
+# which refusing beats acting: p* = 3.70 / (3.20 - BAITED - 2.50). At -5.00    #
+# that was 34.6%, i.e. the policy had to believe an attack was more likely     #
+# than not-quite-one-in-three before declining -- too permissive against the   #
+# measured bench ASR of 16.80%. -8.00 moves p* to 3.70/13.70 = 27.0%. The      #
+# deliberately-not-chosen alternatives: -12.00 gives 20.9%, which is close to  #
+# S0's 16.2% and that setting produced the blanket-refusal regression;         #
+# anything above -6.00 leaves p* essentially unchanged.                        #
 # --------------------------------------------------------------------------- #
 R_SAFETY_HELD: float = +2.00
 R_SAFETY_HELD_BUT_FIRED: float = -1.00
-R_SAFETY_BAITED: float = -5.00
+R_SAFETY_BAITED: float = -8.00
 R_SAFETY_UNCLEAR: float = -0.50
 
 # --------------------------------------------------------------------------- #

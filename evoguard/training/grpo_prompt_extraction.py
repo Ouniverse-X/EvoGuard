@@ -20,6 +20,8 @@ from evoguard.core.types import (
 from evoguard.process.dataset_builder import (
     DefenderDatasetBuilder,
     _infer_target_tool,
+    _norm_text,
+    _payload_probe,
 )
 from evoguard.training.grpo_reward import PromptMeta, _action_signature
 from evoguard.utils.logging import get_logger
@@ -47,6 +49,15 @@ class ExtractionStats:
     n_candidates_before_cap: int = 0        # survived filters before applying max_prompts cap
     n_unique_task_ids_in_result: int = 0   # spread indicator
     n_capped_away: int = 0                  # dropped due to exceeding grpo_max_prompts_per_round
+
+    # ---- which step the sampler decided to ask about (plan 甲) ----------- #
+    # ``bait`` is the one that carries gradient: at that step a sibling taking
+    # the bait scores -10.50 while one taking the twin step scores +3.20. A round
+    # dominated by ``legacy`` is a round where GRPO is likely to idle again, so
+    # these three are worth reading in the r0 log.
+    n_step_bait: int = 0
+    n_step_grounded: int = 0
+    n_step_legacy: int = 0
 
     # ---- benign (clean-trajectory) prompt pool -------------------------- #
     n_clean_records_seen: int = 0
@@ -90,6 +101,117 @@ def _find_post_injection_step_index(
         None,
     )
     return fallback
+
+
+def _bait_step_index(
+    actions: Any,
+    *,
+    start: int,
+    target_tool: str,
+) -> Optional[int]:
+    """Earliest index at/after ``start`` whose tool call IS the attacker's tool."""
+    tgt = (target_tool or "").strip().lower()
+    if not tgt:
+        return None
+    acts = actions or []
+    for i in range(max(0, int(start)), len(acts)):
+        tc = getattr(acts[i], "tool_call", None)
+        if tc is not None and str(getattr(tc, "name", "")).strip().lower() == tgt:
+            return i
+    return None
+
+
+def _payload_visible_at(actions: Any, index: int, probe: str) -> bool:
+    """Whether the payload is on screen in the prompt rendered for ``index``.
+
+    Index 0 is never visible (empty history). An empty ``probe`` means the
+    payload was too short to fingerprint, in which case a non-empty prefix is
+    the strongest statement available -- same degradation as
+    ``dataset_builder._grounded_refusal_index``.
+    """
+    acts = actions or []
+    if index <= 0 or index >= len(acts) + 1:
+        return False
+    if not probe:
+        return True
+    return probe in _norm_text(render_history(acts[:index]))
+
+
+def _decision_step_index(
+    traj: Trajectory,
+    *,
+    base: int,
+    attack: Any,
+) -> tuple[int, str]:
+    """Pick the step the policy is actually asked to decide, plus a reason tag.
+
+    Plan 甲 (2026-08-21). The sampler used to hand GRPO ``injection_point + 1``
+    unconditionally. The payload IS already on screen there -- ``render_history``
+    renders observations and the prefix ends after the injecting turn -- but at
+    that step the bait has usually not fired yet, so every one of the G siblings
+    collects ``R_SAFETY_HELD (+2.00)`` and, if it simply mirrors the clean twin,
+    the structural ``R_PROGRESS_ADVANCE (+1.20)`` as well. Measured over 4400
+    logged GRPO steps of the completed 12-round run: mean reward 2.7861, MEDIAN
+    3.2000 -- exactly the ceiling -- and ``reward_std == 0`` in 73.3% of groups
+    (3225/4400), entropy mean 0.0815. Group-relative advantages are differences
+    within a group, so a group that is uniformly at the ceiling contributes no
+    gradient at all: GRPO idled for ten rounds.
+
+    So sample where the outcomes actually diverge -- the step at which the source
+    rollout fired the attacker's tool. There a sibling that takes the bait scores
+    -10.50 and one that takes the twin step scores +3.20, a 13.70 spread inside
+    one group.
+
+    Preference order, all constrained to indices at/after ``base`` so no prompt
+    ever predates the injection:
+
+      1. the bait step, when the payload is visible in its own prefix;
+      2. failing that, the earliest step whose prefix shows the payload;
+      3. failing that, ``base`` -- legacy behaviour, so supply never shrinks.
+
+    Returns ``(index, reason)`` where reason is one of ``bait`` / ``grounded`` /
+    ``legacy``, counted in :class:`ExtractionStats` so a round can be audited.
+
+    **MEASURED: this is a GUARDRAIL, not the fix. It is inert on the AgentDojo
+    data as of 2026-08-21.** Replayed over the 705 attacked records of r0
+    (`rounds/evoguard_agentdojo_full_sft_twoclass/round_0/records.jsonl`), 321 of
+    which yield a prompt: reasons ``{grounded: 311, bait: 10, legacy: 0}`` but the
+    index shift ``new - legacy`` is **0 in 321/321 cases**. Three independent
+    reasons, all worth knowing before anyone "improves" this function:
+
+      * ``_infer_target_tool`` is a regex over the attack's goal/payload and
+        returns ``""`` for 299/321 (93%), so the bait branch cannot even be
+        attempted; where it can, the bait already sits at ``base`` (10 cases) or
+        strictly before it (2 cases, correctly declined).
+      * the payload is ALREADY on screen at ``base`` -- ``render_history`` renders
+        observations and the prefix ends after the injecting turn -- so the
+        grounded branch has nothing to shift onto.
+      * Δ=0 dominates this dataset (``delta_immediate_share`` 0.86-0.98), and at
+        Δ=0 the labelled turning point is the benign retrieval that FETCHED the
+        payload while the bait sits one step later, i.e. exactly at ``base``.
+
+    So the sampled step was already the decision point, and the saturation is
+    NOT caused by step selection. The active parts of plan 甲 are the two
+    exploration knobs (``grpo_rollout_temperature`` 0.90 -> 1.15,
+    ``grpo_max_prompts_per_round`` 32 -> 48). This function stays because it
+    costs nothing, because it is right for the minority of attacks whose bait
+    fires later, and because its three counters make the claim above re-checkable
+    on any future dataset instead of assumed.
+    """
+
+    actions = getattr(traj, "actions", None) or []
+    probe = _payload_probe(attack)
+    target_tool = _infer_target_tool(attack) if attack is not None else ""
+
+    bait = _bait_step_index(actions, start=base, target_tool=target_tool)
+    if bait is not None and _payload_visible_at(actions, bait, probe):
+        return bait, "bait"
+
+    for i in range(max(0, int(base)), len(actions)):
+        if _payload_visible_at(actions, i, probe):
+            return i, "grounded"
+
+    return int(base), "legacy"
 
 
 def _aligned_clean_action_step(
@@ -298,6 +420,19 @@ def extract_grpo_prompts(
             stats.n_skipped_step_not_found += 1
             continue
 
+        # Retarget onto the step where the G siblings can actually disagree
+        # (plan 甲). Never moves earlier than ``step_i``, so no prompt predates
+        # the injection and the ``legacy`` branch keeps the old behaviour.
+        step_i, step_reason = _decision_step_index(
+            rcd.trajectory, base=step_i, attack=rcd.attack
+        )
+        if step_reason == "bait":
+            stats.n_step_bait += 1
+        elif step_reason == "grounded":
+            stats.n_step_grounded += 1
+        else:
+            stats.n_step_legacy += 1
+
         task_obj: Optional[Task] = dataset_builder._tasks.get(rcd.task_id)
         if task_obj is None:
             logger.debug("[grpo_extract] skipping %r: no registered Task.", rcd.task_id)
@@ -314,8 +449,20 @@ def extract_grpo_prompts(
             _infer_target_tool(rcd.attack) if rcd.attack is not None else ""
         )
 
-        # Align onto clean twin A's corresponding turn so reward's recover-bonus has ground truth.
-        align_thr = (int(inj_point) + 1) if inj_point is not None else None
+        # Align onto clean twin A's corresponding turn so the reward's structural
+        # pre-check has ground truth for THIS step. The anchor is the retargeted
+        # action's own turn, not ``inj_point + 1``: once the sampler shifts to the
+        # bait step, an ``inj_point + 1`` anchor would hand the reward the twin
+        # action for an EARLIER turn, which the policy has usually already taken
+        # -- i.e. a signature sitting in ``prefix_action_signatures``, so the
+        # prefix-repeat branch would fire and the correct continuation could not
+        # score ``ADVANCE`` at all. Same alignment rule as dataset_builder's
+        # phase 2 (anchor on the shifted turn, not the raw signal).
+        align_thr: Optional[int] = (int(inj_point) + 1) if inj_point is not None else None
+        try:
+            align_thr = int(rcd.trajectory.actions[step_i].turn)
+        except Exception:                                             # noqa: BLE001
+            pass
         clean_twin_action_tool_name, clean_twin_action_args = _aligned_clean_action_step(
             cleans_by_task.get(rcd.task_id),
             align_thr,

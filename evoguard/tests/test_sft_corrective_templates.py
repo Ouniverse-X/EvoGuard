@@ -701,6 +701,202 @@ class TestTwoClassRecipe(unittest.TestCase):
         self.assertIn("corrective_refusal", kinds)
 
 
+class TestCorrectiveShareCap(unittest.TestCase):
+    """Plan 乙: detection supervision comes back, but with a bounded weight.
+
+    Two-class mode (above) removed refusal-shaped targets entirely and did fix the
+    r6 mode collapse -- bench clean-arm ``flag_rate`` 68.86% -> 0.00%,
+    ``false_alarm`` 72.37% -> 15.79% -- but it overshot: ASR 2.02% -> 16.80% and
+    recall 0.9798 -> 0.8320 while the attacker got *weaker*
+    (``mean_best_fitness`` 0.259 -> 0.203), so that is defender regression.
+
+    The collapse was caused by the WEIGHT of that supervision, not its existence:
+    one memorised opener occupied 45.7% of decoded steps and showed up in 59.6% of
+    CLEAN trajectories. So ``max_corrective_share`` bounds the fraction of rows
+    whose target is a ``corrective_refusal`` instead of deleting them.
+
+    The admission arithmetic is worth stating, because it is why a *small* corpus
+    can end up with none: each admitted B group adds one refusal row (numerator)
+    and all of its rows (denominator). With ``m`` non-B rows, 3 rows per group and
+    a bound ``s``, the number of groups that fit is ``k <= s*m / (1 - 3s)`` -- at
+    ``s = 0.12`` that is ``k <= 0.1875*m``. The bound is on the corpus, so it is
+    the clean/attack-fail rows that buy room for detection rows.
+    """
+
+    @staticmethod
+    def _capped(share: float, *, min_util: float = 0.0) -> DefenderDatasetBuilder:
+        return DefenderDatasetBuilder(
+            tasks_by_id={"t1": _task()},
+            tools_by_task={"t1": _tools()},
+            min_source_utility=min_util,
+            max_corrective_share=share,
+        )
+
+    @staticmethod
+    def _corpus(n_b: int = 10, n_c: int = 8) -> list[TrajectoryRecord]:
+        """One clean twin + ``n_c`` attack-fail rollouts + ``n_b`` successful attacks.
+
+        3 rows each, so ``n_c = 8`` gives 27 non-B rows -- enough headroom that a
+        0.12 bound admits some but not all of the B groups.
+        """
+        recs: list[TrajectoryRecord] = [_clean_record()]
+        recs += [
+            TestSourceUtilityGate._c_record(1.0, record_id=f"rec-c{i}")
+            for i in range(n_c)
+        ]
+        recs += [_attacked_record(record_id=f"rec-b{i}") for i in range(n_b)]
+        return recs
+
+    def test_default_is_a_no_op(self):
+        """0.0 must reproduce the uncapped corpus byte-for-byte, in iteration order."""
+        recs = self._corpus()
+        self.assertEqual(
+            [ex.to_llamafactory() for ex in _builder().build_sft(list(recs))],
+            [ex.to_llamafactory() for ex in self._capped(0.0).build_sft(list(recs))],
+        )
+
+    def test_uncapped_corpus_exceeds_the_bound(self):
+        """Guards the test itself: without the cap this corpus is over 0.12."""
+        b = _builder()
+        b.build_sft(self._corpus())
+        self.assertGreater(b.last_sft_stats["corrective_refusal_share"], 0.12)
+
+    def test_share_is_held_under_the_bound(self):
+        b = self._capped(0.12)
+        b.build_sft(self._corpus())
+        self.assertLessEqual(b.last_sft_stats["corrective_refusal_share"], 0.12)
+
+    def test_rejected_groups_are_counted(self):
+        b = self._capped(0.12)
+        b.build_sft(self._corpus())
+        # k <= 0.1875 * 27 = 5.06 -> 5 of the 10 groups fit.
+        self.assertEqual(b.last_sft_stats["n_corrective_refusal_rows"], 5)
+        self.assertEqual(b.last_sft_stats["b_records_dropped_over_corrective_cap"], 5)
+
+    def test_detection_vocabulary_survives(self):
+        """The point of 乙 over two-class: refusal targets must still exist."""
+        b = self._capped(0.12)
+        exs = b.build_sft(self._corpus())
+        self.assertTrue(any(ex.meta.get("kind") == "corrective_refusal" for ex in exs))
+        self.assertGreater(b.last_sft_stats["refusal_share_on_injected"], 0.0)
+
+    def test_cap_does_not_weaken_d4_grounding(self):
+        """Dropping groups must not shift a refusal onto a payload-free prompt."""
+        b = self._capped(0.12)
+        b.build_sft(self._corpus())
+        self.assertEqual(b.last_sft_stats["n_refusal_on_payload_free"], 0)
+
+    def test_a_generous_bound_admits_everything(self):
+        b = self._capped(0.5)
+        b.build_sft(self._corpus())
+        self.assertEqual(b.last_sft_stats["b_records_dropped_over_corrective_cap"], 0)
+
+    def test_a_corpus_with_no_room_admits_nothing(self):
+        """A lone B group against 3 clean rows is 1/6 = 16.7% -- over the bound.
+
+        Documented on purpose: the bound is a property of the whole corpus, so a
+        run with too few clean/attack-fail rows gets zero detection supervision
+        rather than a corpus dominated by refusals. That is the safe direction,
+        but it means the cap and ``sft_max_records_per_task`` interact -- check
+        ``n_corrective_refusal_rows`` in the r0 log rather than assuming.
+        """
+        b = self._capped(0.12)
+        exs = b.build_sft([_clean_record(), _attacked_record()])
+        self.assertEqual({ex.meta.get("kind") for ex in exs}, {"clean"})
+        self.assertEqual(b.last_sft_stats["n_corrective_refusal_rows"], 0)
+        self.assertEqual(b.last_sft_stats["b_records_dropped_over_corrective_cap"], 1)
+
+    def test_admission_is_deterministic(self):
+        recs = self._corpus()
+        first = [ex.to_llamafactory() for ex in self._capped(0.12).build_sft(list(recs))]
+        second = [ex.to_llamafactory() for ex in self._capped(0.12).build_sft(list(recs))]
+        self.assertEqual(first, second)
+
+    def test_admission_follows_record_id_not_iteration_order(self):
+        """Same records shuffled must yield the same admitted set."""
+        recs = self._corpus()
+        forward = self._capped(0.12).build_sft(list(recs))
+        reverse = self._capped(0.12).build_sft(list(reversed(recs)))
+        self.assertEqual(
+            sorted(ex.meta.get("record_id", "") for ex in forward
+                   if ex.meta.get("kind") == "corrective_refusal"),
+            sorted(ex.meta.get("record_id", "") for ex in reverse
+                   if ex.meta.get("kind") == "corrective_refusal"),
+        )
+
+    def test_negative_share_is_clamped_to_uncapped(self):
+        recs = self._corpus()
+        self.assertEqual(
+            [ex.to_llamafactory() for ex in self._capped(-1.0).build_sft(list(recs))],
+            [ex.to_llamafactory() for ex in self._capped(0.0).build_sft(list(recs))],
+        )
+
+    def test_two_class_mode_makes_the_cap_moot(self):
+        """No B rows exist to cap; the two knobs must not fight each other."""
+        b = DefenderDatasetBuilder(
+            tasks_by_id={"t1": _task()},
+            tools_by_task={"t1": _tools()},
+            min_source_utility=0.5,
+            two_class=True,
+            max_corrective_share=0.12,
+        )
+        b.build_sft(self._corpus())
+        self.assertEqual(b.last_sft_stats["n_corrective_refusal_rows"], 0)
+        self.assertEqual(b.last_sft_stats["b_records_dropped_over_corrective_cap"], 0)
+
+
+class TestPerTaskCapOutsideTwoClass(unittest.TestCase):
+    """``sft_max_records_per_task`` must keep working with ``two_class=False``.
+
+    The cap used to live inside the two-class branch, so turning two-class off --
+    which is exactly what plan 乙 does -- silently made the knob a no-op. On r0
+    that is 745 rows versus 2314, against a standing instruction that the SFT
+    corpus should be small and clean rather than large.
+    """
+
+    @staticmethod
+    def _b(cap: int) -> DefenderDatasetBuilder:
+        return DefenderDatasetBuilder(
+            tasks_by_id={"t1": _task()},
+            tools_by_task={"t1": _tools()},
+            max_records_per_task=cap,
+        )
+
+    @staticmethod
+    def _mixed() -> list[TrajectoryRecord]:
+        recs: list[TrajectoryRecord] = [_clean_record()]
+        recs += [
+            TestSourceUtilityGate._c_record(1.0, record_id=f"rec-c{i}")
+            for i in range(5)
+        ]
+        recs += [_attacked_record(record_id=f"rec-b{i}") for i in range(5)]
+        return recs
+
+    def test_cap_bounds_the_corpus(self):
+        uncapped = self._b(0).build_sft(self._mixed())
+        capped = self._b(1).build_sft(self._mixed())
+        self.assertLess(len(capped), len(uncapped))
+
+    def test_each_class_keeps_its_own_quota(self):
+        """The abundant class must not evict the scarce one.
+
+        With a single shared bucket per task, five attack-fail rollouts would
+        crowd out the successful attacks -- and B rollouts are the ONLY source of
+        detection supervision, so that silently reproduces two-class mode.
+        """
+        b = self._b(1)
+        kinds = Counter(ex.meta.get("kind") for ex in b.build_sft(self._mixed()))
+        self.assertEqual(b.last_sft_stats["records_after_cap"], 3)   # A + C + B
+        self.assertGreater(kinds["clean"], 0)
+        self.assertGreater(kinds["attacked"], 0)
+        self.assertEqual(kinds["corrective_refusal"], 1)
+
+    def test_zero_disables_the_cap(self):
+        b = self._b(0)
+        b.build_sft(self._mixed())
+        self.assertNotIn("records_after_cap", b.last_sft_stats)
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -717,6 +913,8 @@ def main() -> int:
         TestSourceUtilityGate,
         TestPromptLevelComposition,
         TestTwoClassRecipe,
+        TestCorrectiveShareCap,
+        TestPerTaskCapOutsideTwoClass,
     ):
         suite.addTests(loader.loadTestsFromTestCase(case))
     rc = unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
