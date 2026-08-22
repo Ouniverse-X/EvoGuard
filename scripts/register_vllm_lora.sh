@@ -24,6 +24,7 @@ LORA_PATH="$2"
 PORT="${3:-${EVOGUARD_VLLM_PORT:-8000}}"
 
 URL="http://127.0.0.1:${PORT}/v1/load_lora_adapter"
+UNLOAD_URL="http://127.0.0.1:${PORT}/v1/unload_lora_adapter"
 
 # Quick liveness check so we fail fast with a clear message instead of curl's
 # cryptic connection-refused stderr.
@@ -71,6 +72,21 @@ while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
             ;;
         *)
             echo "  [attempt ${ATTEMPT}] got HTTP=${HTTP_CODE} body=${BODY}" >&2
+            # vLLM rejects a duplicate lora_name with HTTP 400 "has already been
+            # loaded" and does NOT update the path, so a stale registration left
+            # by an EARLIER experiment silently pins the server to the wrong
+            # weights. driver.py treats a failed register as "keep previous
+            # adapter", which on round 1 means the bare base model -- i.e. the
+            # whole run collects rollouts from an untrained defender. Free the
+            # name and retry so this script is idempotent as documented.
+            if grep -qi 'already been loaded' <<<"$BODY"; then
+                echo "  name '${LORA_NAME}' is occupied by a stale registration; unloading it" >&2
+                curl -sS -X POST "$UNLOAD_URL" \
+                     -H 'Content-Type: application/json' \
+                     --data "$(printf '{"lora_name": "%s"}' "$LORA_NAME")" \
+                     --max-time 30 >&2 || true
+                echo "" >&2
+            fi
             # Backoff before next retry (skip backoff after final attempt).
             if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
                 BACKOFF=$((2 ** (ATTEMPT-1)))    # 1s, 2s, ...
