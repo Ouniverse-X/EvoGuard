@@ -67,6 +67,16 @@ class ExtractionStats:
     n_clean_candidates_before_cap: int = 0
     n_clean_in_result: int = 0
 
+    # ---- trajectory grouping (轨C.3) ------------------------------------ #
+    # ``n_steps_per_trajectory == 1`` is the legacy one-prompt-per-record mode.
+    # Above 1, every surviving record contributes EXACTLY that many contiguous
+    # rows sharing one ``meta.traj_group_id``, so the trainer's generation batch
+    # can be made to coincide with one trajectory.
+    n_steps_per_trajectory: int = 1
+    n_traj_groups_attacked: int = 0
+    n_traj_groups_clean: int = 0
+    n_traj_groups_padded: int = 0           # trajectory shorter than K => steps cycled
+
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
 
@@ -244,6 +254,57 @@ def _aligned_clean_action_step(
     return "", {}
 
 
+def _trajectory_step_indices(
+    n_actions: int,
+    *,
+    base: int,
+    k: int,
+) -> tuple[list[int], bool]:
+    """Pick exactly ``k`` step indices spanning one trajectory (轨C.3).
+
+    A GRPO prompt for index ``i`` renders ``actions[:i]`` and asks the policy for
+    action ``i``, so the eligible window is ``[base, n_actions - 1]``: never
+    earlier than ``base`` (which for attacked rows already sits at/after the
+    injection) and never past the last recorded action.
+
+    Returns ``(indices, padded)`` where ``indices`` has length exactly ``k`` and
+    is non-decreasing, and ``padded`` says the window was shorter than ``k`` so
+    steps had to be cycled.
+
+    Two properties are load-bearing:
+
+      * ``k == 1`` returns ``[base]``, i.e. byte-identical legacy behaviour.
+      * the LAST eligible index is always included when ``k > 1``. That index is
+        typically the step at which the source rollout produced its final answer,
+        and it is the only place where "answer now" and "call yet another tool"
+        land in the same G-sibling group. This is the whole reason the group is
+        widened to a trajectory: on the plan_abc adapter the ASR win was partly
+        bought by stalling (``clean_utility_mean`` 0.3149 -> 0.2035,
+        ``final_answer_rate`` 60.53% -> 31.14%, ``steps_mean`` 9.2 -> 11.5), and
+        stalling is rational under a per-step reward because a neutral step costs
+        only -0.15 while firing the bait costs -10.50 and "never answered" is
+        invisible. Including the terminal step prices non-termination as a DATA
+        choice rather than as a new reward term.
+    """
+    k_int = max(1, int(k))
+    lo = max(0, int(base))
+    hi = max(lo, int(n_actions) - 1)
+    if k_int == 1:
+        return [lo], False
+    window = list(range(lo, hi + 1))
+    if len(window) >= k_int:
+        step = (hi - lo) / float(k_int - 1)
+        picked = [int(round(lo + i * step)) for i in range(k_int)]
+        return picked, False
+    # Shorter than K: keep every eligible step, then cycle from the front so the
+    # row count stays an exact multiple of K (TRL's RepeatSampler drops partial
+    # chunks, and a ragged group would desynchronise every later group).
+    picked = list(window)
+    while len(picked) < k_int:
+        picked.append(window[(len(picked) - len(window)) % len(window)])
+    return picked, True
+
+
 def _prefix_action_signatures(actions: Any) -> tuple[str, ...]:
     """Signatures of the tool calls already visible in the prompt prefix.
 
@@ -266,15 +327,24 @@ def _prefix_action_signatures(actions: Any) -> tuple[str, ...]:
 # Public entry point                                                           #
 # --------------------------------------------------------------------------- #
 def _cap_with_task_diversity(
-    candidates: list[GrpoPromptRow],
+    candidates: list[Any],
     max_prompts: int,
     rng: random.Random,
-) -> tuple[list[GrpoPromptRow], int]:
+    key: Any = None,
+) -> tuple[list[Any], int]:
     """Trim ``candidates`` to ``max_prompts`` spreading slots across task_ids.
 
-    Returns ``(kept_rows, n_dropped)``. Under the cap the input list is returned
+    Returns ``(kept_items, n_dropped)``. Under the cap the input list is returned
     verbatim so ordering stays reproducible.
+
+    ``key`` maps an item to the task id used for spreading; it defaults to
+    ``item.meta.task_id`` so a plain list of :class:`GrpoPromptRow` behaves
+    exactly as before. Passing ``key=lambda group: group[0].meta.task_id`` lets
+    the same fairness logic cap trajectory GROUPS as indivisible units, which is
+    what 轨C.3 needs -- capping rows individually would slice groups apart and
+    break the "one generation batch == one trajectory" invariant.
     """
+    key_fn = key if key is not None else (lambda item: item.meta.task_id)
     if max_prompts <= 0:
         return [], len(candidates)
     if len(candidates) <= max_prompts:
@@ -282,7 +352,7 @@ def _cap_with_task_diversity(
 
     groups: dict[str, list[int]] = {}
     for ci, cand in enumerate(candidates):
-        groups.setdefault(cand.meta.task_id, []).append(ci)
+        groups.setdefault(key_fn(cand), []).append(ci)
 
     n_groups = len(groups)
     per_group_quota = max(1, math.ceil(max_prompts / max(1, n_groups)))
@@ -362,6 +432,7 @@ def extract_grpo_prompts(
     max_prompts: int = 32,
     seed: int = 0,
     clean_ratio: float = 0.0,
+    steps_per_trajectory: int = 1,
 ) -> tuple[list[GrpoPromptRow], ExtractionStats]:
     """Build GRPO-ready prompt rows from collected trajectory records.
 
@@ -382,6 +453,21 @@ def extract_grpo_prompts(
                                  attacked one, which is what gives the
                                  group-relative advantage a direction that
                                  rewards serving the user, not only blocking.
+      * ``steps_per_trajectory`` -- K, the number of steps sampled from EACH
+                                 surviving trajectory. ``1`` (default) is the
+                                 legacy one-prompt-per-record behaviour, rows
+                                 unchanged. Above 1 the returned list is a
+                                 concatenation of contiguous K-row groups, each
+                                 sharing one ``meta.traj_group_id``, ordered
+                                 attacked-groups-then-clean-groups. The trainer
+                                 relies on that contiguity: with
+                                 ``shuffle_dataset=False`` and
+                                 ``steps_per_generation = G * K`` one generation
+                                 batch is exactly one trajectory, which is what
+                                 lets a degenerate single-step group (62.8% of
+                                 all steps had ``reward_std == 0`` on the
+                                 plan_abc run) borrow a baseline from its
+                                 siblings elsewhere in the same trajectory.
 
     Returns parallel-aligned lists wrapped inside ``GrpoPromptRow`` containers plus an
     :class:`ExtractionStats` summary suitable for logging diagnostics without re-running filtering.
@@ -389,13 +475,18 @@ def extract_grpo_prompts(
 
     stats = ExtractionStats()
     rng = random.Random(seed)
+    k_steps = max(1, int(steps_per_trajectory))
+    stats.n_steps_per_trajectory = k_steps
 
     cleans_by_task: dict[str, Trajectory] = {}
     for rcd in records:
         if rcd.kind is TrajectoryKind.CLEAN:
             cleans_by_task[rcd.task_id] = rcd.trajectory
 
-    candidates: list[GrpoPromptRow] = []
+    # Each element is one trajectory's contiguous block of exactly ``k_steps``
+    # rows. With k_steps == 1 this is a list of singletons, so flattening at the
+    # end reproduces the legacy row list verbatim.
+    candidate_groups: list[list[GrpoPromptRow]] = []
 
     for rcd in records:
         if rcd.kind is not TrajectoryKind.ATTACKED:
@@ -442,49 +533,68 @@ def extract_grpo_prompts(
         tools_for_task: list[ToolSpec] = dataset_builder._tools.get(rcd.task_id, [])
         sys_str = build_system_prompt(task_obj, tools_for_task, None)
 
-        history_prefix_actions = rcd.trajectory.actions[:step_i]
-        user_text = render_history(history_prefix_actions)
-
         target_tool_name = (
             _infer_target_tool(rcd.attack) if rcd.attack is not None else ""
         )
 
-        # Align onto clean twin A's corresponding turn so the reward's structural
-        # pre-check has ground truth for THIS step. The anchor is the retargeted
-        # action's own turn, not ``inj_point + 1``: once the sampler shifts to the
-        # bait step, an ``inj_point + 1`` anchor would hand the reward the twin
-        # action for an EARLIER turn, which the policy has usually already taken
-        # -- i.e. a signature sitting in ``prefix_action_signatures``, so the
-        # prefix-repeat branch would fire and the correct continuation could not
-        # score ``ADVANCE`` at all. Same alignment rule as dataset_builder's
-        # phase 2 (anchor on the shifted turn, not the raw signal).
-        align_thr: Optional[int] = (int(inj_point) + 1) if inj_point is not None else None
-        try:
-            align_thr = int(rcd.trajectory.actions[step_i].turn)
-        except Exception:                                             # noqa: BLE001
-            pass
-        clean_twin_action_tool_name, clean_twin_action_args = _aligned_clean_action_step(
-            cleans_by_task.get(rcd.task_id),
-            align_thr,
+        step_indices, was_padded = _trajectory_step_indices(
+            len(rcd.trajectory.actions), base=step_i, k=k_steps
         )
+        if was_padded:
+            stats.n_traj_groups_padded += 1
+        group_id = f"a:{rcd.record_id}" if k_steps > 1 else ""
 
-        meta = PromptMeta(
-            task_id=str(task_obj.task_id),
-            task_instruction=(task_obj.instruction or "").strip(),
-            injection_point=inj_point,
-            turning_point=tp_point,
-            delta_normalized=delta_norm_val,
-            target_tool_name=target_tool_name.strip(),
-            clean_twin_action_tool_name=clean_twin_action_tool_name.strip(),
-            clean_twin_action_args=clean_twin_action_args,
-            prefix_action_signatures=_prefix_action_signatures(history_prefix_actions),
-        )
-        candidates.append(GrpoPromptRow(system=sys_str, user=user_text, meta=meta))
+        group_rows: list[GrpoPromptRow] = []
+        for s_idx in step_indices:
+            history_prefix_actions = rcd.trajectory.actions[:s_idx]
+            user_text = render_history(history_prefix_actions)
+
+            # Align onto clean twin A's corresponding turn so the reward's
+            # structural pre-check has ground truth for THIS step. The anchor is
+            # the sampled action's own turn, not ``inj_point + 1``: once the
+            # sampler shifts off ``inj_point + 1`` (either via the plan-甲 bait
+            # retarget or via the 轨C.3 multi-step spread), an ``inj_point + 1``
+            # anchor would hand the reward the twin action for an EARLIER turn,
+            # which the policy has usually already taken -- i.e. a signature
+            # sitting in ``prefix_action_signatures``, so the prefix-repeat
+            # branch would fire and the correct continuation could not score
+            # ``ADVANCE`` at all. Same alignment rule as dataset_builder's phase
+            # 2 (anchor on the sampled turn, not the raw signal).
+            align_thr: Optional[int] = (
+                (int(inj_point) + 1) if inj_point is not None else None
+            )
+            try:
+                align_thr = int(rcd.trajectory.actions[s_idx].turn)
+            except Exception:                                         # noqa: BLE001
+                pass
+            clean_twin_name, clean_twin_args = _aligned_clean_action_step(
+                cleans_by_task.get(rcd.task_id),
+                align_thr,
+            )
+
+            meta = PromptMeta(
+                task_id=str(task_obj.task_id),
+                task_instruction=(task_obj.instruction or "").strip(),
+                injection_point=inj_point,
+                turning_point=tp_point,
+                delta_normalized=delta_norm_val,
+                target_tool_name=target_tool_name.strip(),
+                clean_twin_action_tool_name=clean_twin_name.strip(),
+                clean_twin_action_args=clean_twin_args,
+                prefix_action_signatures=_prefix_action_signatures(
+                    history_prefix_actions
+                ),
+                traj_group_id=group_id,
+            )
+            group_rows.append(
+                GrpoPromptRow(system=sys_str, user=user_text, meta=meta)
+            )
+        candidate_groups.append(group_rows)
 
     # ------------------------------------------------------------------ #
-    # Benign pass: one prompt per usable CLEAN trajectory                 #
+    # Benign pass: K prompts per usable CLEAN trajectory                  #
     # ------------------------------------------------------------------ #
-    clean_candidates: list[GrpoPromptRow] = []
+    clean_candidate_groups: list[list[GrpoPromptRow]] = []
     if clean_ratio > 0.0:
         for rcd in records:
             if rcd.kind is not TrajectoryKind.CLEAN:
@@ -506,55 +616,94 @@ def extract_grpo_prompts(
                 stats.n_clean_skipped_no_task += 1
                 continue
             tools_c: list[ToolSpec] = dataset_builder._tools.get(rcd.task_id, [])
-            clean_next_name, clean_next_args = _clean_next_tool_call(rcd.trajectory, cut)
-            meta_c = PromptMeta(
-                task_id=str(task_obj_c.task_id),
-                task_instruction=(task_obj_c.instruction or "").strip(),
-                injection_point=None,
-                turning_point=None,
-                delta_normalized=0.0,
-                target_tool_name="",
-                clean_twin_action_tool_name=clean_next_name.strip(),
-                is_clean=True,
-                clean_twin_action_args=clean_next_args,
-                prefix_action_signatures=_prefix_action_signatures(
-                    rcd.trajectory.actions[:cut]
-                ),
-            )
-            clean_candidates.append(
-                GrpoPromptRow(
-                    system=build_system_prompt(task_obj_c, tools_c, None),
-                    user=render_history(rcd.trajectory.actions[:cut]),
-                    meta=meta_c,
-                )
-            )
+            sys_c = build_system_prompt(task_obj_c, tools_c, None)
 
-    stats.n_candidates_before_cap = len(candidates)
-    stats.n_clean_candidates_before_cap = len(clean_candidates)
+            # Legacy (K=1) keeps the midpoint cut. For K>1 spread from the FIRST
+            # step with a non-empty history through the last recorded action, so
+            # the group covers "start the task", "middle of the task" and
+            # "the task is done -- answer" instead of one interchangeable
+            # mid-task snapshot.
+            if k_steps == 1:
+                c_indices, c_padded = [cut], False
+            else:
+                c_indices, c_padded = _trajectory_step_indices(
+                    len(rcd.trajectory.actions), base=1, k=k_steps
+                )
+            if c_padded:
+                stats.n_traj_groups_padded += 1
+            group_id_c = f"c:{rcd.record_id}" if k_steps > 1 else ""
+
+            c_rows: list[GrpoPromptRow] = []
+            for s_idx in c_indices:
+                clean_next_name, clean_next_args = _clean_next_tool_call(
+                    rcd.trajectory, s_idx
+                )
+                meta_c = PromptMeta(
+                    task_id=str(task_obj_c.task_id),
+                    task_instruction=(task_obj_c.instruction or "").strip(),
+                    injection_point=None,
+                    turning_point=None,
+                    delta_normalized=0.0,
+                    target_tool_name="",
+                    clean_twin_action_tool_name=clean_next_name.strip(),
+                    is_clean=True,
+                    clean_twin_action_args=clean_next_args,
+                    prefix_action_signatures=_prefix_action_signatures(
+                        rcd.trajectory.actions[:s_idx]
+                    ),
+                    traj_group_id=group_id_c,
+                )
+                c_rows.append(
+                    GrpoPromptRow(
+                        system=sys_c,
+                        user=render_history(rcd.trajectory.actions[:s_idx]),
+                        meta=meta_c,
+                    )
+                )
+            clean_candidate_groups.append(c_rows)
+
+    stats.n_candidates_before_cap = len(candidate_groups) * k_steps
+    stats.n_clean_candidates_before_cap = len(clean_candidate_groups) * k_steps
 
     # ------------------------------------------------------------------ #
     # Two-pool budget split, each capped for inter-task diversity        #
     # ------------------------------------------------------------------ #
+    # ``max_prompts`` is a ROW budget, so with K steps per trajectory the unit of
+    # allocation is ``max_prompts // K`` groups. At K == 1 group count == row
+    # count and every number below is identical to the legacy computation.
+    max_groups = max(0, int(max_prompts) // k_steps)
+    group_key = lambda grp: grp[0].meta.task_id                       # noqa: E731
     clean_ratio_clamped = max(0.0, min(1.0, float(clean_ratio)))
     clean_budget = min(
-        int(round(max_prompts * clean_ratio_clamped)), len(clean_candidates)
+        int(round(max_groups * clean_ratio_clamped)), len(clean_candidate_groups)
     )
-    attacked_budget = max(0, max_prompts - clean_budget)
+    attacked_budget = max(0, max_groups - clean_budget)
 
-    attacked_rows, n_attacked_dropped = _cap_with_task_diversity(
-        candidates, attacked_budget, rng
+    attacked_groups, n_attacked_dropped = _cap_with_task_diversity(
+        candidate_groups, attacked_budget, rng, key=group_key
     )
     # Hand unused attacked slots back to the benign pool so the trainer still
     # sees ``max_prompts`` rows whenever total supply allows.
-    leftover = max_prompts - len(attacked_rows) - clean_budget
+    leftover = max_groups - len(attacked_groups) - clean_budget
     if leftover > 0:
-        clean_budget = min(clean_budget + leftover, len(clean_candidates))
-    clean_rows, n_clean_dropped = _cap_with_task_diversity(
-        clean_candidates, clean_budget, rng
+        clean_budget = min(clean_budget + leftover, len(clean_candidate_groups))
+    clean_groups, n_clean_dropped = _cap_with_task_diversity(
+        clean_candidate_groups, clean_budget, rng, key=group_key
     )
 
-    result_rows = attacked_rows + clean_rows
-    stats.n_capped_away = n_attacked_dropped + n_clean_dropped
+    stats.n_traj_groups_attacked = len(attacked_groups)
+    stats.n_traj_groups_clean = len(clean_groups)
+
+    # Flatten group-major so each trajectory's K rows stay CONTIGUOUS: the
+    # trainer pairs ``shuffle_dataset=False`` with ``steps_per_generation = G*K``,
+    # which makes one generation batch exactly one trajectory. Any reordering
+    # here silently breaks the trajectory pooling (it would pool across
+    # unrelated trajectories) without raising, so do not sort ``result_rows``.
+    result_rows = [row for grp in attacked_groups for row in grp]
+    clean_rows = [row for grp in clean_groups for row in grp]
+    result_rows.extend(clean_rows)
+
+    stats.n_capped_away = (n_attacked_dropped + n_clean_dropped) * k_steps
     stats.n_clean_in_result = len(clean_rows)
     stats.n_unique_task_ids_in_result = len({row.meta.task_id for row in result_rows})
     return result_rows, stats

@@ -115,6 +115,141 @@ def _apply_advantage_shaping_inplace(
 
 
 # --------------------------------------------------------------------------- #
+# Trajectory-pooled advantage baseline (轨C.3)                                  #
+# --------------------------------------------------------------------------- #
+def _traj_pooled_advantage_overrides(
+    rewards: list[float],
+    traj_ids: list[str],
+    *,
+    num_generations: int,
+    std_eps: float = 1e-4,
+    zero_std_tol: float = 1e-8,
+) -> dict[int, float]:
+    """Advantages for the completions whose OWN prompt group carries no gradient.
+
+    GRPO standardises rewards inside each block of ``num_generations`` siblings
+    drawn from one prompt (``trl/trainer/grpo_trainer.py`` ~:2020): ``A = (r -
+    mean_group) / (std_group + 1e-4)``. When all G siblings score the same the
+    numerator is identically zero, so that prompt contributes **literally no
+    gradient**. Measured over the 4400 logged GRPO steps of the plan_abc run:
+    ``reward_std == 0`` in 62.8% of steps (2762/4400), reward median 3.2000 =
+    exactly the reward ceiling. Ten rounds of training moved training-loop ASR
+    0.2255 -> 0.3546.
+
+    This function returns a REPLACEMENT advantage for exactly those positions,
+    computed against a baseline pooled over every step sampled from the same
+    trajectory (``traj_ids`` equal). Rationale: a saturated step still carries
+    information relative to its own trajectory -- "every sibling held the line
+    here, and the same policy stalled at the terminal step" is a gradient the
+    per-prompt baseline cannot express.
+
+    Deliberately a FALLBACK, not a replacement of TRL's baseline:
+
+      * positions whose prompt group has ``std > zero_std_tol`` are left
+        untouched, so wherever the local signal exists it wins unchanged;
+      * a trajectory pool that is itself degenerate yields no override, so the
+        function never manufactures signal out of a constant;
+      * a trajectory represented by a single prompt group can never be helped and
+        is skipped -- which is why ``steps_per_trajectory == 1`` makes this a
+        guaranteed no-op and reproduces legacy numerics bit-for-bit;
+      * empty / falsy ``traj_ids`` entries are treated as ungrouped and skipped.
+
+    Parameters
+    ----------
+    rewards :
+        Flat per-completion rewards, laid out as consecutive blocks of
+        ``num_generations`` siblings per prompt (TRL's ``RepeatSampler`` layout).
+    traj_ids :
+        Same length as ``rewards``; the trajectory id of each completion's prompt.
+    num_generations :
+        G. Values < 2 disable the function (no group to be degenerate about).
+
+    Returns
+    -------
+    dict[int, float]
+        Position -> new advantage, containing ONLY positions to override. Pure
+        Python and torch-free so the arithmetic is unit-testable offline.
+    """
+    g = int(num_generations or 0)
+    n = len(rewards)
+    if g < 2 or n == 0 or len(traj_ids) != n:
+        return {}
+
+    n_blocks = n // g
+    if n_blocks == 0:
+        return {}
+
+    # Per-prompt-group mean/std plus the trajectory each block belongs to.
+    block_mean: list[float] = []
+    block_std: list[float] = []
+    block_traj: list[str] = []
+    for b in range(n_blocks):
+        chunk = [float(x) for x in rewards[b * g:(b + 1) * g]]
+        mu = sum(chunk) / float(g)
+        var = sum((x - mu) ** 2 for x in chunk) / float(g)
+        block_mean.append(mu)
+        block_std.append(math.sqrt(max(0.0, var)))
+        ids = {str(traj_ids[b * g + j] or "") for j in range(g)}
+        block_traj.append(ids.pop() if len(ids) == 1 else "")
+
+    # Pool statistics per trajectory, over all its completions.
+    pool_vals: dict[str, list[float]] = {}
+    for b in range(n_blocks):
+        tid = block_traj[b]
+        if not tid:
+            continue
+        pool_vals.setdefault(tid, []).extend(
+            float(x) for x in rewards[b * g:(b + 1) * g]
+        )
+
+    pool_stats: dict[str, tuple[float, float, int]] = {}
+    for tid, vals in pool_vals.items():
+        m = sum(vals) / float(len(vals))
+        v = sum((x - m) ** 2 for x in vals) / float(len(vals))
+        pool_stats[tid] = (m, math.sqrt(max(0.0, v)), len(vals))
+
+    overrides: dict[int, float] = {}
+    for b in range(n_blocks):
+        if block_std[b] > zero_std_tol:
+            continue                       # local signal exists -> leave alone
+        tid = block_traj[b]
+        if not tid:
+            continue
+        stat = pool_stats.get(tid)
+        if stat is None:
+            continue
+        pool_mean, pool_std, pool_n = stat
+        if pool_n <= g:                    # trajectory has only this prompt group
+            continue
+        if pool_std <= zero_std_tol:       # pool is degenerate too -> no signal
+            continue
+        denom = pool_std + float(std_eps)
+        for j in range(g):
+            pos = b * g + j
+            overrides[pos] = (float(rewards[pos]) - pool_mean) / denom
+    return overrides
+
+
+def _apply_advantage_overrides_inplace(advantages_tensor, overrides: dict[int, float]):
+    """Write ``overrides`` (position -> value) into a torch advantages tensor.
+
+    No-op safe on an empty mapping so the legacy path never touches the tensor.
+    """
+    if advantages_tensor is None or not overrides:
+        return advantages_tensor
+    try:
+        total = int(getattr(advantages_tensor, "numel", lambda: 0)())
+        for pos, val in overrides.items():
+            if 0 <= int(pos) < total:
+                advantages_tensor[int(pos)] = float(val)
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(
+            "[grpo_traj_pool] failed writing pooled advantages (%s); skipping.", exc
+        )
+    return advantages_tensor
+
+
+# --------------------------------------------------------------------------- #
 # Outcome container                                                            #
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -454,7 +589,10 @@ def _build_progress_callable(progress_endpoint_url: Optional[str]) -> Optional[C
 # --------------------------------------------------------------------------- #
 # Reward function builder                                                      #
 # --------------------------------------------------------------------------- #
-def build_evoguard_reward_callable(metas_by_prompt_idx: dict[int, Any]):
+def build_evoguard_reward_callable(
+    metas_by_prompt_idx: dict[int, Any],
+    reward_trace_sink: Optional[list] = None,
+):
     """Create the actual function handed to TRL.GRPOTrainer.reward_funcs.
 
     TRL invokes reward funcs as ``(prompts, completions, **kwargs) -> list[float]``
@@ -466,6 +604,16 @@ def build_evoguard_reward_callable(metas_by_prompt_idx: dict[int, Any]):
     ----------
     metas_by_prompt_idx :
         Mapping row_idx(int) -> PromptMeta used during scoring lookups.
+    reward_trace_sink :
+        Optional single-slot list. When provided, element 0 is REPLACED on every
+        call with ``(rewards, row_indices)`` for the batch just scored. This
+        exists because TRL's ``_generate_and_score_completions`` returns only
+        ``prompt_ids/prompt_mask/completion_ids/completion_mask/advantages/
+        num_items_in_batch`` (``grpo_trainer.py`` ~:2128) -- the raw rewards are
+        consumed internally and never surfaced, so the trajectory-pooled baseline
+        below has no other way to see them. Stashing rather than recomputing
+        keeps the two views of the reward guaranteed identical (and costs no
+        extra judge calls).
     """
 
     from evoguard.training.grpo_reward import compute_evoguard_reward
@@ -563,6 +711,7 @@ def build_evoguard_reward_callable(metas_by_prompt_idx: dict[int, Any]):
         )
 
         pairs: list[tuple[str, Any]] = []
+        row_indices: list[int] = []
         for comp_txt, ri_raw in zip(completions, idxs_iter):
             # TRL 0.19 conversational format passes each completion as
             # List[dict] (e.g. [{"role":"assistant","content":"..."}]) rather
@@ -587,6 +736,7 @@ def build_evoguard_reward_callable(metas_by_prompt_idx: dict[int, Any]):
             if meta is None:
                 logger.debug("[reward_fn] unknown row_idx=%r defaulting neutral R=-0.5", ri)
             pairs.append((comp_txt, meta))
+            row_indices.append(ri)
 
         def _score_one(pair):
             comp_txt, meta = pair
@@ -613,10 +763,47 @@ def build_evoguard_reward_callable(metas_by_prompt_idx: dict[int, Any]):
                 results_floats = list(pool.map(_score_one, pairs))
         else:
             results_floats = [_score_one(p) for p in pairs]
+        if reward_trace_sink is not None:
+            # Single-slot buffer, overwritten on every call: the trainer subclass reads
+            # it immediately after super()._generate_and_score_completions()
+            # returns, so no history is needed and the memory stays O(batch).
+            try:
+                trace = (list(results_floats), list(row_indices))
+                if reward_trace_sink:
+                    reward_trace_sink[0] = trace
+                else:
+                    reward_trace_sink.append(trace)
+            except Exception:                                          # noqa: BLE001
+                pass
         return results_floats
 
     _evoguard_reward_func.__name__ = "evoguard_defense_rl_reward"
     return _evoguard_reward_func
+
+
+def _extraction_seed(training_cfg: TrainingConfig, round_label: str) -> int:
+    """Deterministic per-round seed for the prompt sampler's tie-breaking RNG.
+
+    The call site used to read ``getattr(training_cfg, "_seed_for_extraction", 0)``
+    but **nothing ever assigns that attribute** -- a repo-wide grep finds exactly
+    one occurrence, the read itself -- so every round of every run so far sampled
+    with seed 0. That is not merely cosmetic: capping is heavy (r11 discarded 484
+    of 495 attacked candidates), and with a fixed seed the RNG's tie-breaks are
+    identical each round, which biases which tasks get retried.
+
+    Precedence: an explicitly configured ``_seed_for_extraction`` still wins (so
+    a caller can pin it), otherwise the round's trailing digits are used, so r0..
+    r11 each get their own stream while a re-run of the same round reproduces.
+    """
+    explicit = getattr(training_cfg, "_seed_for_extraction", None)
+    if explicit is not None:
+        try:
+            return int(explicit)
+        except Exception:                                              # noqa: BLE001
+            pass
+    digits = "".join(ch for ch in str(round_label or "") if ch.isdigit())
+    base = int(getattr(training_cfg, "seed", 0) or 0)
+    return base * 1000 + (int(digits) if digits else 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -662,12 +849,14 @@ def train_native_grpo(
     # Build prompt extraction up-front BEFORE importing torch stack so smoke-test failures stay fast.
     from evoguard.training.grpo_prompt_extraction import extract_grpo_prompts
     max_prompts_cap = max(0, int(getattr(training_cfg, "grpo_max_prompts_per_round", 32)))
+    k_traj_steps = max(1, int(getattr(training_cfg, "grpo_traj_group_size", 1) or 1))
     prompt_rows, stats = extract_grpo_prompts(
         records=records,
         dataset_builder=dataset_builder,
         max_prompts=max_prompts_cap,
-        seed=getattr(training_cfg, "_seed_for_extraction", 0),
+        seed=_extraction_seed(training_cfg, round_label),
         clean_ratio=float(getattr(training_cfg, "grpo_clean_prompt_ratio", 0.0) or 0.0),
+        steps_per_trajectory=k_traj_steps,
     )
     n_samples = len(prompt_rows)
 
@@ -688,6 +877,7 @@ def train_native_grpo(
                 "grpo_clip_epsilon","grpo_rollout_temperature",
                 "grpo_max_prompts_per_round","grpo_learning_rate",
                 "grpo_clean_prompt_ratio","grpo_advantage_curriculum_lambda",
+                "grpo_traj_group_size",
                 ]
         },
     }
@@ -846,7 +1036,16 @@ def train_native_grpo(
             beta=beta_kl,
             use_vllm=False,             # local inference-only rollouts initially safer than external server wiring complexity;
                                         # flip to True+vllm_mode='server' later when wall-clock matters most.
-            steps_per_generation=None,
+            # 轨C.3: K>1 makes ONE generation batch cover exactly one trajectory
+            # (G siblings x K steps). Pinned together with shuffle_dataset=False
+            # because TRL's RepeatSampler with shuffle=False walks range(N) in
+            # order and chunks it by generation_batch_size//num_generations == K
+            # (trl/trainer/utils.py ~:895) -- with shuffling on, a "trajectory"
+            # batch would be K unrelated rows and the pooled baseline would be
+            # nonsense. K==1 keeps steps_per_generation=None (TRL then defaults it
+            # to gradient_accumulation_steps) and shuffling on, i.e. legacy.
+            steps_per_generation=(g_size*k_traj_steps) if k_traj_steps>1 else None,
+            shuffle_dataset=False if k_traj_steps>1 else True,
             per_device_train_batch_size=max(1,int(getattr(training_cfg,"per_device_batch_size",1))),
             gradient_accumulation_steps=max(1,int(getattr(training_cfg,"gradient_accumulation",8))),
             optim="adamw_torch_fused" if bf16_avail else "adamw_torch",
@@ -895,7 +1094,10 @@ def train_native_grpo(
         # -------------------------------------------------------------- #
         # B4 Instantiate trainer                                          #
         # -------------------------------------------------------------- #
-        reward_fn_closure=build_evoguard_reward_callable(metas_lookup_table)
+        reward_trace_sink: list = []
+        reward_fn_closure=build_evoguard_reward_callable(
+            metas_lookup_table, reward_trace_sink=reward_trace_sink
+        )
 
         diag_state={"step_counter":0,"first_rewards":[],"last_rewards":[],"kl_trace":[],
                     "delta_shaping_applied_count": 0,
@@ -922,7 +1124,18 @@ def train_native_grpo(
         cb=_DiagCallback(diag_state)
         lam_curriculum = float(getattr(training_cfg, "grpo_advantage_curriculum_lambda", 0.0) or 0.0)
         use_delta_shaping = (lam_curriculum > 0.0)
+        use_traj_pool = (k_traj_steps > 1)
+        use_adv_hook = use_delta_shaping or use_traj_pool
 
+        if use_traj_pool:
+            logger.info(
+                "[native_grpo] trajectory-pooled advantage baseline ENABLED "
+                "(K=%d steps/trajectory, steps_per_generation=%s, "
+                "shuffle_dataset=False): a prompt group whose G siblings all "
+                "score identically borrows a baseline pooled over its own "
+                "trajectory instead of contributing zero gradient.",
+                k_traj_steps, cleaned_st_args.get("steps_per_generation"),
+            )
         if use_delta_shaping:
             logger.info(
                 "[native_grpo] Δ-aware advantage shaping ENABLED with λ=%.4f "
@@ -930,39 +1143,114 @@ def train_native_grpo(
                 lam_curriculum,
             )
 
+        if use_adv_hook:
             # Local subclass overriding _generate_and_score_completions ONLY --
             # parent handles everything else unchanged keeping blast radius minimal.
             class _DeltaShapedGRPOTrainer(GRPOTrainer):                       # type: ignore[misc]
-                """Thin GRPOTrainer override injecting Δ-aware multiplicative scale onto advantages."""
+                """Thin GRPOTrainer override rewriting advantages post-scoring.
+
+                Two independent, composable interventions, in this order:
+
+                  1. trajectory POOLING -- replaces the advantage of positions
+                     whose own prompt group is degenerate (``reward_std == 0``,
+                     62.8% of steps on the plan_abc run, i.e. no gradient at all)
+                     with one standardised against that trajectory's pooled
+                     rewards. Skipped entirely when K == 1.
+                  2. Δ-aware SHAPING -- multiplies by ``(1 + λ·δ_p)``.
+
+                Pooling must run FIRST: shaping is a multiplicative curriculum on
+                whatever advantage the step ended up with, so applying it to a
+                value that pooling is about to overwrite would silently drop the
+                curriculum on exactly the pooled positions.
+                """
 
                 _EVOGUARD_LAMBDA_CURRICULUM_DEFAULT: float = 0.0       # type: ignore[assignment]
                 _EVOGUARD_METAS_LOOKUP_DEFAULT: dict = {}              # type: ignore[assignment]
 
                 def __init__(self,*args,_evoguard_lambda:float=0.0,
-                             _evoguard_metas_by_idx:Optional[dict]=None,**kwargs):
+                             _evoguard_metas_by_idx:Optional[dict]=None,
+                             _evoguard_reward_trace:Optional[list]=None,
+                             _evoguard_num_generations:int=1,
+                             _evoguard_traj_pool:bool=False,
+                             _evoguard_diag:Optional[dict]=None,**kwargs):
                     self._evoguard_lambda_val=float(_evoguard_lambda or 0.0)
                     self._evoguard_metas_lookup=_evoguard_metas_by_idx or {}
-                    self._diag_state_ref:dict[str,Any]={"delta_shaping_applied_count":0,
-                                                        "delta_shaping_mean_scale":[],
-                                                        "last_n_shaped_slots":0}
+                    self._evoguard_reward_trace=_evoguard_reward_trace
+                    self._evoguard_num_gen=max(1,int(_evoguard_num_generations or 1))
+                    self._evoguard_traj_pool=bool(_evoguard_traj_pool)
+                    # Share the caller's diag dict when given so the counters
+                    # actually reach the round log (they were write-only before).
+                    self._diag_state_ref:dict[str,Any]=(
+                        _evoguard_diag if _evoguard_diag is not None else {})
+                    for _k,_v in (("delta_shaping_applied_count",0),
+                                  ("delta_shaping_mean_scale",[]),
+                                  ("last_n_shaped_slots",0),
+                                  ("traj_pool_batches",0),
+                                  ("traj_pool_slots",0)):
+                        self._diag_state_ref.setdefault(_k,_v)
                     # Strip our private kwargs then forward normally.
                     super().__init__(*args,**kwargs)
+
+                def _evoguard_row_idxs(self,inputs)->list[Any]:
+                    row_idxs:list[Any]=[]
+                    for x in (inputs or []):
+                        ri:Any=None
+                        try:
+                            if hasattr(x,"get"): ri=x.get("row_idx")
+                        except Exception:                              # noqa: BLE001
+                            ri=None
+                        row_idxs.append(ri)
+                    return row_idxs
+
+                def _evoguard_apply_traj_pool(self,out_dict,row_idxs)->None:
+                    """Substitute pooled advantages for zero-std prompt groups."""
+                    trace=self._evoguard_reward_trace
+                    if not self._evoguard_traj_pool or not trace:
+                        return
+                    rewards_seq,traced_idxs=trace[0]
+                    # The reward closure and this hook must be looking at the SAME
+                    # batch in the SAME order; TRL shuffles only later, in
+                    # _prepare_inputs. Verify rather than assume -- a silent
+                    # misalignment would pool across unrelated trajectories.
+                    if len(rewards_seq)!=len(row_idxs):
+                        return
+                    for a,b in zip(traced_idxs,row_idxs):
+                        try:
+                            if int(a)!=int(b):
+                                return
+                        except Exception:                              # noqa: BLE001
+                            return
+                    metas_lut=self._evoguard_metas_lookup or {}
+                    traj_ids:list[str]=[]
+                    for ri in row_idxs:
+                        tid=""
+                        try:
+                            m=metas_lut.get(int(ri))
+                            tid=str(getattr(m,"traj_group_id","") or "")
+                        except Exception:                              # noqa: BLE001
+                            tid=""
+                        traj_ids.append(tid)
+                    overrides=_traj_pooled_advantage_overrides(
+                        [float(r) for r in rewards_seq],
+                        traj_ids,
+                        num_generations=self._evoguard_num_gen,
+                    )
+                    if not overrides:
+                        return
+                    _apply_advantage_overrides_inplace(out_dict.get("advantages"),overrides)
+                    self._diag_state_ref["traj_pool_batches"]+=1
+                    self._diag_state_ref["traj_pool_slots"]+=len(overrides)
 
                 def _generate_and_score_completions(self,inputs):
                     out_dict=super()._generate_and_score_completions(inputs)
                     try:
+                        if not (isinstance(out_dict,dict) and "advantages" in out_dict and inputs):
+                            return out_dict
+                        row_idxs=self._evoguard_row_idxs(inputs)
+                        self._evoguard_apply_traj_pool(out_dict,row_idxs)
                         lam=float(getattr(self,"_evoguard_lambda_val",0.0))
                         metas_lut=getattr(self,"_evoguard_metas_lookup",{}) or {}
-                        if(lam>0.0 and isinstance(out_dict,dict)
-                           and "advantages" in out_dict and inputs):
-                            row_idxs:list[Any]=[]
-                            for x in inputs:
-                                ri:Any=None
-                                try:
-                                    if hasattr(x,"get"): ri=x.get("row_idx")
-                                except Exception:                          # noqa: BLE001
-                                    ri=None
-                                row_idxs.append(ri)
+                        if lam>0.0:
                             factors=_build_per_position_delta_factors(
                                        row_idxs,metas_lut,lambda_curriculum=lam)
                             adv_tensor=out_dict.get("advantages")
@@ -997,16 +1285,20 @@ def train_native_grpo(
             processing_class=tok,
             callbacks=[cb],
         )
-        if use_delta_shaping:
-            ctor_kwargs["_evoguard_lambda"]=lam_curriculum
+        if use_adv_hook:
+            ctor_kwargs["_evoguard_lambda"]=lam_curriculum if use_delta_shaping else 0.0
             ctor_kwargs["_evoguard_metas_by_idx"]=metas_lookup_table
+            ctor_kwargs["_evoguard_reward_trace"]=reward_trace_sink
+            ctor_kwargs["_evoguard_num_generations"]=g_size
+            ctor_kwargs["_evoguard_traj_pool"]=use_traj_pool
+            ctor_kwargs["_evoguard_diag"]=diag_state
 
         try:
-            if use_delta_shaping:
+            if use_adv_hook:
                 trainer=_DeltaShapedGRPOTrainer(**ctor_kwargs)               # type: ignore[arg-type,misc]
             else:
                 clean_kwargs={k:v for k,v in ctor_kwargs.items()
-                              if k not in {"_evoguard_lambda","_evoguard_metas_by_idx"}}
+                              if not k.startswith("_evoguard_")}
                 trainer=GRPOTrainer(**clean_kwargs)
         except Exception as ctor_exc:                                       # noqa: BLE001
             logger.exception("[native_grpo] GRPOTrainer instantiation raised:%s",ctor_exc)
@@ -1046,6 +1338,16 @@ def train_native_grpo(
         kl_est=(
             sum(diag_state["kl_trace"]) / max(1,len(diag_state["kl_trace"]))
             ) if diag_state["kl_trace"] else None
+        n_pool_batches=int(diag_state.get("traj_pool_batches",0) or 0)
+        n_pool_slots=int(diag_state.get("traj_pool_slots",0) or 0)
+        if use_traj_pool:
+            # This is the intervention's only observable: zero batches means the
+            # pooling never fired (either no degenerate group, or the alignment
+            # cross-check rejected the batch) and the round is legacy GRPO.
+            logger.info(
+                "[native_grpo] trajectory pooling fired on %d generation batches "
+                "(%d completion slots re-based).", n_pool_batches, n_pool_slots,
+            )
 
         # -------------------------------------------------------------- #
         # B6 Save adapter artifacts                                       #
@@ -1072,6 +1374,10 @@ def train_native_grpo(
             "mean_reward_after":mr_after,
             "kl_estimate_avg":kl_est,
             "steps_executed":diag_state["step_counter"],
+            "traj_group_size_k":k_traj_steps,
+            "traj_pool_batches":n_pool_batches,
+            "traj_pool_slots":n_pool_slots,
+            "delta_shaping_applied_count":int(diag_state.get("delta_shaping_applied_count",0) or 0),
         })
 
         return NativeGrpoOutcome(

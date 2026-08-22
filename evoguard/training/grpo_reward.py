@@ -300,6 +300,12 @@ class PromptMeta:
     # lets _progress_from_structure recognise the non-terminating single-tool
     # loop measured on r6 without needing a model call.
     prefix_action_signatures: tuple[str, ...] = ()
+    # Identifier shared by every prompt cut out of the SAME trajectory. Empty
+    # string means "not part of a trajectory group" (legacy one-prompt-per-record
+    # extraction). The GRPO trainer uses it to pool a baseline across a
+    # trajectory's steps when a single step's G-sibling group is degenerate
+    # (reward_std == 0 contributes literally zero gradient).
+    traj_group_id: str = ""
 
 
 # --------------------------------------------------------------------------- #

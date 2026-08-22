@@ -243,6 +243,33 @@ class TrainingConfig:
     # benign prompt per attacked one.
     grpo_clean_prompt_ratio: float = 0.0
 
+    # ---- Trajectory-level grouping (轨C.3, 2026-08-22) -------------------- #
+    # K = how many steps are sampled from EACH surviving trajectory, and hence how
+    # many prompts form one trajectory group. 1 = legacy one-prompt-per-record
+    # behaviour, bit-for-bit (the pooling helper is a proven no-op at K=1).
+    #
+    # Above 1 two things change together and must stay together:
+    #   * the sampler emits K contiguous rows per trajectory sharing one
+    #     ``PromptMeta.traj_group_id``, spread evenly and always including the
+    #     LAST recorded step (usually where the source rollout answered);
+    #   * the trainer sets ``steps_per_generation = G * K`` and
+    #     ``shuffle_dataset=False`` so one generation batch is exactly one
+    #     trajectory, then substitutes a trajectory-pooled baseline for any prompt
+    #     group whose own G siblings all scored the same.
+    #
+    # Motivation, measured: on the plan_abc run 62.8% of 4400 logged steps had
+    # ``reward_std == 0`` (so contributed no gradient at all) and its bench ASR
+    # win (16.80% -> 5.47%) was partly bought with non-termination
+    # (``clean_utility_mean`` 0.3149 -> 0.2035, ``final_answer_rate`` 60.53% ->
+    # 31.14%). Stalling is rational under a per-step reward -- a neutral step
+    # costs -0.15 against -10.50 for firing the bait, and "never answered" is
+    # invisible. Putting the terminal step in the same group prices it without
+    # adding a reward term.
+    #
+    # Note ``grpo_max_prompts_per_round`` is a ROW budget, so the number of
+    # trajectories per round is ``grpo_max_prompts_per_round // K``.
+    grpo_traj_group_size: int = 1
+
     # ---- SFT dataset quality gate (item D1, 2026-08-20) ------------------- #
     # Utility below which a source trajectory is too poor to imitate.
     # 0.0 = no filtering (legacy behaviour bit-for-bit). At 0.5, a clean (A)
