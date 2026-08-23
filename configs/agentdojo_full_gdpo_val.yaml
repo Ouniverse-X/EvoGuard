@@ -1,0 +1,322 @@
+# EvoGuard experiment: AgentDojo FULL — GDPO + tighter KL leash + real val loop.
+#
+# ===========================================================================
+# THIS RUN (2026-08-23) — `gdpo_val`. Copy of configs/agentdojo_full_last_traj.yaml
+# with a DIFFERENT `name`, so rounds/evoguard_agentdojo_full_last_traj/ stays
+# intact. THREE things change, and the user explicitly chose to test them
+# TOGETHER in one run, accepting that a regression cannot be attributed:
+#
+#   1. grpo_gdpo:            (new) false -> true
+#   2. grpo_beta:            0.01  -> 0.05
+#   3. validate_every_round: (new) false -> true, on a NEW val split
+#
+# ---------------------------------------------------------------------------
+# 1. GDPO — per-reward advantage normalisation. NOT a new reward term.
+# ---------------------------------------------------------------------------
+# The reward is unchanged: R = r_safety + r_progress - p_drift, three terms, and
+# the standing instruction is that it must get SIMPLER, not longer. What changes
+# is the ORDER of summing and normalising. GRPO sums the three terms and
+# standardises the scalar total inside each group of G=8 siblings; GDPO (NVlabs,
+# ICML 2026, arXiv:2601.05242) standardises each term inside the group first,
+# sums the per-term advantages, then rescales batch-wise so the magnitude does
+# not grow with the term count.
+#
+# Why here: the three terms live on very different scales -- r_safety spans 10
+# points ({+2.00, -1.00, -8.00, -0.50}), r_progress 3.7 ({+1.20, -0.15, -2.50}),
+# p_drift 0.5 ({0, 0.25, 0.50}). Summing first lets r_safety set the group std
+# almost by itself, so a group that agrees about the bait but disagrees about
+# progress gets a near-degenerate signal, and a group that agrees on the total
+# gets exactly zero. Measured on the trainer's own logs: `reward_std == 0` in
+# 73.3% of plan_abc's predecessor steps, 62.8% of plan_abc's 4400 steps, and
+# still 20.5-50% per round under last_traj. A zero-std group contributes
+# literally no gradient. Under GDPO a term the group agrees on contributes
+# exactly 0 without flattening the terms it disagrees on.
+#
+# DISCLOSURE. The paper's exact equations could NOT be retrieved from this host
+# (no outbound route to arxiv: WebFetch timed out five times, curl returns
+# HTTP 000). native_grpo_runner._gdpo_advantages is a derivation from the
+# published description -- "group-wise normalization per reward and then
+# batch-wise advantage normalization to preserve a stable numerical range
+# independent of reward count" -- and its properties are locked by the 37 tests
+# in evoguard/tests/test_gdpo_advantages.py, including the honest negative that
+# at G=2 a two-way tie in the TOTAL still cancels. That last point is why
+# trajectory pooling (K=2 below) is retained behind GDPO rather than replaced by
+# it: pooling keys off the scalar total's group std and still catches groups GDPO
+# leaves flat. Intervention order in the trainer is GDPO -> pooling -> Δ shaping.
+#
+# ---------------------------------------------------------------------------
+# 2. grpo_beta 0.01 -> 0.05 — a shorter KL leash.
+# ---------------------------------------------------------------------------
+# Motivated by measured FORGETTING, not by theory. Per-task zero-ASR counts over
+# plan_abc's 12 rounds: 4/47 at r0, 31/47 at r5, 18/47 at r11 -- between r5 and
+# r11 the defender LOST 13 tasks it had already solved. Over last_traj's 12
+# rounds the per-task breach pattern never converged either: mode 6/12 and 8/12
+# rounds breached, 0 tasks clean in all 12, 0 tasks breached in all 12, with
+# +5..18 / -8..15 zero-ASR tasks churning every round. That is a co-evolutionary
+# CYCLE. beta=0.05 is the reference-policy anchor; 0.04 is TRL's own default and
+# every EvoGuard run so far sat below it at 0.01.
+#
+# ---------------------------------------------------------------------------
+# 3. A real validation loop — fixing a defect, not adding a feature.
+# ---------------------------------------------------------------------------
+# `patience_rounds` / `asr_threshold` were documented as early-stopping on a
+# held-out set, but `_val_tasks` was assigned and never read and
+# `Pipeline.run_validation` did not exist, so the termination state machine has
+# always been fed TRAINING-set ASR -- which correlates with attacker strength
+# (rho(ASR, mean_best_fitness) = +0.61) rather than with defender quality.
+#
+# Now `validate_every_round: true` runs the FULL tool-executing replay
+# (evoguard/eval/vendored_replay.py, the only harness that actually calls
+# env.execute) on the val split against the round's own adapter, appends the
+# summary to <exp>/val_metrics.jsonl, and feeds val ASR into
+# update_termination_state. A val failure degrades to training ASR with a
+# WARNING rather than killing the run.
+#
+# The val split is NEW (2026-08-23) and was carved out of train, never out of
+# test: `python -m evoguard.process.split_toolsafe --carve-val` moved whole
+# instructions from train/ into val/ and a sha256 guard proves test/ is
+# byte-identical, so every held-out number already on record stays comparable.
+#     banking 4/1/1   slack 4/1/1   travel 4/1/1   workspace 25/7/8
+#     = 37 train / 10 val / 11 test   (was 47 train / 11 test)
+# Training therefore sees 37 tasks this run instead of 47 -- that is the price of
+# an honest early-stopping signal, and it is stated here rather than buried.
+#
+# COST: val is 88 distinct injection scenarios over 10 tasks (more scenarios than
+# test's 53 over 11 tasks, since the carve took the heavily-probed workspace
+# tasks). Measured base-model reference, concurrency 10, 98 records: 74.7 s
+# wall, ASR 7.95%, f1 0.9474, acc 0.9082, precision 0.9759, recall 0.9205,
+# clean_completion 0.78. At concurrency 8 budget ~2-3 min/round, ~30 min over 12
+# rounds, under 5% of an ~11 h run.
+#
+# ---------------------------------------------------------------------------
+# EXPECTED COST. ~11 h, unchanged. native_max_steps_per_round=400 binds, so
+# total completions = 400 x per_device_batch_size x gradient_accumulation = 3200
+# regardless of the prompt budget (last_traj measured fit() 9h37m of an 11h20m
+# wall clock). Neither GDPO nor beta changes the step count; GDPO is a few
+# hundred float operations per generation batch.
+#
+# ACCEPTANCE. Held-out FULL replay on data/toolsafe/agentdojo-tragjnew/test via
+# scripts/run_replay_heldout.sh, evaluating SEVERAL candidate rounds -- not just
+# the last, since r11 > r5 on replay while r5 > r11 on training metrics in BOTH
+# prior runs. Beat plan_abc_r11's ASR 2.52% / f1 0.9718 / clean utility_mean
+# 0.8364 WITHOUT losing poison-delivery: plan_abc_r11 delivered the payload in
+# only 48.4% of attacked replays, so its ASR|delivered is 5.10%, and more than
+# half its true positives are AVOIDANCE (routing around the poisoned tool)
+# rather than resistance. Report poison_delivered_rate and asr_given_delivered
+# next to ASR, and report BOTH arms, always.
+#
+# Do NOT diagnose termination or clean utility from bench_base: its "full
+# rollout" appends observation: "" at every step, so its steps_mean ~12 is the
+# model talking to itself. That harness produced the retracted "plan_abc stalls"
+# reading.
+#
+# LAUNCH MUST EXPORT (scripts/run_grpo_experiment.sh sets none of these):
+#   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds
+#   EVOGUARD_JUDGE_LLM_BASE_URL=http://127.0.0.1:8003/v1
+#   EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8003/v1
+# Confirm the log shows `[native_grpo][reward_fn] progress judge active at ...`,
+# `[native_grpo] GDPO ENABLED`, `[prewarm] ... (total=20 entries)`, and no
+# WARNING naming either judge env var.
+#
+# GPU / endpoint layout on this box:
+#   GPU 0,1 -> primary defender vLLM  :8000  (TP=2, --enable-lora, hot-reload)
+#   GPU 2,3 -> helper vLLM            :8002  (TP=2, tool_executor)
+#   GPU 5,6 -> helper vLLM            :8003  (TP=2, judge + utility_judge)
+#   GPU 4   -> native SFT/GRPO trainer (single-GPU; no DDP in native_runner)
+#   GPU 7   -> spare headroom
+#
+# Everything below this line is inherited from configs/agentdojo_full_last_traj.yaml
+# and its rationale still applies; read that file's header for 甲/乙/丙, the K=2
+# trajectory-group derivation, and the SFT corpus recipe.
+# ===========================================================================
+
+name: evoguard_agentdojo_full_gdpo_val
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2
+    base_url: null
+    api_key: null
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    # Backstop only. The real defence against the gateway's 60 rpm quota is the
+    # process-wide send pacer in QianFanClient (EVOGUARD_QIANFAN_MAX_RPM, set to
+    # 55 by scripts/run_grpo_experiment.sh).
+    max_retries: 8
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+  mcts_failure_credit_eps: 0.03
+  mcts_tau_window_size: 8
+
+env:
+  dataset: agentdojo_split
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  # Not binding: the tree holds 58 distinct instructions (37 train + 10 val +
+  # 11 test). AgentDojoSplitEnv loads all three subdirs and tags each task with
+  # metadata["split"]; driver._split_train_val then trains on `train` and
+  # validates on `val`.
+  max_tasks: 100
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /root/yangxiao/models/downloads/qwen2.5-7b-instruct
+
+  method: sft_then_native_grpo
+
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+
+  # SFT recipe unchanged from last_traj (D1 + D4 + share-capped corrective,
+  # plan 乙). Two invariants to grep the r0 log for:
+  #   n_refusal_on_payload_free == 0
+  #   corrective_refusal_share <= 0.12
+  # Note the corpus will be SMALLER than last_traj's measured 1176 rows simply
+  # because r0 now rolls out 37 training tasks instead of 47.
+  sft_min_source_utility: 0.5
+  sft_two_class: false
+  sft_max_records_per_task: 4
+  sft_max_corrective_share: 0.12
+
+  grpo_learning_rate: 2.0e-6
+  # 0.01 -> 0.05. See change (2) in the header: plan_abc lost 13 of the 31 tasks
+  # it had driven to zero ASR by r5 by the time it reached r11, and last_traj's
+  # per-task breach pattern cycled for all 12 rounds without converging. TRL's
+  # own default is 0.04; every EvoGuard run so far sat at 0.01.
+  grpo_beta: 0.05
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 1.15
+  # ROW budget; rows come K=2 at a time, so 160/2 = 80 trajectories per round
+  # (60 attacked + 20 clean). NOT a cost knob: native_max_steps_per_round=400
+  # caps total completions at 400 x 1 x 8 = 3200 either way.
+  grpo_max_prompts_per_round: 160
+  grpo_min_new_successes: 3
+  grpo_clean_prompt_ratio: 0.25
+  grpo_traj_group_size: 2
+  grpo_advantage_curriculum_lambda: 1.5
+
+  # NEW. Standardise each of the three reward terms inside its own group of
+  # G=8 siblings, sum the per-term advantages, then rescale batch-wise. A
+  # normalisation change, not a reward term -- R is still
+  # r_safety + r_progress - p_drift. Aimed at the measured zero-gradient
+  # saturation (reward_std == 0 in 62.8% of plan_abc's steps). Default is false,
+  # which reproduces legacy GRPO bit-for-bit, so every historical run is
+  # unaffected. Implementation derived from the paper's published description;
+  # see the DISCLOSURE paragraph in the header.
+  grpo_gdpo: true
+
+  # Keep bs=1/accum=8 even on 80GB cards: TRL counts per_device_train_batch_size
+  # in *completions*, and run 20260816_233727 OOM'd at bs=2 on an r3 GRPO
+  # backward with 74.38 GiB allocated. eff_batch stays 8, which must remain
+  # divisible by grpo_group_size_g=8.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  # Dedicated trainer GPU. native_runner has no DDP/sharding, so exactly one.
+  cuda_visible_devices: "4"
+  native_max_steps_per_round: 400
+
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  # Inert here: the env declares metadata["split"], which
+  # driver._split_train_val prefers. Retained as the flat-dataset fallback.
+  validation_fraction: 0.15
+
+  # NEW. Run the full tool-executing replay on the val split after every round
+  # and feed ITS ASR into the termination state machine, instead of the training
+  # ASR that patience_rounds/asr_threshold have silently been reading all along.
+  # ~2-3 min/round at concurrency 8 (88 scenarios / 10 tasks; the base model
+  # reference is ASR 7.95%, f1 0.9474). A replay failure degrades to training ASR
+  # with a WARNING rather than aborting the round.
+  validate_every_round: true
+  val_dataset_dir: data/toolsafe/agentdojo-tragjnew/val
+  val_split: val
+  val_concurrency: 8
+
+  # task_concurrency sizes three pools: the outer per-task rollout fan-out, the
+  # phase-0 MCTS population precompute pool and the post-round evolve pool.
+  # attack_concurrency is the inner per-population fan-out.
+  task_concurrency: 12
+  attack_concurrency: 16
+
+evo_data_subdir: "agentdojo"

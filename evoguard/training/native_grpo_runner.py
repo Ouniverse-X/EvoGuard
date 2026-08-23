@@ -230,6 +230,145 @@ def _traj_pooled_advantage_overrides(
     return overrides
 
 
+# --------------------------------------------------------------------------- #
+# GDPO: group reward-Decoupled normalization                                    #
+# --------------------------------------------------------------------------- #
+def _gdpo_advantages(
+    components: list[tuple[float, ...]],
+    *,
+    num_generations: int,
+    std_eps: float = 1e-4,
+    zero_std_tol: float = 1e-8,
+    batch_normalize: bool = True,
+) -> list[float]:
+    """GDPO advantages: normalise each reward term inside its group, then sum.
+
+    GRPO sums the reward terms *first* and standardises the scalar total inside
+    each group of ``num_generations`` siblings. GDPO (NVlabs, ICML 2026,
+    arXiv:2601.05242) inverts the order -- it normalises **each reward
+    independently** within the group and then sums the per-reward advantages,
+    finally rescaling batch-wise so the numeric range does not grow with the
+    number of rewards.
+
+    Why this matters for EvoGuard specifically: the three terms live on wildly
+    different scales. ``r_safety`` spans 10 points ({+2.00, −1.00, −8.00,
+    −0.50}), ``r_progress`` spans 3.7 ({+1.20, −0.15, −2.50}), and ``p_drift``
+    spans 0.5 ({0, 0.25, 0.50}). Summing first lets ``r_safety`` set the group
+    std almost by itself, so a group that agrees on safety but disagrees on
+    progress gets a near-degenerate signal -- and when it agrees on all of the
+    total, exactly zero (measured: ``reward_std == 0`` in 62.8-73.3% of steps).
+    Normalising per reward keeps each term's disagreement at unit scale, so
+    progress can still steer a group that already agrees about the bait.
+
+    Note this is a *normalisation* change, not a new reward term -- the reward
+    stays the same three components (``R = r_safety + r_progress − p_drift``).
+
+    Parameters
+    ----------
+    components :
+        One tuple per completion, laid out as consecutive blocks of
+        ``num_generations`` siblings per prompt (TRL's ``RepeatSampler``
+        layout). Every tuple must have the same arity K >= 1, and the tuples are
+        expected to be SIGNED contributions that sum to the scalar reward (so
+        ``p_drift`` enters as ``-p_drift``).
+    num_generations :
+        G. Values < 2 disable the function -- a group of one has no spread to
+        normalise against.
+    batch_normalize :
+        Apply the second, batch-wise standardisation. Since each per-reward
+        advantage has exactly zero mean inside its own group, the batch mean is
+        already ~0, so in practice this is a rescale by ``1/std_batch``: it is
+        what keeps the advantage magnitude independent of K.
+
+    Returns
+    -------
+    list[float]
+        Replacement advantage per completion, length ``(len(components) // G) *
+        G``, or ``[]`` when the inputs are unusable (which the caller must treat
+        as "leave TRL's advantages alone").
+    """
+    g = int(num_generations or 0)
+    n = len(components)
+    if g < 2 or n == 0:
+        return []
+    n_blocks = n // g
+    if n_blocks == 0:
+        return []
+    k_terms = len(components[0]) if components[0] is not None else 0
+    if k_terms < 1:
+        return []
+    used = n_blocks * g
+    for row in components[:used]:
+        if row is None or len(row) != k_terms:
+            return []
+
+    out = [0.0] * used
+    for b in range(n_blocks):
+        lo = b * g
+        for k in range(k_terms):
+            chunk = [float(components[lo + j][k]) for j in range(g)]
+            mu = sum(chunk) / float(g)
+            var = sum((x - mu) ** 2 for x in chunk) / float(g)
+            sd = math.sqrt(max(0.0, var))
+            if sd <= zero_std_tol:
+                # This term is unanimous in this group: it carries no
+                # information here, so it contributes nothing -- and crucially
+                # it does not drag the other terms' scale down either.
+                continue
+            denom = sd + float(std_eps)
+            for j in range(g):
+                out[lo + j] += (chunk[j] - mu) / denom
+
+    if batch_normalize:
+        bm = sum(out) / float(used)
+        bvar = sum((x - bm) ** 2 for x in out) / float(used)
+        bsd = math.sqrt(max(0.0, bvar))
+        if bsd > zero_std_tol:
+            bdenom = bsd + float(std_eps)
+            out = [(x - bm) / bdenom for x in out]
+    return out
+
+
+def _aligned_trace_view(trace, row_idxs) -> tuple[Optional[list], Optional[list]]:
+    """Validated ``(rewards, components)`` from the reward closure's trace slot.
+
+    Returns ``(None, None)`` unless the stashed trace lines up positionally with
+    ``row_idxs``. The reward function and the trainer hook must be looking at the
+    SAME batch in the SAME order -- TRL shuffles only later, in
+    ``_prepare_inputs`` -- and a silent misalignment would pool or normalise
+    across unrelated prompts, so verify rather than assume.
+
+    ``components`` is ``None`` on an older two-element trace, which callers must
+    treat as "GDPO cannot run on this batch". The trace is INDEXED rather than
+    unpacked precisely so widening it again cannot break this.
+    """
+    if not trace:
+        return (None, None)
+    entry = trace[0]
+    try:
+        rewards_seq = list(entry[0])
+        traced_idxs = list(entry[1])
+    except Exception:                                               # noqa: BLE001
+        return (None, None)
+    comps: Optional[list] = None
+    try:
+        if len(entry) > 2 and entry[2] is not None:
+            comps = list(entry[2])
+    except Exception:                                               # noqa: BLE001
+        comps = None
+    if len(rewards_seq) != len(row_idxs):
+        return (None, None)
+    for a, b in zip(traced_idxs, row_idxs):
+        try:
+            if int(a) != int(b):
+                return (None, None)
+        except Exception:                                           # noqa: BLE001
+            return (None, None)
+    if comps is not None and len(comps) != len(rewards_seq):
+        comps = None
+    return (rewards_seq, comps)
+
+
 def _apply_advantage_overrides_inplace(advantages_tensor, overrides: dict[int, float]):
     """Write ``overrides`` (position -> value) into a torch advantages tensor.
 
@@ -606,14 +745,19 @@ def build_evoguard_reward_callable(
         Mapping row_idx(int) -> PromptMeta used during scoring lookups.
     reward_trace_sink :
         Optional single-slot list. When provided, element 0 is REPLACED on every
-        call with ``(rewards, row_indices)`` for the batch just scored. This
+        call with ``(rewards, row_indices, components)`` for the batch just
+        scored, where ``components[i]`` is the SIGNED per-term tuple
+        ``(r_safety, r_progress, -p_drift)`` summing to ``rewards[i]``. This
         exists because TRL's ``_generate_and_score_completions`` returns only
         ``prompt_ids/prompt_mask/completion_ids/completion_mask/advantages/
         num_items_in_batch`` (``grpo_trainer.py`` ~:2128) -- the raw rewards are
         consumed internally and never surfaced, so the trajectory-pooled baseline
-        below has no other way to see them. Stashing rather than recomputing
-        keeps the two views of the reward guaranteed identical (and costs no
-        extra judge calls).
+        below has no other way to see them, and GDPO additionally needs the
+        pre-sum decomposition that never leaves the reward function at all.
+        Stashing rather than recomputing keeps the views of the reward guaranteed
+        identical (and costs no extra judge calls). Consumers must INDEX the
+        tuple rather than unpack it, so widening it again stays backwards
+        compatible.
     """
 
     from evoguard.training.grpo_reward import compute_evoguard_reward
@@ -739,16 +883,32 @@ def build_evoguard_reward_callable(
             row_indices.append(ri)
 
         def _score_one(pair):
+            """Score one completion -> ``(total, signed_components)``.
+
+            The components are the SIGNED per-term contributions in a fixed
+            order ``(r_safety, r_progress, -p_drift)``, so ``sum(components)``
+            equals ``total`` by construction. Only GDPO reads them; TRL still
+            sees nothing but the scalar total, which keeps the legacy path
+            bit-identical. ``p_drift`` is stored on the breakdown as a positive
+            magnitude and SUBTRACTED inside ``total``, hence the negation here --
+            GDPO normalises each term independently and must therefore be handed
+            contributions that already carry their sign.
+            """
             comp_txt, meta = pair
             if meta is None:
-                return -0.5
+                # Unknown row: the historical neutral default. Expressed as a
+                # single-term-carrying tuple so the sum invariant still holds.
+                return (-0.5, (-0.5, 0.0, 0.0))
             bd = compute_evoguard_reward(
                 completion_text=comp_txt,
                 meta=meta,
                 judge_call=effective_jcb,
                 progress_call=effective_pcb,
             )
-            return float(bd.total)
+            return (
+                float(bd.total),
+                (float(bd.r_safety), float(bd.r_progress), -float(bd.p_drift)),
+            )
 
         # With both judges live, scoring costs TWO HTTP round-trips per
         # completion -- serially that is minutes per optimizer step. The judge
@@ -760,15 +920,17 @@ def build_evoguard_reward_callable(
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=min(n_workers, len(pairs))) as pool:
-                results_floats = list(pool.map(_score_one, pairs))
+                scored = list(pool.map(_score_one, pairs))
         else:
-            results_floats = [_score_one(p) for p in pairs]
+            scored = [_score_one(p) for p in pairs]
+        results_floats = [float(t) for t, _c in scored]
+        components = [tuple(c) for _t, c in scored]
         if reward_trace_sink is not None:
             # Single-slot buffer, overwritten on every call: the trainer subclass reads
             # it immediately after super()._generate_and_score_completions()
             # returns, so no history is needed and the memory stays O(batch).
             try:
-                trace = (list(results_floats), list(row_indices))
+                trace = (list(results_floats), list(row_indices), list(components))
                 if reward_trace_sink:
                     reward_trace_sink[0] = trace
                 else:
@@ -1125,7 +1287,19 @@ def train_native_grpo(
         lam_curriculum = float(getattr(training_cfg, "grpo_advantage_curriculum_lambda", 0.0) or 0.0)
         use_delta_shaping = (lam_curriculum > 0.0)
         use_traj_pool = (k_traj_steps > 1)
-        use_adv_hook = use_delta_shaping or use_traj_pool
+        use_gdpo = bool(getattr(training_cfg, "grpo_gdpo", False))
+        use_adv_hook = use_delta_shaping or use_traj_pool or use_gdpo
+
+        if use_gdpo:
+            logger.info(
+                "[native_grpo] GDPO ENABLED: each of the three reward terms "
+                "(r_safety, r_progress, -p_drift) is standardised inside its own "
+                "group of G=%d siblings and the per-term advantages are then "
+                "summed and rescaled batch-wise, instead of GRPO's "
+                "sum-then-standardise. A term the group agrees on contributes "
+                "exactly 0 without flattening the terms it disagrees on.",
+                g_size,
+            )
 
         if use_traj_pool:
             logger.info(
@@ -1149,8 +1323,12 @@ def train_native_grpo(
             class _DeltaShapedGRPOTrainer(GRPOTrainer):                       # type: ignore[misc]
                 """Thin GRPOTrainer override rewriting advantages post-scoring.
 
-                Two independent, composable interventions, in this order:
+                Three independent, composable interventions, in this order:
 
+                  0. GDPO -- recomputes the ENTIRE advantage vector by
+                     standardising each reward term inside its group and summing
+                     the per-term advantages (see :func:`_gdpo_advantages`).
+                     Skipped unless ``grpo_gdpo`` is set.
                   1. trajectory POOLING -- replaces the advantage of positions
                      whose own prompt group is degenerate (``reward_std == 0``,
                      62.8% of steps on the plan_abc run, i.e. no gradient at all)
@@ -1158,10 +1336,16 @@ def train_native_grpo(
                      rewards. Skipped entirely when K == 1.
                   2. Δ-aware SHAPING -- multiplies by ``(1 + λ·δ_p)``.
 
-                Pooling must run FIRST: shaping is a multiplicative curriculum on
-                whatever advantage the step ended up with, so applying it to a
-                value that pooling is about to overwrite would silently drop the
-                curriculum on exactly the pooled positions.
+                The order is load-bearing in both places. GDPO must run FIRST
+                because it overwrites the whole vector, so anything applied
+                before it is discarded; it also leaves fewer groups degenerate,
+                which makes pooling the narrower fallback it is meant to be
+                (pooling still keys off the SCALAR total's group std, so it can
+                still fire on a group where all three terms are unanimous).
+                Pooling must in turn precede shaping: shaping is a multiplicative
+                curriculum on whatever advantage the step ended up with, so
+                applying it to a value that pooling is about to overwrite would
+                silently drop the curriculum on exactly the pooled positions.
                 """
 
                 _EVOGUARD_LAMBDA_CURRICULUM_DEFAULT: float = 0.0       # type: ignore[assignment]
@@ -1172,12 +1356,14 @@ def train_native_grpo(
                              _evoguard_reward_trace:Optional[list]=None,
                              _evoguard_num_generations:int=1,
                              _evoguard_traj_pool:bool=False,
+                             _evoguard_gdpo:bool=False,
                              _evoguard_diag:Optional[dict]=None,**kwargs):
                     self._evoguard_lambda_val=float(_evoguard_lambda or 0.0)
                     self._evoguard_metas_lookup=_evoguard_metas_by_idx or {}
                     self._evoguard_reward_trace=_evoguard_reward_trace
                     self._evoguard_num_gen=max(1,int(_evoguard_num_generations or 1))
                     self._evoguard_traj_pool=bool(_evoguard_traj_pool)
+                    self._evoguard_gdpo=bool(_evoguard_gdpo)
                     # Share the caller's diag dict when given so the counters
                     # actually reach the round log (they were write-only before).
                     self._diag_state_ref:dict[str,Any]=(
@@ -1186,7 +1372,9 @@ def train_native_grpo(
                                   ("delta_shaping_mean_scale",[]),
                                   ("last_n_shaped_slots",0),
                                   ("traj_pool_batches",0),
-                                  ("traj_pool_slots",0)):
+                                  ("traj_pool_slots",0),
+                                  ("gdpo_batches",0),
+                                  ("gdpo_slots",0)):
                         self._diag_state_ref.setdefault(_k,_v)
                     # Strip our private kwargs then forward normally.
                     super().__init__(*args,**kwargs)
@@ -1202,24 +1390,44 @@ def train_native_grpo(
                         row_idxs.append(ri)
                     return row_idxs
 
+                def _evoguard_trace_view(self,row_idxs):
+                    """Alignment-checked ``(rewards, components)`` for this batch.
+
+                    Thin delegation to the module-level, unit-tested
+                    :func:`_aligned_trace_view`.
+                    """
+                    return _aligned_trace_view(self._evoguard_reward_trace,row_idxs)
+
+                def _evoguard_apply_gdpo(self,out_dict,row_idxs)->None:
+                    """Replace TRL's advantages with GDPO's per-reward ones.
+
+                    Runs FIRST of the three interventions because it rewrites the
+                    whole vector; pooling then acts as a fallback for groups that
+                    GDPO still leaves degenerate (all three terms unanimous), and
+                    Δ shaping multiplies whatever survives.
+                    """
+                    if not self._evoguard_gdpo:
+                        return
+                    _rewards,comps=self._evoguard_trace_view(row_idxs)
+                    if not comps:
+                        return
+                    adv=_gdpo_advantages(
+                        comps,num_generations=self._evoguard_num_gen)
+                    if not adv:
+                        return
+                    _apply_advantage_overrides_inplace(
+                        out_dict.get("advantages"),
+                        {i:v for i,v in enumerate(adv)})
+                    self._diag_state_ref["gdpo_batches"]+=1
+                    self._diag_state_ref["gdpo_slots"]+=len(adv)
+
                 def _evoguard_apply_traj_pool(self,out_dict,row_idxs)->None:
                     """Substitute pooled advantages for zero-std prompt groups."""
-                    trace=self._evoguard_reward_trace
-                    if not self._evoguard_traj_pool or not trace:
+                    if not self._evoguard_traj_pool:
                         return
-                    rewards_seq,traced_idxs=trace[0]
-                    # The reward closure and this hook must be looking at the SAME
-                    # batch in the SAME order; TRL shuffles only later, in
-                    # _prepare_inputs. Verify rather than assume -- a silent
-                    # misalignment would pool across unrelated trajectories.
-                    if len(rewards_seq)!=len(row_idxs):
+                    rewards_seq,_comps=self._evoguard_trace_view(row_idxs)
+                    if not rewards_seq:
                         return
-                    for a,b in zip(traced_idxs,row_idxs):
-                        try:
-                            if int(a)!=int(b):
-                                return
-                        except Exception:                              # noqa: BLE001
-                            return
                     metas_lut=self._evoguard_metas_lookup or {}
                     traj_ids:list[str]=[]
                     for ri in row_idxs:
@@ -1247,6 +1455,7 @@ def train_native_grpo(
                         if not (isinstance(out_dict,dict) and "advantages" in out_dict and inputs):
                             return out_dict
                         row_idxs=self._evoguard_row_idxs(inputs)
+                        self._evoguard_apply_gdpo(out_dict,row_idxs)
                         self._evoguard_apply_traj_pool(out_dict,row_idxs)
                         lam=float(getattr(self,"_evoguard_lambda_val",0.0))
                         metas_lut=getattr(self,"_evoguard_metas_lookup",{}) or {}
@@ -1291,6 +1500,7 @@ def train_native_grpo(
             ctor_kwargs["_evoguard_reward_trace"]=reward_trace_sink
             ctor_kwargs["_evoguard_num_generations"]=g_size
             ctor_kwargs["_evoguard_traj_pool"]=use_traj_pool
+            ctor_kwargs["_evoguard_gdpo"]=use_gdpo
             ctor_kwargs["_evoguard_diag"]=diag_state
 
         try:
@@ -1347,6 +1557,17 @@ def train_native_grpo(
             logger.info(
                 "[native_grpo] trajectory pooling fired on %d generation batches "
                 "(%d completion slots re-based).", n_pool_batches, n_pool_slots,
+            )
+        if use_gdpo:
+            # Same reasoning as above: zero batches means GDPO never actually
+            # replaced an advantage (missing components in the trace, or the
+            # alignment cross-check rejected every batch) and the round ran
+            # legacy GRPO despite the flag.
+            logger.info(
+                "[native_grpo] GDPO fired on %d generation batches "
+                "(%d completion slots re-normalised).",
+                int(diag_state.get("gdpo_batches",0) or 0),
+                int(diag_state.get("gdpo_slots",0) or 0),
             )
 
         # -------------------------------------------------------------- #

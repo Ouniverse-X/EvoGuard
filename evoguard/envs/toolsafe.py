@@ -208,10 +208,14 @@ class AgentDojoSplitEnv(_ToolSafeEnv):
         if not os.path.isdir(self._data_dir):
             raise FileNotFoundError(f"toolsafe split dir not found: {self._data_dir}")
         # Train first so that, if ``max_tasks`` truncates, the training side is
-        # the part that survives.
-        for split in ("train", "test"):
+        # the part that survives. ``val`` is optional: it was carved out of
+        # ``train`` later (see ``split_toolsafe.carve_val_split``), so older
+        # trees that predate it must still load.
+        for split in ("train", "val", "test"):
             sdir = os.path.join(self._data_dir, split)
             if not os.path.isdir(sdir):
+                if split == "val":
+                    continue
                 raise FileNotFoundError(f"missing split subdir: {sdir}")
             for fname in sorted(os.listdir(sdir)):
                 if not fname.endswith(".json"):
@@ -223,7 +227,7 @@ class AgentDojoSplitEnv(_ToolSafeEnv):
 
     def _split_for_path(self, path: str) -> Optional[str]:
         parent = os.path.basename(os.path.dirname(path))
-        return parent if parent in ("train", "test") else None
+        return parent if parent in ("train", "val", "test") else None
 
 
 class AgentHarmEnv(_ToolSafeEnv):

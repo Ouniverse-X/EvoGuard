@@ -85,20 +85,30 @@ def _split_train_val(tasks: list, val_fraction: float):
 
     Envs built from a pre-split tree (see
     :class:`evoguard.envs.toolsafe.AgentDojoSplitEnv`) tag every task with
-    ``metadata["split"] in {"train","test"}``. Honour that when present: the
-    tail-fraction fallback below is order-based, and with ToolSafe's
+    ``metadata["split"] in {"train","val","test"}``. Honour that when present:
+    the tail-fraction fallback below is order-based, and with ToolSafe's
     alphabetically-loaded suites it hands the held-out set entirely to
     ``workspace`` -- so validation ASR was never measured on the same suite mix
     the attacker trained against.
+
+    ``val`` wins over ``test`` for the validation side when it exists. ``test``
+    is the frozen baseline every recorded held-out replay number was measured
+    on, so touching it during a run would burn it; the ``val`` split exists
+    precisely so per-round validation has somewhere else to go. Trees that
+    predate the carve have no ``val`` tasks and fall back to ``test``, which
+    reproduces the previous behaviour exactly.
 
     Fallback (no declared split): deterministic tail fraction, unchanged.
     """
     if not tasks:
         return [], []
-    declared_train = [t for t in tasks
-                      if (getattr(t, "metadata", None) or {}).get("split") == "train"]
-    declared_val = [t for t in tasks
-                    if (getattr(t, "metadata", None) or {}).get("split") == "test"]
+
+    def _declared(name: str) -> list:
+        return [t for t in tasks
+                if (getattr(t, "metadata", None) or {}).get("split") == name]
+
+    declared_train = _declared("train")
+    declared_val = _declared("val") or _declared("test")
     if declared_train and declared_val:
         return declared_train, declared_val
     n_val = max(0, min(len(tasks), int(round(len(tasks) * val_fraction))))
@@ -561,6 +571,100 @@ class Pipeline:
         return _factory
 
     # ------------------------------------------------------------------ #
+    # Per-round held-out validation                                       #
+    # ------------------------------------------------------------------ #
+    def run_validation(self, round_label: str, config_snapshot: str) -> dict:
+        """Replay the ``val`` split against the CURRENT adapter; return metrics.
+
+        Deliberately reuses :func:`evoguard.eval.vendored_replay.run_eval`
+        rather than growing a second evaluation path: it is the only harness in
+        the repo that actually executes tools (``bench_base``'s "full rollout"
+        appends an empty observation, and ``stepwise_eval`` is a single
+        ``decide()`` call with no environment), so it is the only one whose ASR
+        means what the termination check assumes it means.
+
+        The adapter is passed explicitly. ``run_eval`` re-reads the config from
+        disk, so without the override it would evaluate whatever adapter the
+        snapshot was written with -- i.e. round 0's -- for every round.
+
+        Failures are swallowed: a flaky validation must not kill a run that is
+        otherwise training fine. The caller then falls back to training ASR for
+        that round's termination check.
+        """
+        from evoguard.eval.vendored_replay import run_eval
+
+        out_dir = os.path.join(self.exp_dir, "val", round_label)
+        summary = run_eval(
+            config_snapshot,
+            output_dir=out_dir,
+            lora_adapter_override=self.cfg.defense.llm.lora_adapter,
+            dataset_dir=self.cfg.pipeline.val_dataset_dir,
+            split=self.cfg.pipeline.val_split,
+            concurrency=max(1, int(self.cfg.pipeline.val_concurrency)),
+        )
+        summary = dict(summary)
+        summary["round_label"] = round_label
+        # Kept OUT of the round-metrics history: ``write_safety_metrics_csv``
+        # writes a fixed header, and val numbers are a different population
+        # (10 val tasks vs 47 train tasks) that must not be read as one series.
+        append_line(
+            os.path.join(self.exp_dir, "val_metrics.jsonl"),
+            json_dump(summary),
+        )
+        logger.info(
+            "[val] %s adapter=%s asr=%.4f f1=%.4f recall=%.4f precision=%.4f "
+            "acc=%.4f cf=(tp=%d fn=%d fp=%d tn=%d) scenarios=%d tasks=%d",
+            round_label, summary.get("adapter"),
+            summary.get("attack_success_rate", float("nan")),
+            summary.get("cf_f1", float("nan")), summary.get("cf_recall", float("nan")),
+            summary.get("cf_precision", float("nan")), summary.get("cf_acc", float("nan")),
+            summary.get("cf_tp", -1), summary.get("cf_fn", -1),
+            summary.get("cf_fp", -1), summary.get("cf_tn", -1),
+            summary.get("n_injection_scenarios", -1), summary.get("n_tasks", -1),
+        )
+        return summary
+
+    def _termination_metrics(self, rr, round_label: str, config_snapshot: str):
+        """Metrics object the termination state machine should read this round.
+
+        Returns ``rr.metrics`` (training ASR) unless per-round validation is on
+        and succeeds, in which case it returns a shim carrying the *val* split's
+        ASR. ``patience_rounds``/``asr_threshold`` were always documented as a
+        val-set criterion; before this they read the training round, whose ASR
+        moves with the co-evolving attacker rather than with the defender.
+        """
+        if not self.cfg.pipeline.validate_every_round:
+            return rr.metrics
+        try:
+            summary = self.run_validation(round_label, config_snapshot)
+        except Exception as exc:                                       # noqa: BLE001
+            logger.warning(
+                "[val] %s validation failed (%s); termination check falls back "
+                "to TRAINING ASR for this round", round_label, exc,
+            )
+            return rr.metrics
+        tp = int(summary.get("cf_tp", 0) or 0)
+        fn = int(summary.get("cf_fn", 0) or 0)
+        if tp + fn <= 0:
+            logger.warning(
+                "[val] %s produced no attacked records; falling back to "
+                "TRAINING ASR for the termination check", round_label,
+            )
+            return rr.metrics
+
+        @dataclass
+        class _ValTerminationView:
+            attack_success_rate: float
+            n_attacked_total: int
+            n_success_b: int
+
+        return _ValTerminationView(
+            attack_success_rate=float(summary.get("attack_success_rate", 1.0)),
+            n_attacked_total=tp + fn,
+            n_success_b=fn,
+        )
+
+    # ------------------------------------------------------------------ #
     # Full driver                                                       #
     # ------------------------------------------------------------------ #
     def run(self) -> ExperimentSummary:
@@ -595,7 +699,7 @@ class Pipeline:
 
             streak, stop_now, reason = update_termination_state(
                 streak,
-                rr.metrics,
+                self._termination_metrics(rr, label, cfg_snap),
                 patience_rounds=self.cfg.pipeline.patience_rounds,
                 asr_threshold=self.cfg.pipeline.asr_threshold,
                 stop_on_zero_success=self.cfg.pipeline.stop_on_zero_success,

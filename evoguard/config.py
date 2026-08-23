@@ -270,6 +270,32 @@ class TrainingConfig:
     # trajectories per round is ``grpo_max_prompts_per_round // K``.
     grpo_traj_group_size: int = 1
 
+    # ---- GDPO advantage normalisation (2026-08-23) ------------------------- #
+    # False = GRPO's own advantage (sum the three reward terms, then standardise
+    # the scalar total inside each group of G siblings) -- bit-for-bit legacy.
+    # True = GDPO (NVlabs, ICML 2026, arXiv:2601.05242): standardise EACH reward
+    # term inside the group first, sum the per-term advantages, then rescale
+    # batch-wise so the magnitude does not grow with the number of terms.
+    #
+    # This is a NORMALISATION change, not a new reward term -- the reward is
+    # still exactly ``R = r_safety + r_progress - p_drift``. It is aimed at a
+    # measured pathology: the three terms live on very different scales
+    # (r_safety spans 10 points, r_progress 3.7, p_drift 0.5), so summing first
+    # lets r_safety set the group std almost alone, and a group that agrees about
+    # the bait but disagrees about progress gets a near-degenerate signal. On the
+    # logged trainer steps ``reward_std == 0`` in 62.8% (plan_abc) and 20.5-50%
+    # (last_traj) of steps, and a group with zero std contributes literally no
+    # gradient. Under GDPO a term the group agrees on contributes exactly 0
+    # without flattening the terms it disagrees on.
+    #
+    # CAVEAT worth carrying: the paper's exact equations could not be retrieved
+    # from this host (no outbound route to arxiv), so the implementation in
+    # ``native_grpo_runner._gdpo_advantages`` is derived from the published
+    # description "group-wise normalization per reward, then batch-wise advantage
+    # normalization to preserve a stable numerical range independent of reward
+    # count".
+    grpo_gdpo: bool = False
+
     # ---- SFT dataset quality gate (item D1, 2026-08-20) ------------------- #
     # Utility below which a source trajectory is too poor to imitate.
     # 0.0 = no filtering (legacy behaviour bit-for-bit). At 0.5, a clean (A)
@@ -357,6 +383,26 @@ class PipelineConfig:
     # Also stop if a round produces zero successful (B) attacks.
     stop_on_zero_success: bool = True
     validation_fraction: float = 0.2
+
+    # ------------------------------------------------------------------ #
+    # Per-round validation on a held-out split (docs: _val_tasks defect)  #
+    # ------------------------------------------------------------------ #
+    # ``patience_rounds``/``asr_threshold`` above describe a *val*-set ASR, but
+    # until this was wired the state machine read the TRAINING round's ASR --
+    # a moving target, since it rises and falls with the co-evolving attacker
+    # (rho(ASR, mean_best_fitness) = +0.61 measured over 12 rounds). With
+    # ``validate_every_round`` on, each round replays the real vendored
+    # injections of the ``val`` split through the freshly registered adapter
+    # (tools actually execute, unlike the stepwise/bench harnesses) and the
+    # termination check reads THAT ASR instead.
+    #
+    # Cost: the val split is 10 tasks / 88 distinct injections; the 11-task /
+    # 53-injection test split replays in ~62s at concurrency 8, so budget
+    # ~2-3 min per round.
+    validate_every_round: bool = False
+    val_dataset_dir: str = "data/toolsafe/agentdojo-tragjnew/val"
+    val_split: str = "val"
+    val_concurrency: int = 8
 
     # ------------------------------------------------------------------ #
     # Concurrency knobs                                                  #
