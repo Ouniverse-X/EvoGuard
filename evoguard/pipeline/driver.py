@@ -576,25 +576,35 @@ class Pipeline:
     def run_validation(self, round_label: str, config_snapshot: str) -> dict:
         """Replay the ``val`` split against the CURRENT adapter; return metrics.
 
-        Deliberately reuses :func:`evoguard.eval.vendored_replay.run_eval`
-        rather than growing a second evaluation path: it is the only harness in
+        Deliberately reuses
+        :func:`evoguard.eval.vendored_replay.run_vendored_replay` rather than
+        growing a second evaluation path: it is the only harness in
         the repo that actually executes tools (``bench_base``'s "full rollout"
         appends an empty observation, and ``stepwise_eval`` is a single
         ``decide()`` call with no environment), so it is the only one whose ASR
         means what the termination check assumes it means.
 
-        The adapter is passed explicitly. ``run_eval`` re-reads the config from
-        disk, so without the override it would evaluate whatever adapter the
-        snapshot was written with -- i.e. round 0's -- for every round.
+        The adapter is passed explicitly. ``run_vendored_replay`` re-reads the
+        config from disk, so without the override it would evaluate whatever
+        adapter the snapshot was written with -- i.e. round 0's -- for every
+        round.
 
         Failures are swallowed: a flaky validation must not kill a run that is
         otherwise training fine. The caller then falls back to training ASR for
         that round's termination check.
+
+        NOTE (2026-08-23): this import named ``run_eval``, which does not exist,
+        for the whole of the ``gdpo_val`` run -- every round logged
+        ``[val] rN validation failed (cannot import name 'run_eval')`` and
+        silently degraded to training ASR. The swallow-and-degrade contract
+        worked as designed, which is exactly why the defect survived eight
+        rounds: grep the log for ``[val]`` and confirm ``val_metrics.jsonl``
+        exists before trusting any early-stopping decision.
         """
-        from evoguard.eval.vendored_replay import run_eval
+        from evoguard.eval.vendored_replay import run_vendored_replay
 
         out_dir = os.path.join(self.exp_dir, "val", round_label)
-        summary = run_eval(
+        summary = run_vendored_replay(
             config_snapshot,
             output_dir=out_dir,
             lora_adapter_override=self.cfg.defense.llm.lora_adapter,
