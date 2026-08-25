@@ -442,7 +442,10 @@ class TrajectoryRecord:
     signals: Optional[Signals] = None
     # Task-level correctness of the *benign* objective (from the env scorer).
     utility: Optional[float] = None
-    # How that score was produced: "native_lite"|"llm_rubric"|"error"|"skipped_no_llm"|"".
+    # How that score was produced:
+    # "native_lite"|"llm_rubric"|"llm_unparseable"|"llm_error"|"skipped_no_llm"|"".
+    # ``llm_unparseable`` means the judge returned no verdict and the score was
+    # forced to 0.0 (fail-closed); see ``envs.utility_judge.score_utility``.
     utility_method: str = ""
     # Short evidence string (≤500 chars) explaining why utility got its value.
     utility_evidence: str = ""
