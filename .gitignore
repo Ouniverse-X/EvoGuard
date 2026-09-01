@@ -62,6 +62,10 @@ venv.bak/
 .vscode/
 .idea/
 .DS_Store
+# macOS resource forks produced by unzipping an archive on a Mac; they shadow
+# every real file (`._all.jsonl` next to `all.jsonl`) and are never read.
+__MACOSX/
+._*
 Thumbs.db
 *~
 .*.swp
