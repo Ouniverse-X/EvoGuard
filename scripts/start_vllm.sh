@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT"
 
-MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/downloads/qwen2.5-7b-instruct}"
+MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/Qwen2.5-7B-Instruct}"
 PORT="${EVOGUARD_VLLM_PORT:-8000}"
 GPU_ID="${EVOGUARD_VLLM_GPU:-0,1}"
 SERVED_NAME="${EVOGUARD_VLLM_NAME:-qwen2.5-7b-it}"
@@ -46,13 +46,20 @@ LORA_MODULES_CSV="${EVOGUARD_VLLM_LORA_MODULES:-}"
 # Priority order (highest first):
 #   1. EVOGUARD_VLLM_PYBIN explicit override (e.g. /opt/conda/envs/foo/bin/python)
 #   2. EVOGUARD_PY_BIN exported by scripts/setup_evoguard_env.sh's activation hook
-#   3. The dedicated vllm-serving venv built for this box.
+#   3. The conda env that also runs the trainer. Serving and training share one
+#      env as of 2026-09-02: `evoguard` had transformers 5.16.1, which
+#      vllm 0.8.5's `get_cached_tokenizer` cannot wrap
+#      (AttributeError: Qwen2Tokenizer has no attribute
+#      all_special_tokens_extended), so a separate `vllm085` env existed purely
+#      to serve. Pinning transformers==4.51.3 (+ tokenizers 0.21.4,
+#      huggingface_hub 0.36.2) in `evoguard` removed the need -- that is trl
+#      0.19's native pairing, so the trainer is unaffected.
 if [[ -n "${EVOGUARD_VLLM_PYBIN:-}" && -x "$EVOGUARD_VLLM_PYBIN" ]]; then
     VLLM_PY="$EVOGUARD_VLLM_PYBIN"
 elif [[ -n "${EVOGUARD_PY_BIN:-}" && -x "$EVOGUARD_PY_BIN" ]]; then
     VLLM_PY="$EVOGUARD_PY_BIN"
 else
-    VLLM_PY="/root/yangxiao/envs/vllm085/bin/python"
+    VLLM_PY="/root/miniconda3/envs/evoguard/bin/python"
 fi
 echo "   python_bin   : $VLLM_PY"
 

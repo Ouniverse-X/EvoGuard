@@ -38,7 +38,7 @@ Per task, the controller produces **tri trajectories**: **A** = clean, **B** = a
 
 ## Common commands
 
-Python interpreter: `/ssd1/conda_envs/evoguard/bin/python` (conda env `evoguard`, NOT miniforge). `pip install -r requirements.txt` for lightweight deps only; heavy torch+vllm pre-installed in the env.
+Python interpreter: `/root/miniconda3/envs/evoguard/bin/python` (conda env `evoguard`). One env does BOTH training and vLLM serving as of 2026-09-02 — `transformers` is pinned to **4.51.3** there because vllm 0.8.5 cannot wrap a transformers-5.x tokenizer; do not upgrade it without also upgrading vllm. Models live under `/root/yangxiao/models/`. `pip install -r requirements.txt` for lightweight deps only; heavy torch+vllm pre-installed.
 
 ### Offline tests (no GPU/network)
 

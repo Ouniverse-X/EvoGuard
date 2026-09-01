@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT"
 
-MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/downloads/qwen2.5-7b-instruct}"
+MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/Qwen2.5-7B-Instruct}"
 PORT="${EVOGUARD_VLLM_PORT:-8002}"
 GPU_ID="${EVOGUARD_VLLM_GPU:-2,3}"
 SERVED_NAME="${EVOGUARD_VLLM_NAME:-qwen2.5-7b-it}"
@@ -28,7 +28,7 @@ MAX_MODEL_LEN="${EVOGUARD_VLLM_MAXLEN:-16384}"
 _TP_FROM_GPUS=$(awk -F',' '{n=0; for(i=1;i<=NF;i++) if ($i != "") n++; print n}' <<<"$GPU_ID")
 TP_SIZE="${EVOGUARD_VLLM_TP:-$_TP_FROM_GPUS}"
 
-PYBIN="${EVOGUARD_JUDGE_PYBIN:-${EVOGUARD_VLLM_PYBIN:-/root/yangxiao/envs/vllm085/bin/python}}"
+PYBIN="${EVOGUARD_JUDGE_PYBIN:-${EVOGUARD_VLLM_PYBIN:-/root/miniconda3/envs/evoguard/bin/python}}"
 if [[ ! -x "$PYBIN" ]]; then
     echo "[FATAL] python interpreter not executable: $PYBIN" >&2
     exit 127
