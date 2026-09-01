@@ -12,6 +12,7 @@ from __future__ import annotations
 ROLE_DEFENSE = "defense_agent"
 ROLE_TOOL_EXECUTOR = "tool_executor"
 ROLE_JUDGE = "attack_judge"
+ROLE_TASK_COMPLETION = "task_completion_judge"
 ROLE_ATTACKER_GENERATE = "attacker_generate"
 ROLE_ATTACKER_CROSSOVER = "attacker_crossover"
 ROLE_ATTACKER_MUTATE = "attacker_mutate"

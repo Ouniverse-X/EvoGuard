@@ -1,7 +1,8 @@
 # EvoGuard experiment: AgentDojo banking subset, fully-local backend.
 #
 # Improvements enabled (vs evoguard_agentdojo_full baseline):
-#   * Part 1 — utility scoring via native_lite + LLM rubric fallback
+#   * Part 1 — utility scoring via the LLM rubric judge (native_lite matcher
+#     removed 2026-09-01; it only ever covered one banking prompt)
 #     → new metrics clean_completion_rate / attacked_benign_preserved_rate /
 #       blocked_unfinished_rate populated each round under results/.
 #   * Part 2 — attacker max_tokens raised 4096→8192 AND thinking mode disabled

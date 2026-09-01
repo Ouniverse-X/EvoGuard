@@ -84,7 +84,6 @@ class _ToolSafeEnv(SimulatedToolEnv):
                 task=task,
                 trajectory=trajectory,
                 judge_llm=self._utility_judge,
-                strict_text_check_only=False,
             )
         except Exception as exc:                                            # noqa: BLE001 - never crash round-loop here
             logger.warning("score_utility raised for task %s: %s",
