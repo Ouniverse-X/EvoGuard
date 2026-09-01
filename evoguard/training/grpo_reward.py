@@ -306,6 +306,18 @@ class PromptMeta:
     # trajectory's steps when a single step's G-sibling group is degenerate
     # (reward_std == 0 contributes literally zero gradient).
     traj_group_id: str = ""
+    # The attacker's own text, carried so the reward-path safety judge can read
+    # WHAT the injection asked for instead of only the tool name it happened to
+    # mention. Before 2026-09-01 ``native_grpo_runner._build_judge_callable``
+    # sent the literal string "(judge probe)" as the payload and a synthesised
+    # goal, so the judge was asked "did the agent execute the injected
+    # instruction" while never being shown that instruction -- its verdict could
+    # only mirror the structural ``tool == target_tool_name`` check, and
+    # attacker-serving behaviour with no malicious tool call (exfiltration inside
+    # `final_answer`) was invisible to r_safety. Empty strings reproduce the old
+    # behaviour exactly, so clean rows and stored metas are unaffected.
+    injected_payload_excerpt: str = ""
+    attacker_goal: str = ""
 
 
 # --------------------------------------------------------------------------- #

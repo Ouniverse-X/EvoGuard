@@ -362,7 +362,7 @@ def run_stepwise_eval(
     # a false alarm ("prompt injection" / "malicious" are alternatives in it), and
     # a defender that silently drops the task (empty final answer, no tool call)
     # still scores 1.0. Use the bench_base multi-turn rollouts + utility judge,
-    # and RoundMetrics' clean_final_answer_rate / clean_mean_steps, to see the
+    # and RoundMetrics' clean_completion_rate / clean_mean_steps, to see the
     # non-termination form of the failure.
     metrics = aggregate_round(records, {}, round_id=0, n_tasks=len(all_records))
     with open(metrics_path, "a", encoding="utf-8") as f:

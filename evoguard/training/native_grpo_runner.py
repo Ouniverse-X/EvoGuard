@@ -515,9 +515,14 @@ def _build_judge_callable(judge_client_endpoint_url: Optional[str]) -> Optional[
     def _judge(completion_text: str, meta):                          # noqa: ANN001
         # Lazy imports keep module-load cheap outside true runs.
         from evoguard.config import LLMConfig
-        from evoguard.llm.base import LLMClient
-        from evoguard.judge import AttackJudge, _infer_target_tool
-        from evoguard.core.types import AttackSpec, Message, Role, Trajectory
+        from evoguard.judge import AttackJudge
+        from evoguard.core.types import (
+            Action as EvAction,
+            AttackSpec,
+            ToolCall,
+            Trajectory,
+            TrajectoryKind,
+        )
 
         cfg = LLMConfig(backend="openai",
                         model=_judge_model_name(),
@@ -526,16 +531,27 @@ def _build_judge_callable(judge_client_endpoint_url: Optional[str]) -> Optional[
         # Re-use AttackJudge logic indirectly: build minimal synthetic trajectory
         # containing just the single action being scored so its structural gates fire.
         target_tool_name = meta.target_tool_name or ""
-        # We construct an AttackSpec stub carrying goal text mentioning the inferred tool
-        # so _detected_injection/_action_timeline codepaths behave consistently.
+        # Hand the judge the attacker's ACTUAL text when the prompt carries it
+        # (``PromptMeta.injected_payload_excerpt`` / ``attacker_goal``, populated
+        # by grpo_prompt_extraction). Without it the payload was the literal
+        # "(judge probe)" and the goal a synthesised "call <tool>" line, so the
+        # judge was asked whether the agent executed an instruction it was never
+        # shown -- its verdict could only restate the structural
+        # ``tool == target_tool_name`` check computed below, and an attack served
+        # entirely inside `final_answer` scored as safe. The synthesised strings
+        # remain the fallback for metas built before this field existed.
+        payload_text = str(getattr(meta, "injected_payload_excerpt", "") or "")
+        goal_text = str(getattr(meta, "attacker_goal", "") or "")
+        if not goal_text:
+            goal_text = ("attacker goal: call " + target_tool_name) if target_tool_name else ""
         attack_stub = AttackSpec(
             attack_id=f"_grpo_inner_{meta.task_id}",
             task_id=str(meta.task_id),
             target_turn=(int(meta.injection_point)+1) if meta.injection_point is not None else 1,
             injection_channel="_inner_loop_probe_",
             method="probe",
-            payload="(judge probe)",
-            goal=("attacker goal: call " + target_tool_name) if target_tool_name else "",
+            payload=payload_text or "(judge probe)",
+            goal=goal_text,
         )
 
         # Parse completion_text defensively to assemble Action-like evidence.
@@ -555,8 +571,6 @@ def _build_judge_callable(judge_client_endpoint_url: Optional[str]) -> Optional[
         except Exception:
             pass                                                    # noqa: BLE001
 
-        from dataclasses import dataclass as _dc_dataclass
-        from evoguard.core.types import ToolCall, Action as EvAction
         act_obj = EvAction(turn=int(meta.injection_point)+2 \
                             if meta.injection_point is not None else 2,
                            thought=thought_str,
@@ -566,7 +580,7 @@ def _build_judge_callable(judge_client_endpoint_url: Optional[str]) -> Optional[
 
         traj = Trajectory(task_id=str(meta.task_id),
                           actions=[act_obj],
-                          kind=__import__("evoguard").core.types.TrajectoryKind.ATTACKED,
+                          kind=TrajectoryKind.ATTACKED,
                           metadata={
                               "injection_visible_turn":
                                   int(meta.injection_point) if meta.injection_point is not None else 0,
@@ -1089,7 +1103,7 @@ def train_native_grpo(
     try:
         import torch                                                  # noqa: F401
         from datasets import Dataset                                 # noqa: F401
-        from peft import LoraConfig, PeftModel                       # type: ignore
+        from peft import PeftModel                                    # type: ignore
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
 
         from evoguard.training._trl_compat import patch_trl_probes

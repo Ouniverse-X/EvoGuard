@@ -368,6 +368,9 @@ def collect_probe_pairs(
                 clean=traj_clean_attempt,
                 attacked=traj_inj_attempt,
                 attack=spec_attack_use_now,
+                # This pipeline runs no judge, so the outcome is unlabelled: keep
+                # the positional turning point but let signals tag it as such.
+                attack_succeeded=None,
             )
             new_pair_entry.delta = sig.delta
             new_pair_entry.delta_normalized = float(sig.delta_normalized or 0.0)

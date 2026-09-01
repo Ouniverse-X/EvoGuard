@@ -1099,10 +1099,13 @@ _TARGET_TOOL_RE = re.compile(r"call\s+([A-Za-z_]\w*)")
 def _infer_target_tool(attack) -> str:
     """Best-effort extraction of the malicious tool name referenced by ``attack``.
 
-    Mirrors :func:`evoguard.judge._infer_target_tool` but kept local to avoid a
-    circular import (``judge`` imports :mod:`evoguard.llm` which transitively
-    touches dataset-builder territory via training glue). The regex picks up
-    phrases like 'call send_money' inside either the goal or payload strings.
+    This is now the ONLY such helper in the tree: ``judge._infer_target_tool``
+    was deleted 2026-08-25 (the judge reads the attack text itself instead of a
+    regex). Consumers are the SFT corpus builder and
+    ``training/grpo_prompt_extraction``, which need a target-tool NAME to key
+    reward bookkeeping on. The regex picks up phrases like 'call send_money'
+    inside either the goal or payload strings, and returns "" when neither
+    names a tool -- callers must treat "" as "unknown", not as "no attack".
     """
 
     m = _TARGET_TOOL_RE.search(getattr(attack, "goal", "") or "")

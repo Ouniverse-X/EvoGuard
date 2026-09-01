@@ -77,8 +77,6 @@ attacker:
   search_method: mcts_delta                     # MCTS backend same as v5_mcts/v6_probed_lora comparators.
   mcts_ucb_c: 1.414                             # classic UCB1 exploration coefficient (= sqrt(2)).
   mcts_lambda_delta: 0.6                        # weight of delta-potential term in UCB-delta selection score.
-  mcts_failure_credit_eps: 0.03                # fraction of late-caught-failure tau converted into partial credit.
-  mcts_tau_window_size: 8                       # sliding window of recent C-class taus kept per node.
 
 env:
   dataset: agentdojo

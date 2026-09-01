@@ -96,17 +96,14 @@ def _make_tools(n_tools: int = 3) -> list[ToolSpec]:
     return [ToolSpec(name=f"tool_{i}", description="d") for i in range(n_tools)]
 
 
-def _evaluated_from_spec(spec: AttackSpec, *, success=True, delta_norm=None,
-                         tau_caught: int = 2) -> EvaluatedAttack:
+def _evaluated_from_spec(spec: AttackSpec, *, success=True,
+                         delta_norm=None) -> EvaluatedAttack:
     fit_val = float(delta_norm if delta_norm is not None else (0.5 if success else 0.0))
     return EvaluatedAttack(
         spec=spec,
         fitness=float(fit_val),
         success=bool(success),
-        metadata={
-            "turning_point": int(tau_caught),
-            "delta_normalized": float(fit_val),
-        },
+        metadata={"delta_normalized": float(fit_val)},
     )
 
 
@@ -147,9 +144,9 @@ class TestDeltaGuidedMCTSAttacker(unittest.TestCase):
         root_before = att._nodes_by_id["root"].n_visits
 
         evaluated_list = [
-            _evaluated_from_spec(pop[0], success=True, delta_norm=0.7, tau_caught=3),
-            _evaluated_from_spec(pop[1], success=False, delta_norm=0.0, tau_caught=1),
-            _evaluated_from_spec(pop[2], success=True, delta_norm=0.9, tau_caught=2),
+            _evaluated_from_spec(pop[0], success=True, delta_norm=0.7),
+            _evaluated_from_spec(pop[1], success=False, delta_norm=0.0),
+            _evaluated_from_spec(pop[2], success=True, delta_norm=0.9),
         ]
         next_pop = att.evolve(evaluated_list)
 
@@ -158,27 +155,26 @@ class TestDeltaGuidedMCTSAttacker(unittest.TestCase):
                           "Root must receive visit-count increment equal to batch size")
         self.assertGreater(len(next_pop), 0, "evolve() must schedule a new batch")
 
-    def test_failure_partial_credit_accumulates_more_for_late_catches(self):
-        """Late-caught C-class outcomes should deposit more partial credit than early ones."""
-        att,_ = self._build(population_size=4)
+    def test_failed_attacks_contribute_visits_but_no_delta(self):
+        """C-class outcomes must not deposit any Δ credit.
 
-        pop_r1 = list(att.current_population())
-        evals_r1 = [_evaluated_from_spec(s, success=False, tau_caught=1)
-                     for s in pop_r1]
-        att.evolve(evals_r1)
-        pc_after_early_failures = sum(float(n.sum_partial_credit)
-                                        for n in att._nodes_by_id.values())
+        Pins the 2026-09-01 deletion of the failure-partial-credit term: a
+        turning point is only meaningful on a successful attack, so a round of
+        pure failures may only move ``n_visits``.
+        """
+        att, _ = self._build(population_size=4)
 
-        pop_r2 = list(att.current_population())
-        evals_r2 = [_evaluated_from_spec(s, success=False,
-                                          tau_caught=max(2, att.injectable_turn_ceiling))
-                     for s in pop_r2]
-        att.evolve(evals_r2)
-        pc_after_late_failures = sum(float(n.sum_partial_credit)
-                                       for n in att._nodes_by_id.values())
+        pop = list(att.current_population())
+        att.evolve([_evaluated_from_spec(s, success=False, delta_norm=0.0)
+                    for s in pop])
 
-        self.assertGreater(pc_after_late_failures, pc_after_early_failures,
-                           "Late-caught failures should accumulate more partial credit")
+        self.assertEqual(att._nodes_by_id["root"].n_visits, len(pop))
+        for node in att._nodes_by_id.values():
+            self.assertEqual(node.n_success, 0)
+            self.assertEqual(node.sum_delta_on_success, 0.0)
+            self.assertEqual(node.max_delta_observed, 0.0)
+            self.assertFalse(hasattr(node, "sum_partial_credit"))
+            self.assertFalse(hasattr(node, "last_failure_taus"))
 
     def test_ucb_score_prefers_higher_delta_subtree_under_equal_visits(self):
         att,_ = self._build()
@@ -234,8 +230,7 @@ class TestDeltaGuidedMCTSAttacker(unittest.TestCase):
                   att.evolve(prev_evals)             # type: ignore[name-defined]
             prev_evals = [
                 _evaluated_from_spec(s, success=(i % 2 == 0),
-                                     delta_norm=float((i % 3) * 0.25),
-                                     tau_caught=min(i + 1, att.injectable_turn_ceiling))
+                                     delta_norm=float((i % 3) * 0.25))
                 for i, s in enumerate(pop)
             ]
         # After two full rounds the tree should have non-trivial statistics somewhere.

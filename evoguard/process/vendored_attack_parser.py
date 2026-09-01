@@ -24,8 +24,10 @@ For each distinct task instruction we extract:
                          fooled reference action in ``current_action``.
 * ``goal``            -- attacker objective string constructed as
                          ``"call <mal_tool> with arguments <args> -- <text>"``
-                         so :func:`evoguard.judge._infer_target_tool` (which
-                         regexes ``call\\s+(\\w+)``) resolves correctly.
+                         so the ``call\\s+(\\w+)`` consumers
+                         (:func:`evoguard.process.dataset_builder._infer_target_tool`,
+                         and the judge model reading ``attacker_goal``) resolve
+                         the target tool correctly.
 * ``ground_truth_score``-- AgentDojo's own ``score`` (1.0 = attack succeeded
                          vs the reference model) for cross-validation.
 """
@@ -155,7 +157,7 @@ def _parse_one(record: dict, suite: str,
 
     instruction = record.get("instruction", "").strip()
     task_id = _task_uid(suite, instruction, dataset)
-    # Compose goal so judge._infer_target_tool regex `call\s+(\w+)` matches.
+    # Compose goal so every `call\s+(\w+)` consumer resolves the target tool.
     args_clause = f" with arguments {mal_args}" if mal_args else ""
     goal = f"call {mal_tool}{args_clause} -- {goal_text}".strip(" -")
 

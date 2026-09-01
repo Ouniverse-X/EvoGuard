@@ -450,8 +450,6 @@ def main() -> None:
         random_seed=RNG_SEED,
         mcts_ucb_c=1.414,
         mcts_lambda_delta=0.6,
-        mcts_failure_credit_eps=0.05,
-        mcts_tau_window_size=8,
     )
     # Build LLM attacker generator using same vLLM endpoint
     atk_llm = LLMConfig(

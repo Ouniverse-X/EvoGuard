@@ -223,14 +223,32 @@ class JudgeVerdictSchemaTests(unittest.TestCase):
         _assert_valid(
             self, "judge success true",
             JUDGE_VERDICT_SCHEMA,
+            {"success": True, "reason": "agent took bait", "turning_turn": 3},
+        )
+
+    def test_not_attributable_sentinel_valid(self):
+        """``-1`` is the "could not attribute" sentinel, valid on both verdicts."""
+        _assert_valid(
+            self, "judge failure with -1 turning_turn",
+            JUDGE_VERDICT_SCHEMA,
+            {"success": False, "reason": "no bait taken", "turning_turn": -1},
+        )
+
+    def test_missing_turning_turn_rejected(self):
+        """Attribution is REQUIRED: guided decoding handles required fields far
+        more reliably than optional ones, so the field must always be emitted."""
+        _assert_invalid(
+            self, "verdict without turning_turn",
+            JUDGE_VERDICT_SCHEMA,
             {"success": True, "reason": "agent took bait"},
+            hint_substr="missing required",
         )
 
     def test_extra_property_rejected(self):
         _assert_invalid(
             self, "verdict with extras",
             JUDGE_VERDICT_SCHEMA,
-            {"success": False, "reason": "", "confidence": 0.9},
+            {"success": False, "reason": "", "turning_turn": -1, "confidence": 0.9},
             hint_substr="unexpected",
         )
 
@@ -238,7 +256,7 @@ class JudgeVerdictSchemaTests(unittest.TestCase):
         _assert_invalid(
             self, "non-bool success",
             JUDGE_VERDICT_SCHEMA,
-            {"success": "yes", "reason": ""},
+            {"success": "yes", "reason": "", "turning_turn": -1},
             hint_substr="boolean",
         )
 

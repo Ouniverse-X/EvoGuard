@@ -11,7 +11,6 @@ import math
 import os
 import random
 import re
-from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Optional, Sequence
 
@@ -128,15 +127,17 @@ class _TreeNode:
     discriminator: dict[str, Any] = field(default_factory=dict)
 
     n_visits: int = 0
-    n_success: int = 0                       # count of B-class outcomes observed 
+    n_success: int = 0                       # count of B-class outcomes observed
     sum_delta_on_success: float = 0.0         # Σ Δ_norm restricted to successes only
     max_delta_observed: float = 0.0           # running peak for exploitation bound
 
-    # Failure partial credit machinery. Sliding window length governed by config
-    # ``mcts_tau_window_size``; 
-    last_failure_taus: deque = field(default_factory=lambda: deque(maxlen=8))
-    # 走过它的失败的case给他的贡献（8的滑窗）
-    sum_partial_credit: float = 0.0            
+    # NOTE (2026-09-01): failure partial credit was DELETED. It converted the
+    # C-class turning_point into a positive reward, but a turning point only has
+    # the intended meaning ("the defender abandoned the benign plan to execute
+    # the injected instruction") on SUCCESSFUL attacks. On failures the same
+    # linear scan measures early termination / trailing length differences /
+    # benign plan drift, so the term rewarded "make the defender refuse later",
+    # which is not the attacker's objective. Do not re-add it.
 
     cached_payload_text: Optional[str] = None  # set on L3 leaves post-materialization
     children_ids: list[str] = field(default_factory=list)
@@ -175,9 +176,6 @@ class DeltaGuidedMCTSAttacker:
         self._ucb_c = float(config.mcts_ucb_c)#公式探索系数
         # delta方差项系数
         self._lambda_delta = float(config.mcts_lambda_delta)
-        # 失败样本的部分积分系数 ε。当一次攻击失败但被防御方很晚才检测到（tau_caught 大）时，仍给该路径一定正向信用 ε·(tau/T_cap)
-        self._failure_eps = float(config.mcts_failure_credit_eps)
-        self._tau_window = int(config.mcts_tau_window_size)
 
         self._root = _TreeNode(
             node_id="root",
@@ -242,26 +240,15 @@ class DeltaGuidedMCTSAttacker:
             )
 
         for eva_record, path_ids in zip(evaluated, self._buffer_paths):
-            outcome_meta = eva_record.metadata or {}
             succeeded = bool(eva_record.success)
-            # Prefer explicit signal fields if upstream populated them,
-            # otherwise fall back to fitness (= Δ_norm when success per plan.md).
+            # ``fitness`` is Δ_norm on success and 0.0 otherwise (see
+            # core.types.AttackRecord.fitness), so failures contribute visits
+            # only -- no turning-point signal is read for C-class outcomes.
             delta_norm = float(eva_record.fitness or 0.0)
-            tau_caught_raw = (
-                outcome_meta.get("turning_point")
-                or outcome_meta.get("tau_turn")
-                or outcome_meta.get("behavior_turn_point")
-                or 0
-            )
-            try:
-                tau_caught = max(0, int(tau_caught_raw))
-            except Exception:
-                tau_caught = 0
             self._backprop_along_path(
                 path_ids=path_ids,
                 succeeded=succeeded,
                 delta_norm=delta_norm,
-                tau_caught=tau_caught,
             )
 
         self.generation += 1
@@ -412,21 +399,15 @@ class DeltaGuidedMCTSAttacker:
         """Composite selection criterion.
         ``score = exploit_term + c·explore_term + λ·δ_potential``
         """
-        eps_visit = 1e-9
         if child.n_visits <= 0:
-            exploit_mean_delta = 0.01               
+            exploit_mean_delta = 0.01
             # 做个宽先验，如果节点未访问，这片方差设为0.25，鼓励探索
-            variance_estimate = 0.25                 
+            variance_estimate = 0.25
         else:
             denom_succ = float(max(1, child.n_success))
             mean_on_succ = float(child.sum_delta_on_success) / denom_succ
             success_rate = float(child.n_success) / float(child.n_visits)
             exploit_mean_delta = success_rate * mean_on_succ
-            partial_avg = (
-                float(child.sum_partial_credit) /
-                float(child.n_visits + eps_visit)
-            )
-            exploit_mean_delta += self._failure_eps * partial_avg
             # Variance proxy computed from extreme spread when sample size small;
             # collapses to 0 once many observations pin distribution tightly --
             # desired property letting other terms dominate mature cells.
@@ -629,12 +610,13 @@ class DeltaGuidedMCTSAttacker:
     def _backprop_along_path(self, *,
                              path_ids: list[str],
                              succeeded: bool,
-                             delta_norm: float,
-                             tau_caught: int):
-        """Update visit/success/delta/partial-credit counters on every ancestor.
-        """
-        T_cap = float(self._inject_turn_ceiling) or 1.0
+                             delta_norm: float):
+        """Update visit/success/delta counters on every ancestor.
 
+        Failures increment ``n_visits`` only: that alone lowers the success rate
+        in :meth:`_ucb_score` and raises the exploration term for siblings, so a
+        losing subtree is still de-prioritised without inventing a Δ for it.
+        """
         for nid in path_ids:
             nd = self._nodes_by_id.get(nid)
             if nd is None:
@@ -646,11 +628,6 @@ class DeltaGuidedMCTSAttacker:
                 nd.sum_delta_on_success += dn
                 if dn > nd.max_delta_observed:
                     nd.max_delta_observed = dn
-            else:
-                tc = max(0, int(tau_caught or 0))
-                nd.last_failure_taus.append(tc)
-                frac_hidden = min(1.0, float(tc) / T_cap)
-                nd.sum_partial_credit += (self._failure_eps * frac_hidden)
 
     # ------------------------------------------------------------------ #
     # Regenerate population                                             #

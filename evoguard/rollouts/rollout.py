@@ -80,6 +80,12 @@ def _ensure_vllm_healthy(controller: Controller) -> None:
     This check runs AFTER population pre-compute and BEFORE any clean/attacked
     rollout dispatch, giving us the chance to detect+restart vLLM so rollouts
     don't all fail with Connection errors.
+
+    No-ops for the ``mock`` backend: it serves no HTTP endpoint, so the probe
+    would fall back to the default ``127.0.0.1:8000`` URL, fail, shell out to
+    ``scripts/start_vllm.sh`` and then poll for ``_VLLM_HEALTH_MAX_WAIT``
+    seconds -- turning the offline smoke run (documented as needing no GPU and
+    no network) into a ten-minute stall per round.
     """
     import subprocess
 
@@ -87,6 +93,9 @@ def _ensure_vllm_healthy(controller: Controller) -> None:
     agent = controller.agent
     base_url = getattr(getattr(agent, "config", None), "llm", None)
     if base_url is None:
+        return
+    if str(getattr(base_url, "backend", "")).lower() == "mock":
+        logger.info("[vllm_health] mock backend: no endpoint to probe, skipping")
         return
     base_url_str = getattr(base_url, "base_url", None) or "http://127.0.0.1:8000/v1"
     # Strip /v1 suffix to get health URL.

@@ -130,8 +130,11 @@ class AttackerConfig:
     search_method: str = "ga"
     mcts_ucb_c: float = 1.414           # classic UCB exploration coefficient (= sqrt(2))
     mcts_lambda_delta: float = 0.6      # weight of the delta-potential term in selection score
-    mcts_failure_credit_eps: float = 0.03  # fraction of late-caught-failure tau converted into partial credit
-    mcts_tau_window_size: int = 8        # sliding window of recent C-class taus kept per node
+    # NOTE (2026-09-01): ``mcts_failure_credit_eps`` / ``mcts_tau_window_size``
+    # were REMOVED together with the failure-partial-credit term in
+    # attacks/mct_searcher.py -- a turning point is only meaningful on a
+    # SUCCESSFUL attack, so C-class taus must not feed selection. Stale yaml
+    # entries are harmless (from_dict ignores unknown keys).
 
 
 @dataclass
@@ -170,6 +173,13 @@ class ProcessConfig:
     divergence_threshold: float = 0.5
     # Whether to normalize delta by clean-trajectory length (else by max length).
     normalize_by: str = "clean_length"  # "clean_length" | "max_length"
+    # How the turning point is resolved (``process/signals.py``):
+    #   "scan"          -- first mismatch of the A/B tool-call signature sequences
+    #   "llm"           -- the attack judge's own attribution (``turning_turn``)
+    #   "llm_then_scan" -- judge attribution, scan when it can't attribute
+    # Default stays "scan" so every historical run stays bit-reproducible; flip
+    # only after the scan-vs-LLM agreement study.
+    turning_point_method: str = "scan"
 
 
 @dataclass

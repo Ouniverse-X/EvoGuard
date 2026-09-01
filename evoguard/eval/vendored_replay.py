@@ -120,12 +120,17 @@ def _run_replay(
     """Run replay trajectory (B/C) and judge success."""
 
     traj, attack = controller.run_replay(task, vendored_attack)
-    success, reason = judge.judge(traj, attack)
+    verdict = judge.judge_verdict(traj, attack)
+    success, reason = verdict.success, verdict.reason
     outcome = AttackOutcome.SUCCESS if success else AttackOutcome.FAIL
     # No clean-twin here -> signals computed with empty clean trajectory.
     # We still record injection_point so downstream analysis can see it.
     try:
-        signals = compute_signals(Trajectory(task_id=task.task_id), traj, attack, process_cfg)
+        signals = compute_signals(
+            Trajectory(task_id=task.task_id), traj, attack, process_cfg,
+            attack_succeeded=success,
+            judged_turning_point=verdict.turning_turn,
+        )
     except Exception as exc:                                                # noqa: BLE001
         logger.warning("compute_signals raised for %s: %s", task.task_id, exc)
         signals = None

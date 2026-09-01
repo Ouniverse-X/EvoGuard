@@ -536,6 +536,12 @@ def extract_grpo_prompts(
         target_tool_name = (
             _infer_target_tool(rcd.attack) if rcd.attack is not None else ""
         )
+        # The attacker's own words, forwarded to the reward-path safety judge so
+        # it scores what the injection ASKED FOR, not just the tool it named.
+        attacker_goal = str(getattr(rcd.attack, "goal", "") or "") if rcd.attack else ""
+        payload_excerpt = (
+            str(getattr(rcd.attack, "payload", "") or "")[:500] if rcd.attack else ""
+        )
 
         step_indices, was_padded = _trajectory_step_indices(
             len(rcd.trajectory.actions), base=step_i, k=k_steps
@@ -585,6 +591,8 @@ def extract_grpo_prompts(
                     history_prefix_actions
                 ),
                 traj_group_id=group_id,
+                injected_payload_excerpt=payload_excerpt,
+                attacker_goal=attacker_goal,
             )
             group_rows.append(
                 GrpoPromptRow(system=sys_str, user=user_text, meta=meta)
