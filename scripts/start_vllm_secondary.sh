@@ -28,7 +28,22 @@ MAX_MODEL_LEN="${EVOGUARD_VLLM_MAXLEN:-16384}"
 _TP_FROM_GPUS=$(awk -F',' '{n=0; for(i=1;i<=NF;i++) if ($i != "") n++; print n}' <<<"$GPU_ID")
 TP_SIZE="${EVOGUARD_VLLM_TP:-$_TP_FROM_GPUS}"
 
-PYBIN="${EVOGUARD_JUDGE_PYBIN:-${EVOGUARD_VLLM_PYBIN:-/root/miniconda3/envs/evoguard/bin/python}}"
+# Word-split passthrough for per-model engine flags this wrapper does not model.
+# Needed by Qwen3.5's hybrid linear-attention layers: flashinfer 0.6.6's
+# JIT-compiled sm90a gated-delta-rule prefill kernel aborts on the FIRST forward
+# pass on this box --
+#   gdn_prefill_launcher.cu:60: delta rule kernel does not support this device
+#   major version: 0
+# -- while the server still reports /v1/models healthy, so the failure only shows
+# up as a dead process on the first real request. vLLM's own Triton/FLA path is
+# unaffected:
+#   EVOGUARD_VLLM_EXTRA_ARGS="--gdn-prefill-backend triton"
+EXTRA_ARGS=()
+if [[ -n "${EVOGUARD_VLLM_EXTRA_ARGS:-}" ]]; then
+    read -ra EXTRA_ARGS <<<"$EVOGUARD_VLLM_EXTRA_ARGS"
+fi
+
+PYBIN="${EVOGUARD_JUDGE_PYBIN:-${EVOGUARD_VLLM_PYBIN:-/root/miniconda3/envs/evoguard2/bin/python}}"
 if [[ ! -x "$PYBIN" ]]; then
     echo "[FATAL] python interpreter not executable: $PYBIN" >&2
     exit 127
@@ -59,10 +74,17 @@ Launching helper vLLM server:
    port            : $PORT
    log file        : $LOG_FILE
 EOF
+[[ ${#EXTRA_ARGS[@]} -gt 0 ]] && echo "   extra_args      : ${EXTRA_ARGS[*]}"
 
-# vllm 0.8.x: force the legacy engine for parity with the primary server so both
-# instances behave identically under load (see scripts/start_vllm.sh).
-export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+# Engine selection: probe for the knob instead of assuming it exists. vllm 0.8.x
+# needed VLLM_USE_V1=0 for parity with the primary server (see
+# scripts/start_vllm.sh); vllm >= ~0.11 removed V0 and the knob with it, so on
+# 0.19.1 the variable is not in vllm.envs.environment_variables at all.
+if "$PYBIN" -c "import sys, vllm.envs as e; sys.exit(0 if 'VLLM_USE_V1' in getattr(e, 'environment_variables', {}) else 1)" >/dev/null 2>&1; then
+    export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+else
+    unset VLLM_USE_V1 2>/dev/null || true
+fi
 
 # With tensor_parallel_size>1 vllm stands up a torch.distributed TCPStore whose
 # port comes from get_open_port(). Two instances launched close together can pick
@@ -81,6 +103,7 @@ nohup "$PYBIN" -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len     "$MAX_MODEL_LEN" \
     --trust-remote-code \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     >"$LOG_FILE" 2>&1 &
 SEC_PID=$!
 echo "$SEC_PID" >"$PID_FILE"

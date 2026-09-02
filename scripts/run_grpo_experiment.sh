@@ -65,13 +65,17 @@ probe_endpoint() {
 }
 
 # Helper endpoints are probed only if the config actually references them, so
-# single-endpoint configs keep working unchanged.
+# single-endpoint configs keep working unchanged. The port list is DERIVED from the
+# config rather than hard-coded: it used to be a literal `8002 8003`, which meant a
+# config pointing its judges anywhere else (v10 puts them on :8004) had its judge
+# endpoint silently unprobed, so a dead judge only surfaced mid-round.
 PRIMARY_VLLM_URL="${EVOGUARD_PRIMARY_VLLM:-http://127.0.0.1:8000/v1}"
 probe_endpoint "$PRIMARY_VLLM_URL"   "primary vLLM (defense)"
-for helper_port in 8002 8003; do
-    if grep -q "127.0.0.1:${helper_port}/v1" "$CONFIG"; then
-        probe_endpoint "http://127.0.0.1:${helper_port}/v1" "helper vLLM :${helper_port}"
-    fi
+PRIMARY_PORT="$(printf '%s' "$PRIMARY_VLLM_URL" | sed -n 's#.*:\([0-9]\+\)/v1.*#\1#p')"
+HELPER_PORTS="$(sed -n 's#.*127\.0\.0\.1:\([0-9]\+\)/v1.*#\1#p' "$CONFIG" | sort -u)"
+for helper_port in $HELPER_PORTS; do
+    [[ "$helper_port" == "$PRIMARY_PORT" ]] && continue
+    probe_endpoint "http://127.0.0.1:${helper_port}/v1" "helper vLLM :${helper_port}"
 done
 
 # Verify VLLM_ALLOW_RUNTIME_LORA_UPDATING was set when primary launched --

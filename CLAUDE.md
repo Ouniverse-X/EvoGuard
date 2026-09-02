@@ -38,7 +38,9 @@ Per task, the controller produces **tri trajectories**: **A** = clean, **B** = a
 
 ## Common commands
 
-Python interpreter: `/root/miniconda3/envs/evoguard/bin/python` (conda env `evoguard`). One env does BOTH training and vLLM serving as of 2026-09-02 — `transformers` is pinned to **4.51.3** there because vllm 0.8.5 cannot wrap a transformers-5.x tokenizer; do not upgrade it without also upgrading vllm. Models live under `/root/yangxiao/models/`. `pip install -r requirements.txt` for lightweight deps only; heavy torch+vllm pre-installed.
+Python interpreter: `/root/miniconda3/envs/evoguard2/bin/python` (conda env `evoguard2`, 2026-09-02). One env does BOTH training and vLLM serving: torch 2.10.0+cu128, vllm 0.19.1, transformers 4.57.6, trl 0.19.0, peft 0.19.0. Do not bump past **vllm 0.19.1** — 0.20+ ships a CUDA-13 wheel stack needing driver ≥580 and this box is 550.127.08/CUDA 12.4. Do not bump **trl** — `_DeltaShapedGRPOTrainer` overrides `GRPOTrainer._generate_and_score_completions`, so trl 1.x is a code migration. torch ≥2.7 is mandatory: peft 0.19's `UPCAST_DTYPES` does an unguarded `getattr(torch,"float8_e8m0fnu")`, which killed r0 SFT on torch 2.6. The predecessor env `evoguard` (vllm 0.8.5 + torch 2.6 + transformers 4.51.3) is the intact rollback target; freezes in `/root/yangxiao/env_snapshots/`. Models live under `/root/yangxiao/models/`. `pip install -r requirements.txt` for lightweight deps only (its `openai<2` pin is stale — vllm 0.19.1 needs `openai>=2`); heavy torch+vllm pre-installed.
+
+Serving notes: vllm 0.19.1 has **no V0 engine** — `VLLM_USE_V1` is absent from `vllm.envs`, and both launch scripts probe for the knob rather than exporting it. `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1` still gates `POST /v1/load_lora_adapter`. Qwen3.5-9B serves here (`Qwen3_5ForConditionalGeneration` is registered) but **requires `EVOGUARD_VLLM_EXTRA_ARGS="--gdn-prefill-backend triton"`**: flashinfer's sm90a gated-delta-rule prefill kernel aborts on the first forward pass *after* the server already reports healthy.
 
 ### Offline tests (no GPU/network)
 

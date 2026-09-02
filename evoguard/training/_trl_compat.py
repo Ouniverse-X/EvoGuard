@@ -27,6 +27,24 @@ gone in 5.x, so the assignment raises ``AttributeError`` (routed through PEFT's
 ``__getattr__`` delegation chain, which makes the traceback misleading). A
 lazily-populated property is installed on ``PreTrainedModel`` so the dict exists
 per instance again.
+
+Shim 3 -- TRL's optional vLLM generation backend. ``trl/trainer/grpo_trainer.py``
+does, at module scope::
+
+    if is_vllm_available():
+        from vllm import LLM, SamplingParams
+        from vllm.sampling_params import GuidedDecodingParams
+
+``GuidedDecodingParams`` was renamed ``StructuredOutputsParams`` in vLLM 0.19,
+so on a box where the trainer env also carries a modern vLLM that guard fires and
+``from trl import GRPOTrainer`` dies with ``ImportError``. ``trl.extras.vllm_client``
+reaches even deeper (``vllm.distributed.device_communicators.pynccl``). EvoGuard
+passes ``use_vllm=False`` (``native_grpo_runner``): generation happens in-process
+through transformers, and TRL's server-mode client is never constructed. So the
+probe is pinned to ``False`` rather than aliasing the renamed class -- that keeps
+the shim independent of any future vLLM rename, and it disables only code paths
+this repo does not use. Flip this off if ``use_vllm=True`` is ever wanted, and
+pair TRL with a vLLM of its own generation.
 """
 
 from __future__ import annotations
@@ -47,6 +65,7 @@ def patch_trl_probes() -> None:
 
     _coerce_tuple_probes()
     _restore_warnings_issued()
+    _disable_trl_vllm_backend()
 
 
 def _coerce_tuple_probes() -> None:
@@ -107,3 +126,25 @@ def _restore_warnings_issued() -> None:
     PreTrainedModel.warnings_issued = property(_get, _set)
     logger.info("[trl_compat] installed PreTrainedModel.warnings_issued shim "
                 "(transformers 5.x dropped it; TRL still writes to it)")
+
+
+def _disable_trl_vllm_backend() -> None:
+    """Pin ``trl.import_utils.is_vllm_available`` to ``False``.
+
+    Must run before ``trl.trainer.grpo_trainer`` is first imported: that module
+    resolves the probe with a ``from ..import_utils import ...`` at module scope
+    and then imports vLLM symbols under it. EvoGuard generates in-process
+    (``use_vllm=False``), so nothing downstream of the guard is reachable.
+    """
+    try:
+        from trl import import_utils as _iu  # type: ignore
+    except Exception as exc:  # pragma: no cover - trl absent (dry-run paths)
+        logger.debug("[trl_compat] trl.import_utils unavailable (%s); skipping", exc)
+        return
+
+    if not hasattr(_iu, "is_vllm_available"):
+        return
+    _iu.is_vllm_available = lambda: False
+    logger.info("[trl_compat] pinned trl.import_utils.is_vllm_available()=False "
+                "(EvoGuard uses use_vllm=False; TRL 0.19 targets the pre-0.19 "
+                "vLLM sampling-params API)")

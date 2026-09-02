@@ -41,25 +41,44 @@ MAX_LORA_RANK="${EVOGUARD_VLLM_MAX_LORA_RANK:-64}"
 MAX_LORAS="${EVOGUARD_VLLM_MAX_LORAS:-4}"
 LORA_MODULES_CSV="${EVOGUARD_VLLM_LORA_MODULES:-}"
 
+# Word-split passthrough for per-model engine flags this wrapper does not model,
+# e.g. EVOGUARD_VLLM_EXTRA_ARGS="--gdn-prefill-backend triton" for Qwen3.5's
+# hybrid linear-attention layers (flashinfer's sm90a gated-delta-rule prefill
+# kernel aborts on the first forward pass on this driver; see
+# scripts/start_vllm_secondary.sh for the full trace).
+EXTRA_ARGS=()
+if [[ -n "${EVOGUARD_VLLM_EXTRA_ARGS:-}" ]]; then
+    read -ra EXTRA_ARGS <<<"$EVOGUARD_VLLM_EXTRA_ARGS"
+fi
+
 # Resolve which python interpreter launches the vLLM server.
 #
 # Priority order (highest first):
 #   1. EVOGUARD_VLLM_PYBIN explicit override (e.g. /opt/conda/envs/foo/bin/python)
 #   2. EVOGUARD_PY_BIN exported by scripts/setup_evoguard_env.sh's activation hook
-#   3. The conda env that also runs the trainer. Serving and training share one
-#      env as of 2026-09-02: `evoguard` had transformers 5.16.1, which
-#      vllm 0.8.5's `get_cached_tokenizer` cannot wrap
-#      (AttributeError: Qwen2Tokenizer has no attribute
-#      all_special_tokens_extended), so a separate `vllm085` env existed purely
-#      to serve. Pinning transformers==4.51.3 (+ tokenizers 0.21.4,
-#      huggingface_hub 0.36.2) in `evoguard` removed the need -- that is trl
-#      0.19's native pairing, so the trainer is unaffected.
+#   3. The conda env that also runs the trainer. `evoguard2` (2026-09-02) holds
+#      vllm 0.19.1 + torch 2.10.0+cu128 + transformers 4.57.6 + trl 0.19.0 +
+#      peft 0.19.0: one env serves AND trains. Why this exact set:
+#        * vllm >= 0.20 ships a CUDA-13 wheel stack (nvidia-*-cu13) which needs
+#          driver >= 580; this box is 550.127.08 / CUDA 12.4, so 0.19.1 is the
+#          newest usable release. It registers Qwen3_5ForConditionalGeneration,
+#          so Qwen3.5-9B serves here and Qwen2.5 keeps its SupportsLoRA path.
+#        * torch 2.10 is what fixes the r0 crash: peft 0.19's UPCAST_DTYPES
+#          references torch.float8_e8m0fnu (torch >= 2.7), which the previous
+#          env's torch 2.6.0 did not define, so get_peft_model() died on the
+#          very first SFT.
+#        * trl stays at 0.19.0 on purpose -- _DeltaShapedGRPOTrainer overrides
+#          GRPOTrainer._generate_and_score_completions (GDPO + trajectory pooling
+#          + Delta shaping all hang off it), so trl 1.x is a code migration, not
+#          an env bump.
+#      The predecessor `evoguard` env (vllm 0.8.5 + torch 2.6) is left intact as
+#      the rollback target.
 if [[ -n "${EVOGUARD_VLLM_PYBIN:-}" && -x "$EVOGUARD_VLLM_PYBIN" ]]; then
     VLLM_PY="$EVOGUARD_VLLM_PYBIN"
 elif [[ -n "${EVOGUARD_PY_BIN:-}" && -x "$EVOGUARD_PY_BIN" ]]; then
     VLLM_PY="$EVOGUARD_PY_BIN"
 else
-    VLLM_PY="/root/miniconda3/envs/evoguard/bin/python"
+    VLLM_PY="/root/miniconda3/envs/evoguard2/bin/python"
 fi
 echo "   python_bin   : $VLLM_PY"
 
@@ -109,20 +128,34 @@ if [[ "$ENABLE_LORA" != "0" ]]; then
     fi
 fi
 
-# vLLM 0.8.x gates the /v1/load_lora_adapter + /v1/unload_lora_adapter HTTP
-# routes behind env var VLLM_ALLOW_RUNTIME_LORA_UPDATING (see
-# vllm/entrypoints/openai/api_server.py:783). Passing --enable-lora alone is NOT
-# enough -- without this env flag the routes never register and our pipeline's
-# per-round hot-load call (scripts/register_vllm_lora.sh) returns HTTP 404.
+# vLLM gates the /v1/load_lora_adapter + /v1/unload_lora_adapter HTTP routes
+# behind env var VLLM_ALLOW_RUNTIME_LORA_UPDATING (0.8.x:
+# entrypoints/openai/api_server.py; 0.19.x: entrypoints/serve/lora/api_router.py).
+# Passing --enable-lora alone is NOT enough -- without this env flag the routes
+# never register and our per-round hot-load call
+# (scripts/register_vllm_lora.sh) returns HTTP 404.
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING="${VLLM_ALLOW_RUNTIME_LORA_UPDATING:-1}"
 
-# Force LEGACY engine path. The experimental V1 engine in vllm 0.8.x does NOT
-# fully initialize lora_manager when --enable-lora is passed, causing every
-# POST /v1/load_lora_adapter call to fail with
+# Engine selection, decided by ASKING the interpreter rather than by assumption.
+#
+# On vllm 0.8.x the legacy V0 engine was mandatory for dynamic LoRA: V1 did not
+# finish initialising lora_manager under --enable-lora, so every
+# POST /v1/load_lora_adapter died with
 #   AttributeError: 'GPUModelRunner' object has no attribute 'lora_manager'
-# The legacy engine handles dynamic LoRA hot-loading correctly end-to-end as
-# verified on 2026-07-21 with a probe server launched under evoguard python3.12.
-export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+# V0 also sidestepped V1's memory profiling, which refuses to start at a low
+# --gpu-memory-utilization when another process already holds part of the card.
+#
+# vllm >= ~0.11 REMOVED V0 and with it the VLLM_USE_V1 knob (it is absent from
+# vllm.envs.environment_variables on 0.19.1). Exporting it there is at best dead
+# weight and at worst confusing when reading a log, and V1 LoRA hot-load has
+# worked since 0.9. So probe for the knob and only set it when it exists.
+if "$VLLM_PY" -c "import sys, vllm.envs as e; sys.exit(0 if 'VLLM_USE_V1' in getattr(e, 'environment_variables', {}) else 1)" >/dev/null 2>&1; then
+    export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+    echo "   engine       : V0 (VLLM_USE_V1=$VLLM_USE_V1; required for LoRA hot-load on vllm 0.8.x)"
+else
+    unset VLLM_USE_V1 2>/dev/null || true
+    echo "   engine       : V1 only (this vLLM has no VLLM_USE_V1 knob)"
+fi
 
 CUDA_VISIBLE_DEVICES="$GPU_ID" \
 nohup "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
@@ -135,6 +168,7 @@ nohup "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
     --max-model-len     "$MAX_MODEL_LEN" \
     --trust-remote-code \
     "${LORA_ARGS[@]}" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     >"$LOG_FILE" 2>&1 &
 
 VLLM_PID=$!
