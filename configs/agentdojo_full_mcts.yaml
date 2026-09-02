@@ -133,8 +133,18 @@ training:
   grpo_group_size_g: 8
   grpo_clip_epsilon: 0.20
   grpo_rollout_temperature: 0.90
-  grpo_max_prompts_per_round: 32
+  grpo_max_prompts_per_round: 400                # ROW budget; at K=1 this is also the prompt count.
+                                                 # Requires native_max_steps_per_round >= 400.
   grpo_min_new_successes: 3
+
+  grpo_gdpo: true                                # per-term group standardisation then batch rescale;
+                                                 # reward stays R = r_safety + r_progress - p_drift.
+  grpo_traj_group_size: 1                        # one prompt per record; pooled-baseline fallback is a no-op.
+
+  grpo_advantage_curriculum_lambda: 1.5          # Ã=(1+λ·δ_p)·A -- the ONLY path Δ has into training;
+                                                 # WAS 0.0, i.e. a Δ-guided attacker vs a Δ-blind defender.
+  grpo_clean_prompt_ratio: 0.25                  # 100 benign rows of the 400 budget. WAS 0.0 (attacked-only),
+                                                 # which recreates the zero-gradient condition grpo_gdpo fixes.
 
   # ---- Trainer infrastructure shared by both phases ------------------ #
   per_device_batch_size: 1
@@ -143,7 +153,7 @@ training:
   dry_run: false                                # genuine weight updates every viable round.
   use_native_trainer: true                       # bypass vendored llamafactory-cli / verl CLIs.
   cuda_visible_devices: "2"                      # GPU2 freed by killing stale TP workers; isolated card for fit().
-  native_max_steps_per_round: 200                # triple optimizer steps/round.
+  native_max_steps_per_round: 400                # binding cap on prompt coverage at K=1 (1 step = 1 prompt).
 
 pipeline:
   max_rounds: 12                                 # same as v4_grpo_v2.

@@ -153,8 +153,51 @@ training:
   grpo_group_size_g: 8                           # G=8 completions sampled per prompt for group-relative advantage estimation.
   grpo_clip_epsilon: 0.20                        # PPO-style ratio clipping ε standard value.
   grpo_rollout_temperature: 0.90                 # inner-loop sampling temp (>defense.temp) encourages exploration of refusal-vs-compliance modes against injected states.
-  grpo_max_prompts_per_round: 32                 # cap prompts fed into trainer each round bounds runtime added wall-clock vs SFT-only rounds observed empirically.
+  # ROW budget per round. WAS 32, which at K=1 means one optimizer step per
+  # prompt and therefore 32 distinct decision points per round against ~54
+  # tasks -- most tasks contributed nothing to any given update. 400 covers the
+  # whole extracted pool instead of a thin sample of it. Must be paired with
+  # native_max_steps_per_round >= this value or the extra prompts are simply
+  # never reached (see that field).
+  grpo_max_prompts_per_round: 400
   grpo_min_new_successes: 3                      # skip incremental retrain unless >=3 fresh B-trajectories collected this round preventing noisy micro-updates late in convergence tail.
+
+  # ---- Advantage normalisation --------------------------------------- #
+  # GDPO: standardise EACH reward term inside the group of G siblings, sum the
+  # per-term advantages, then rescale batch-wise. The reward itself is
+  # untouched -- still R = r_safety + r_progress - p_drift. Motivation is the
+  # measured zero-gradient problem: r_safety spans 10 points against
+  # r_progress's 3.7 and p_drift's 0.5, so summing first lets r_safety set the
+  # group std almost alone and a group that agrees about the bait but disagrees
+  # about progress gets a near-degenerate signal.
+  grpo_gdpo: true
+  # K = steps sampled per trajectory. 1 = one prompt per record, bit-for-bit
+  # legacy; the trajectory-pooled baseline fallback in _DeltaShapedGRPOTrainer
+  # is a proven no-op at this value. K=2 was tried (see the last_traj run): it
+  # fixed reward saturation but did NOT improve held-out ASR, so K=1 keeps the
+  # row budget spent on distinct trajectories instead of extra steps of the
+  # same one -- 400 rows = 400 trajectories here, not 200.
+  grpo_traj_group_size: 1
+
+  # ---- Where Δ enters, and what balances the "refuse everything" pull -- #
+  # λ of Ã = (1 + λ·δ_p)·A, applied on top of the group-relative advantage.
+  # Since S1 deleted the inline r_early term this is the ONLY place Δ still
+  # touches training, so λ=0.0 (the previous value here) silently discarded Δ
+  # altogether -- a Δ-guided attacker paired with a Δ-blind defender update.
+  # 1.5 matches plan_abc / last_traj / gdpo_val.
+  grpo_advantage_curriculum_lambda: 1.5
+  # Fraction of the row budget reserved for BENIGN prompts cut from clean (A)
+  # trajectories: 0.25 of 400 = 100 clean rows against 300 attacked ones. They
+  # run the same formula with r_safety pinned, so all their signal is the judged
+  # r_progress term. WAS 0.0 (attacked-only), which is the 一刀切 condition:
+  # every prompt pays for blocking, all G siblings converge on blocking, reward
+  # std collapses and nothing in the gradient separates "blocked and still
+  # served the user" from "blocked and gave up". That is also the zero-gradient
+  # condition grpo_gdpo above is meant to relieve, so leaving it at 0.0 would
+  # have had the two knobs working against each other. It is additionally what
+  # makes pipeline.clean_rollouts_per_task: 6 pay off on the RL side and not
+  # only in the SFT corpus.
+  grpo_clean_prompt_ratio: 0.25
 
   # ---- Trainer infrastructure shared by both phases ------------------ #
   per_device_batch_size: 1
@@ -164,7 +207,12 @@ training:
   use_native_trainer: true                       # bypass vendored llamafactory-cli / verl CLIs whose pinned deps clash with installed stack.
   cuda_visible_devices: "1"                      # CHANGED FROM "4" -> GPU4 unknown residual state today; GPUs#0,#1,#5 all truly empty (<1MB resident).
                                                  # Primary qwen2.5 lives on GPU6 (37G), secondary judge llama3 on GPU7 (34G), so picking isolated GPU1 keeps fit() OOM-free.
-  native_max_steps_per_round: 200                # WAS 60 -- v2 tuning triples optimizer steps so reward signal can actually shape adapter weights before next attack wave arrives.
+  native_max_steps_per_round: 400                # RAISED 200 -> 400 alongside grpo_max_prompts_per_round.
+                                                 # At K=1 one optimizer step consumes exactly one prompt
+                                                 # (generation batch = per_device_batch x steps_per_generation
+                                                 # = 1 x gradient_accumulation = 8 = G), so this field is the
+                                                 # BINDING cap on prompt coverage: leaving it at 200 would
+                                                 # silently discard half of the 400-row budget.
 
 pipeline:
   max_rounds: 12                                 # UNCHANGED vs v3 fair-comparison basis; early-stop ε=0.05 K=5 patience may fire sooner if GRPO actually improves defense faster than SFT did.
