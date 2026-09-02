@@ -526,14 +526,25 @@ class DefenderDatasetBuilder:
         # routing a refusal back onto a clean twin that itself failed the task
         # teaches "block the attack, then fail" -- exactly what
         # ``blocked_unfinished_rate`` counts.
+        #
+        # With ``pipeline.clean_rollouts_per_task > 1`` a task carries several
+        # clean records, so which one wins is a decision rather than an accident:
+        # take the highest-utility sample (unscored sorts as 1.0, same
+        # convention as :meth:`_cap_per_task`), ties on record order. At one
+        # clean record per task this is the record it always was.
         cleans_by_task: dict[str, Trajectory] = {}
+        best_clean_utility: dict[str, float] = {}
         for rec in records:
             if rec.kind is not TrajectoryKind.CLEAN:
                 continue
             if not self._passes_utility(rec):
                 stats["clean_dropped_low_utility"] += 1
                 continue
+            util = 1.0 if rec.utility is None else float(rec.utility)
+            if rec.task_id in cleans_by_task and util <= best_clean_utility[rec.task_id]:
+                continue
             cleans_by_task[rec.task_id] = rec.trajectory
+            best_clean_utility[rec.task_id] = util
 
         # Two-class mode selects its source rollouts up front: only A and C that
         # passed the utility bar are eligible.
@@ -572,6 +583,12 @@ class DefenderDatasetBuilder:
         # corpus is known. Each group is (record_id, rows) so admission order is
         # a property of the data, not of iteration order.
         corrective_groups: list[tuple[str, list[SFTExample]]] = []
+        # Byte-identical clean repeats contribute nothing but duplicated rows.
+        # Sampling the same task N times is how the clean arm stops being the
+        # scarce class, but a deterministic-enough policy will hand back the same
+        # trajectory more than once, and N copies of one demonstration is not N
+        # demonstrations -- it is one, weighted N times.
+        seen_clean: set[tuple[str, str]] = set()
         for rec in records:
             task = self._tasks.get(rec.task_id)
             if task is None:
@@ -580,6 +597,11 @@ class DefenderDatasetBuilder:
             if rec.kind is TrajectoryKind.CLEAN:
                 if rec.task_id not in cleans_by_task:
                     continue                      # already counted as dropped
+                fingerprint = (rec.task_id, _trajectory_fingerprint(rec.trajectory))
+                if fingerprint in seen_clean:
+                    stats["clean_records_deduped"] += 1
+                    continue
+                seen_clean.add(fingerprint)
                 clean_rows.extend(self._imitate(task, tools, rec.trajectory))
                 stats["clean_records_used"] += 1
             elif rec.kind is TrajectoryKind.ATTACKED and rec.outcome is AttackOutcome.FAIL:
@@ -1140,6 +1162,22 @@ def _action_to_json(action: Action) -> str:
             }
         )
     return _dict_to_json({"thought": action.thought, "final_answer": action.final_answer})
+
+
+def _trajectory_fingerprint(traj: Trajectory) -> str:
+    """Identity of a trajectory for de-duplication purposes.
+
+    Covers observations as well as actions because :meth:`DatasetBuilder._imitate`
+    renders the prior observations into every prompt: two rollouts that chose the
+    same actions but saw different simulated tool results are different
+    supervision, and only a byte-identical pair is a true duplicate.
+    """
+
+    return hashlib.sha1(
+        "\x1e".join(
+            f"{_action_to_json(a)}\x1f{a.observation or ''}" for a in traj.actions
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _clone_with_observation(action: Action) -> Action:

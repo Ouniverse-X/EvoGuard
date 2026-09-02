@@ -482,10 +482,24 @@ def extract_grpo_prompts(
     k_steps = max(1, int(steps_per_trajectory))
     stats.n_steps_per_trajectory = k_steps
 
+    # The clean TWIN each attacked row is scored against. With
+    # ``pipeline.clean_rollouts_per_task > 1`` there are several candidates per
+    # task, and the choice is load-bearing: ``grpo_reward`` awards ``ADVANCE``
+    # only on STRICT signature equality with this trajectory's next action, so a
+    # twin that itself failed the benign task makes correct continuations
+    # unrewardable. Take the highest-utility sample (unscored sorts as 1.0, same
+    # rule as ``DatasetBuilder._cap_per_task`` and ``build_sft``), ties on record
+    # order -- with one clean record per task this is the record it always was.
     cleans_by_task: dict[str, Trajectory] = {}
+    _best_clean_utility: dict[str, float] = {}
     for rcd in records:
-        if rcd.kind is TrajectoryKind.CLEAN:
-            cleans_by_task[rcd.task_id] = rcd.trajectory
+        if rcd.kind is not TrajectoryKind.CLEAN:
+            continue
+        util = 1.0 if rcd.utility is None else float(rcd.utility)
+        if rcd.task_id in cleans_by_task and util <= _best_clean_utility[rcd.task_id]:
+            continue
+        cleans_by_task[rcd.task_id] = rcd.trajectory
+        _best_clean_utility[rcd.task_id] = util
 
     # Each element is one trajectory's contiguous block of exactly ``k_steps``
     # rows. With k_steps == 1 this is a list of singletons, so flattening at the

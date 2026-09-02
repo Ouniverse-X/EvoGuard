@@ -232,6 +232,9 @@ class Pipeline:
             round_id=round_id,
             task_concurrency=getattr(self.cfg.pipeline, "task_concurrency", 1),
             attack_concurrency=getattr(self.cfg.pipeline, "attack_concurrency", 1),
+            clean_rollouts_per_task=getattr(
+                self.cfg.pipeline, "clean_rollouts_per_task", 1
+            ),
         )
 
         n_total_tasks_in_env = sum(1 for t in env.get_tasks())

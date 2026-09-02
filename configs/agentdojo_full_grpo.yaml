@@ -127,6 +127,12 @@ training:
   # ---- Cold-start SFT knobs (only used by r0) ----------------------- #
   sft_epochs: 2.0
   sft_learning_rate: 1.0e-4
+  # Per-task, per-CLASS rollout cap (clean / attack_fail / attack_success), kept
+  # in step with pipeline.clean_rollouts_per_task below so all 6 clean samples of
+  # a task can survive into the corpus. Records are ranked by utility inside each
+  # class before the cut, so raising this admits the next-best rollout, never a
+  # worse one.
+  sft_max_records_per_task: 6
 
   # ---- Native-GRPO knobs ------------------------------------------- #
   # v2 TUNING (2026-07-24): based on v4 r0-r8 results showing ASR monotonically
@@ -168,5 +174,15 @@ pipeline:
   validation_fraction: 0.15                      # held-out tail fraction reserved for independent early-stop signalling.
   task_concurrency: 8                            # outer fan-out elevated matching v3 setup exploiting freed throughput now judge moved offline away from main shared server.
   attack_concurrency: 8                          # inner fan-out matched symmetrically; effective burst ~64 simultaneous requests fits comfortably inside one PCIe-A100 batching envelope.
+  # WAS 1 (implicitly). The clean arm was the scarce class: one A rollout per task
+  # per round had to serve as BOTH the SFT clean supervision and the clean twin,
+  # and the twin decides whether a B record gets a continuation (_corrective phase
+  # 3) or degenerates to "refuse, then stop" -- which happened to 33.7% of r0's
+  # corrective rows. The clean arm delivers ~71.8% of the time, so P(no usable
+  # twin) drops from 28% at N=1 to ~0.1% at N=6. Deliberately NOT paired with a
+  # temperature rise: the failures are sampling variance, and a hotter policy
+  # would degrade the very trajectories we imitate. Repeats that come back
+  # byte-identical are de-duplicated when the corpus is built.
+  clean_rollouts_per_task: 6
 
 evo_data_subdir: "agentdojo"

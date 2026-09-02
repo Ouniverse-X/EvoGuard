@@ -431,6 +431,37 @@ class PipelineConfig:
     task_concurrency: int = 4
     attack_concurrency: int = 4
 
+    # ------------------------------------------------------------------ #
+    # Clean-arm sample count                                             #
+    # ------------------------------------------------------------------ #
+    # How many CLEAN (trajectory A) rollouts to collect per task per round.
+    # One was never a design decision, it was the obvious default, and it makes
+    # the clean arm the scarce class twice over:
+    #
+    #   * as SFT supervision -- a task contributes up to 15 attacked rollouts
+    #     against exactly 1 clean one, so the per-task cap has almost nothing to
+    #     choose from on the clean side;
+    #   * as the clean TWIN -- one sample decides, for the whole round, whether a
+    #     task has a usable twin at all. When it does not, every B record for that
+    #     task loses ``_corrective`` phase 3 and degenerates to "refuse, then
+    #     stop" (33.7% of r0's corrective rows). The twin also supplies the
+    #     ``ADVANCE`` ground truth in ``grpo_reward``, so a task whose single
+    #     clean rollout happened to fail cannot reward correct continuations
+    #     either.
+    #
+    # Those failures are SAMPLING VARIANCE, not task difficulty: the clean arm
+    # delivers 71.8% of the time, so P(no usable twin) falls from 28% at N=1 to
+    # 0.1% at N=6. That is why this is a repetition knob and NOT a temperature
+    # one -- raising the agent's temperature to buy diversity would degrade the
+    # very trajectories we want to imitate.
+    #
+    # All N are persisted as CLEAN records (the round's utility statistics get N
+    # times the samples), the highest-utility one becomes the twin handed to the
+    # attacked rollouts, and ``dataset_builder.build_sft`` de-duplicates
+    # byte-identical repeats so the corpus does not simply gain N copies of one
+    # trajectory. Cost is linear: N clean rollouts per task per round.
+    clean_rollouts_per_task: int = 1
+
 
 @dataclass
 class ExperimentConfig:

@@ -123,6 +123,9 @@ training:
   # ---- Cold-start SFT knobs (only used by r0) ----------------------- #
   sft_epochs: 2.0
   sft_learning_rate: 1.0e-4
+  sft_max_records_per_task: 6                    # per-task PER-CLASS cap; matches
+                                                # pipeline.clean_rollouts_per_task so
+                                                # all 6 clean samples can survive.
 
   # ---- Native-GRPO knobs (identical to v4_grpo_v2 for fair comparison) #
   grpo_learning_rate: 5.0e-6
@@ -150,5 +153,13 @@ pipeline:
   validation_fraction: 0.15
   task_concurrency: 8
   attack_concurrency: 8
+  clean_rollouts_per_task: 6                     # WAS 1 implicitly. One A rollout per
+                                                # task had to serve as both the SFT
+                                                # clean supervision and the clean twin;
+                                                # at a 71.8% clean delivery rate that
+                                                # left 28% of tasks with no usable twin,
+                                                # and a task without one turns its B
+                                                # records into "refuse, then stop". No
+                                                # temperature change -- see config.py.
 
 evo_data_subdir: "agentdojo"

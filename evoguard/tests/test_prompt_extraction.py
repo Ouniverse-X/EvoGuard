@@ -905,6 +905,90 @@ class TestDecisionStepRetargeting(unittest.TestCase):
         )
 
 
+class TestTwinSelectionAmongRepeats(unittest.TestCase):
+    """Which clean record becomes the twin when a task has several.
+
+    ``pipeline.clean_rollouts_per_task`` (6 in the shipping configs) samples the
+    clean arm N times per task, so ``cleans_by_task`` has N candidates to choose
+    from instead of one. The choice decides what ``ADVANCE`` means: the reward
+    demands STRICT signature equality with this trajectory's aligned action, so a
+    twin drawn from a rollout that itself failed the benign task makes correct
+    continuations unrewardable. The rule -- highest utility, ``None`` sorting as
+    1.0 -- must match ``DatasetBuilder._cap_per_task`` and ``build_sft``, or the
+    reward is computed against a different trajectory than the SFT corpus
+    imitates.
+    """
+
+    def setUp(self) -> None:
+        self.builder = DefenderDatasetBuilder(
+            tasks_by_id={"t1": _make_task()},
+            tools_by_task={"t1": [_make_tool("get_balance"), _make_tool("read_file")]},
+        )
+
+    def _attacked(self) -> TrajectoryRecord:
+        return _make_record(
+            kind=TrajectoryKind.ATTACKED,
+            task_id="t1",
+            inj_point=1,
+            turning_point=3,
+            outcome=AttackOutcome.SUCCESS,
+            attack=_make_attack(target_turn=1),
+            actions_turns=[0, 1, 2, 3],
+            actions_tool_names=["read_file", "read_file", "get_balance", None],
+        )
+
+    @staticmethod
+    def _clean(utility, *, turn2_tool: str, turn2_args: dict) -> TrajectoryRecord:
+        rec = _make_record(
+            kind=TrajectoryKind.CLEAN,
+            task_id="t1",
+            actions_turns=[0, 1, 2, 3],
+            actions_tool_names=["read_file", "read_file", turn2_tool, None],
+        )
+        rec.utility = utility
+        for act in rec.trajectory.actions:
+            if int(act.turn) == 2 and act.tool_call is not None:
+                act.tool_call.arguments = dict(turn2_args)
+        return rec
+
+    def _twin_of(self, cleans: list[TrajectoryRecord]) -> tuple[str, dict]:
+        rows, _ = extract_grpo_prompts(
+            records=[*cleans, self._attacked()], dataset_builder=self.builder
+        )
+        self.assertEqual(len(rows), 1)
+        m = rows[0].meta
+        return m.clean_twin_action_tool_name, m.clean_twin_action_args
+
+    def test_best_utility_wins_over_record_order(self):
+        # The GOOD sample is first, so a last-wins dict would pick the bad one.
+        good = self._clean(0.9, turn2_tool="get_balance", turn2_args={"account": "checking"})
+        bad = self._clean(0.2, turn2_tool="read_file", turn2_args={"path": "junk.txt"})
+        self.assertEqual(
+            self._twin_of([good, bad]), ("get_balance", {"account": "checking"})
+        )
+
+    def test_best_utility_wins_when_it_arrives_last(self):
+        bad = self._clean(0.2, turn2_tool="read_file", turn2_args={"path": "junk.txt"})
+        good = self._clean(0.9, turn2_tool="get_balance", turn2_args={"account": "checking"})
+        self.assertEqual(
+            self._twin_of([bad, good]), ("get_balance", {"account": "checking"})
+        )
+
+    def test_unscored_sorts_as_one_matching_the_cap_convention(self):
+        scored = self._clean(0.9, turn2_tool="read_file", turn2_args={"path": "junk.txt"})
+        unscored = self._clean(None, turn2_tool="get_balance", turn2_args={"account": "checking"})
+        self.assertEqual(
+            self._twin_of([scored, unscored]), ("get_balance", {"account": "checking"})
+        )
+
+    def test_ties_keep_the_first_record(self):
+        first = self._clean(0.7, turn2_tool="get_balance", turn2_args={"account": "checking"})
+        second = self._clean(0.7, turn2_tool="read_file", turn2_args={"path": "junk.txt"})
+        self.assertEqual(
+            self._twin_of([first, second]), ("get_balance", {"account": "checking"})
+        )
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -916,6 +1000,7 @@ def main() -> int:
     suite.addTests(loader.loadTestsFromTestCase(TestCleanRatioBudget))
     suite.addTests(loader.loadTestsFromTestCase(TestCleanTwinStepIdentityPlumbing))
     suite.addTests(loader.loadTestsFromTestCase(TestDecisionStepRetargeting))
+    suite.addTests(loader.loadTestsFromTestCase(TestTwinSelectionAmongRepeats))
     runner = unittest.TextTestRunner(verbosity=2)
     rc = runner.run(suite).wasSuccessful()
     print(f"\n{'ALL TESTS PASSED' if rc else 'TESTS FAILED'}\n")

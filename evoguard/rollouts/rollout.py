@@ -171,6 +171,7 @@ def collect_tri_rollouts(
     *,
     task_concurrency: int = 1,
     attack_concurrency: int = 1,
+    clean_rollouts_per_task: int = 1,
 ) -> RoundRollouts:
     """Collect the (A, B/C...) records for every task in a round.
 
@@ -188,6 +189,13 @@ def collect_tri_rollouts(
                             Two independent fan-out layers. Effective peak outbound
                             request count ≈ their product; bounded externally by paid-
                             endpoint rate quota. Either <=1 disables that layer's pool.
+      * ``clean_rollouts_per_task`` --
+                            How many A trajectories to sample per task. All are
+                            returned as CLEAN records; the highest-utility one is
+                            the twin passed to the attacked rollouts, so it is
+                            also the twin that ``dataset_builder`` and
+                            ``grpo_reward`` see. ``1`` reproduces the historical
+                            behaviour exactly.
     """
 
     clean_runner = CleanRollout(controller, round_id)
@@ -310,20 +318,13 @@ def collect_tri_rollouts(
     # ------------------------------------------------------------------ #
     # Per-task worker body                                               #
     # ------------------------------------------------------------------ #
-    def _run_one_task(task: Task) -> tuple[
-        "TrajectoryRecord | None",
-        dict[int, tuple["TrajectoryRecord", EvaluatedAttack]],
-    ]:
-        """Roll out trajectory A then all N attacks for this single task.
+    n_clean = max(1, int(clean_rollouts_per_task))
 
-        Returns ``(clean_record_or_None, {attack_index_in_population -> (record, eval)})``
-        keyed by index-in-population rather than spec identity so the caller can
-        reassemble evaluations back into original order deterministically even if
-        threads complete out-of-order.
-        """
+    def _one_clean(task: Task) -> "TrajectoryRecord | None":
+        """One A rollout, with a single transient retry, or ``None``."""
 
         try:
-            clean_record = clean_runner.rollout(task)
+            return clean_runner.rollout(task)
         except Exception as exc:                                          # noqa: BLE001
             # Retry once after a short wait — vLLM may have been transiently
             # unreachable (e.g. just finishing model reload after LoRA hot-load).
@@ -336,15 +337,77 @@ def collect_tri_rollouts(
                 )
                 time.sleep(30)
                 try:
-                    clean_record = clean_runner.rollout(task)
+                    return clean_runner.rollout(task)
                 except Exception as exc2:                                  # noqa: BLE001
                     logger.error("Round %d task %s CLEAN rollout retry also failed: %s",
                                  round_id, task.task_id, exc2)
-                    return None, {}
+                    return None
+            logger.error("Round %d task %s CLEAN rollout failed: %s",
+                         round_id, task.task_id, exc)
+            return None
+
+    def _collect_clean(task: Task) -> list["TrajectoryRecord"]:
+        """``n_clean`` A rollouts for ``task``, BEST FIRST.
+
+        The head of the list is the round's twin for this task, so the ordering
+        is the whole point: it must be the highest-utility sample, because a twin
+        that itself failed the benign task cannot supply either
+        ``_corrective``'s continuation or ``grpo_reward``'s ``ADVANCE`` ground
+        truth. Unscored (``utility is None``) sorts as ``1.0``, matching
+        ``DatasetBuilder._cap_per_task`` so the twin and the surviving corpus
+        records are ranked by the same rule. Ties break on collection order, so
+        ``n_clean == 1`` returns exactly what the single-rollout path returned.
+
+        A failure is not fatal beyond the first: the task keeps whatever samples
+        it got. Only an empty list drops the task from the round.
+        """
+
+        attempt_1 = _one_clean(task)
+        if attempt_1 is None:
+            # No twin, so the attacked rollouts have no baseline to diverge from
+            # and the whole task is unusable this round -- retrying the repeats
+            # would only multiply the same failure.
+            return []
+        got = [attempt_1]
+        if n_clean > 1:
+            if attack_concurrency > 1:
+                with ThreadPoolExecutor(
+                    max_workers=min(int(attack_concurrency), n_clean - 1)
+                ) as pool:
+                    got.extend(
+                        r for r in pool.map(_one_clean, [task] * (n_clean - 1))
+                        if r is not None
+                    )
             else:
-                logger.error("Round %d task %s CLEAN rollout failed: %s",
-                             round_id, task.task_id, exc)
-                return None, {}
+                got.extend(
+                    r for r in (_one_clean(task) for _ in range(n_clean - 1))
+                    if r is not None
+                )
+        if len(got) < n_clean:
+            logger.warning(
+                "Round %d task %s: %d/%d CLEAN rollouts succeeded",
+                round_id, task.task_id, len(got), n_clean,
+            )
+        got.sort(key=lambda r: -(float(r.utility) if r.utility is not None else 1.0))
+        return got
+
+    def _run_one_task(task: Task) -> tuple[
+        list["TrajectoryRecord"],
+        dict[int, tuple["TrajectoryRecord", EvaluatedAttack]],
+    ]:
+        """Roll out trajectory A (``n_clean`` times) then all N attacks.
+
+        Returns ``(clean_records_best_first, {attack_index_in_population ->
+        (record, eval)})`` keyed by index-in-population rather than spec identity
+        so the caller can reassemble evaluations back into original order
+        deterministically even if threads complete out-of-order. The FIRST clean
+        record is the round's twin for this task -- see ``_collect_clean``.
+        """
+
+        clean_records = _collect_clean(task)
+        if not clean_records:
+            return [], {}
+        clean_record = clean_records[0]
 
         pop_for_this_task = precomputed_populations.get(task.task_id) or []
         local_results: dict[int, tuple[TrajectoryRecord, EvaluatedAttack]] = {}
@@ -363,7 +426,7 @@ def collect_tri_rollouts(
                         metadata={"record_id": rec.record_id},
                     ),
                 )
-            return clean_record, local_results
+            return clean_records, local_results
 
         def _one_attack(idx_and_spec):
             idx, spec = idx_and_spec
@@ -388,7 +451,7 @@ def collect_tri_rollouts(
                         "Round %d task %s: attack future raised: %s",
                         round_id, task.task_id, exc,
                     )
-        return clean_record, local_results
+        return clean_records, local_results
 
     # ------------------------------------------------------------------ #
     # Outer-level dispatcher                                              #
@@ -415,7 +478,7 @@ def collect_tri_rollouts(
                         "Round %d task %s OUTER failed: %s",
                         round_id, t_done.task_id, exc,
                     )
-                    outcome = (None, {})
+                    outcome = ([], {})
                 collected_pairs.append((t_done, outcome))
 
         # Re-sort by input-task order so persisted records stay stable across runs.
@@ -426,9 +489,8 @@ def collect_tri_rollouts(
     # ------------------------------------------------------------------ #
     # Assemble final results in canonical order                          #
     # ------------------------------------------------------------------ #
-    for t, (clean_record, attk_map_by_idx) in ordered_outcomes:
-        if clean_record is not None:
-            result.records.append(clean_record)
+    for t, (clean_records, attk_map_by_idx) in ordered_outcomes:
+        result.records.extend(clean_records)
 
         pop_list = precomputed_populations.get(t.task_id) or []
         evals_ordered: list[EvaluatedAttack] = []
