@@ -24,6 +24,10 @@ from evoguard.process.dataset_builder import (
     _payload_probe,
 )
 from evoguard.training.grpo_reward import PromptMeta, _action_signature
+from evoguard.training.step_safety_judge import (
+    build_reference_timeline,
+    build_step_timeline,
+)
 from evoguard.utils.logging import get_logger
 
 logger = get_logger("training.grpo_prompt_extraction")
@@ -551,6 +555,13 @@ def extract_grpo_prompts(
         group_id = f"a:{rcd.record_id}" if k_steps > 1 else ""
 
         group_rows: list[GrpoPromptRow] = []
+        # Fingerprint of the attacker's text, reused per step below to decide
+        # whether the payload is already on screen at that step.
+        payload_probe = _payload_probe(rcd.attack) if rcd.attack is not None else ""
+        clean_twin_traj = cleans_by_task.get(rcd.task_id)
+        benign_timeline = build_reference_timeline(
+            getattr(clean_twin_traj, "actions", ()) or ()
+        )
         for s_idx in step_indices:
             history_prefix_actions = rcd.trajectory.actions[:s_idx]
             user_text = render_history(history_prefix_actions)
@@ -593,6 +604,13 @@ def extract_grpo_prompts(
                 traj_group_id=group_id,
                 injected_payload_excerpt=payload_excerpt,
                 attacker_goal=attacker_goal,
+                prefix_timeline=build_step_timeline(
+                    history_prefix_actions, inj_point
+                ),
+                benign_reference_timeline=benign_timeline,
+                payload_visible_in_prefix=_payload_visible_at(
+                    rcd.trajectory.actions, s_idx, payload_probe
+                ),
             )
             group_rows.append(
                 GrpoPromptRow(system=sys_str, user=user_text, meta=meta)

@@ -12,6 +12,12 @@ from __future__ import annotations
 ROLE_DEFENSE = "defense_agent"
 ROLE_TOOL_EXECUTOR = "tool_executor"
 ROLE_JUDGE = "attack_judge"
+#: Step-level safety judge on the GRPO reward path. Deliberately distinct from
+#: :data:`ROLE_JUDGE`: the two ask different questions (see
+#: ``evoguard/training/step_safety_judge.py``) and MockClient must not route a
+#: step-level request into the trajectory-level handler, which would read
+#: payload keys the step prompt never sends and answer 0 on everything.
+ROLE_STEP_SAFETY_JUDGE = "step_safety_judge"
 ROLE_TASK_COMPLETION = "task_completion_judge"
 ROLE_ATTACKER_GENERATE = "attacker_generate"
 ROLE_ATTACKER_CROSSOVER = "attacker_crossover"

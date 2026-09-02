@@ -5,14 +5,25 @@ A vLLM server started with ``python -m vllm.entrypoints.openai.api_server`` (or
 per-request LoRA adapter selection by passing the adapter name as the ``model``.
 This client therefore covers both hosted OpenAI endpoints and self-hosted vLLM.
 
-Structured output (``response_format={"type": "json_schema", ...}``) is sent
-over the wire when callers pass a schema. If the endpoint rejects it -- either
-with an HTTP 400 mentioning ``response_format``/``json_schema``, or because
-the returned text fails downstream parsing -- we transparently retry once
-without ``response_format`` so existing best-effort parsers stay effective.
-A per-instance capability cache makes this probe happen at most once per
-client lifetime, after which subsequent requests skip straight to whichever
-mode is known to work.
+Structured output is negotiated down a THREE-rung ladder, each rung cached
+sticky-false per client instance so the probe happens at most once per rung
+per client lifetime:
+
+1. ``response_format={"type": "json_schema", "json_schema": {...}}`` -- the
+   OpenAI wire format.
+2. ``extra_body={"guided_json": <schema>}`` -- vLLM's native guided-decoding
+   parameter, which older servers accept when they reject rung 1.
+3. unconstrained decoding, leaving the caller's best-effort text parsers as the
+   only defence.
+
+Callers pass a BARE JSON Schema (see :mod:`evoguard.llm.schemas`); rung 1 wraps
+it. Passing the bare schema straight through as ``response_format`` -- which is
+what every call site did until 2026-09-02 -- makes an OpenAI-compatible server
+read the schema's own ``"type": "object"`` as the response-format discriminator
+and reject the request with a pydantic ``literal_error`` on
+``body.response_format.type``. The rejection was indistinguishable from "this
+endpoint has no structured output", so rung 3 absorbed it and EVERY structured
+call in the project decoded unconstrained.
 """
 
 from __future__ import annotations
@@ -100,6 +111,9 @@ class OpenAIClient(LLMClient):
         #   True  -> confirmed supported after one successful constrained completion.
         #   False -> rejected once; skip strict mode for all future calls in this run.
         self._schema_supported: Optional[bool] = None
+        # Same three states for the vLLM ``guided_json`` rung, probed only once
+        # ``response_format`` has been ruled out.
+        self._guided_supported: Optional[bool] = None
         # Warn at most once about user-supplied response_format collision via extra.
         self._extra_collision_warned = False
 
@@ -126,8 +140,8 @@ class OpenAIClient(LLMClient):
         if self.config.extra:
             kwargs.update(self._merge_extra(self.config.extra))
 
-        use_strict_mode = (
-            response_format is not None and self._schema_supported is not False
+        use_strict_mode = response_format is not None and not (
+            self._schema_supported is False and self._guided_supported is False
         )
         return self._call_with_degrade(kwargs, response_format if use_strict_mode else None)
 
@@ -157,33 +171,55 @@ class OpenAIClient(LLMClient):
     def _call_with_degrade(
         self,
         base_kwargs: dict,
-        response_format: Optional[dict],
+        schema: Optional[dict],
     ) -> LLMResponse:
-        """Run the API call with optional structured-output + degrade path."""
+        """Run the API call, walking the constraint ladder on rejection.
 
-        attempt_kwargs = dict(base_kwargs)
-        if response_format is not None:
-            attempt_kwargs["response_format"] = response_format
+        ``schema`` is a BARE JSON Schema. Each rung is attempted at most once per
+        client lifetime: a rejection flips that rung's capability flag
+        sticky-false so later calls start at the first rung still viable.
+        """
 
-        try:
-            resp = self._invoke(attempt_kwargs)
-        except _SchemaRejectError as reject_exc:
-            # Endpoint doesn't grok json_schema — flip capability sticky-false
-            # and retry exactly once without response_format before giving up.
-            if response_format is None:
-                raise  # shouldn't happen but be defensive
-            logger.warning(
-                "Structured-output rejected (%s); degrading to unconstrained mode.",
-                str(reject_exc)[:200],
-            )
-            self._schema_supported = False
-            degrade_kwargs = {k: v for k, v in base_kwargs.items()
-                              if k != "response_format"}
-            return self._invoke(degrade_kwargs)
+        if schema is None:
+            return self._invoke(dict(base_kwargs))
 
-        if response_format is not None and self._schema_supported is None:
-            self._schema_supported = True
-        return resp
+        # Rung 1: OpenAI-style json_schema wrapper.
+        if self._schema_supported is not False:
+            attempt = dict(base_kwargs)
+            attempt["response_format"] = _as_openai_response_format(schema)
+            try:
+                resp = self._invoke(attempt)
+            except _SchemaRejectError as exc:
+                logger.warning(
+                    "response_format json_schema rejected (%s); trying guided_json.",
+                    str(exc)[:200],
+                )
+                self._schema_supported = False
+            else:
+                self._schema_supported = True
+                return resp
+
+        # Rung 2: vLLM's own guided-decoding parameter.
+        if self._guided_supported is not False:
+            attempt = dict(base_kwargs)
+            attempt["extra_body"] = {
+                **(base_kwargs.get("extra_body") or {}),
+                "guided_json": schema,
+            }
+            try:
+                resp = self._invoke(attempt)
+            except _SchemaRejectError as exc:
+                logger.warning(
+                    "guided_json rejected (%s); degrading to unconstrained decoding.",
+                    str(exc)[:200],
+                )
+                self._guided_supported = False
+            else:
+                self._guided_supported = True
+                return resp
+
+        # Rung 3: unconstrained.
+        return self._invoke(dict(base_kwargs))
 
     def _invoke(self, kwargs: dict) -> LLMResponse:
         """Call the SDK with backoff retries; translate schema-reject errors."""
@@ -203,7 +239,7 @@ class OpenAIClient(LLMClient):
                 )
             except Exception as exc:  # noqa: BLE001 - classify below
                 last_exc = exc
-                if _is_schema_rejection(exc) and "response_format" in kwargs:
+                if _is_schema_rejection(exc) and _carries_constraint(kwargs):
                     raise _SchemaRejectError(str(exc)) from exc
                 backoff = min(2.0 ** attempt, 30.0)
                 logger.warning(
@@ -222,6 +258,55 @@ class OpenAIClient(LLMClient):
 
 class _SchemaRejectError(RuntimeError):
     """Internal sentinel raised when the backend rejects json_schema."""
+
+
+#: Name attached to the wrapped schema. Servers echo it in error messages only;
+#: it is not part of the constraint.
+_SCHEMA_WRAPPER_NAME = "evoguard_structured_output"
+
+#: ``response_format`` values that are already in OpenAI wire form and must be
+#: forwarded verbatim instead of being wrapped a second time.
+_WIRE_FORMAT_TYPES = frozenset({"json_schema", "json_object", "text"})
+
+
+def _as_openai_response_format(schema: dict) -> dict:
+    """Wrap a bare JSON Schema in the OpenAI ``response_format`` envelope.
+
+    A caller that already built the envelope (``{"type": "json_schema", ...}``)
+    gets it back untouched -- the discriminator is the ``type`` field, which in a
+    bare schema is a JSON Schema type name (``object``/``array``/...) and never
+    one of :data:`_WIRE_FORMAT_TYPES`.
+
+    ``$schema`` is dropped: it is meaningless to the server and hosted OpenAI
+    rejects unknown keywords at the root of a strict-mode schema.
+    """
+
+    if str(schema.get("type", "")) in _WIRE_FORMAT_TYPES:
+        return schema
+    inner = {k: v for k, v in schema.items() if k != "$schema"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": _SCHEMA_WRAPPER_NAME,
+            "schema": inner,
+            "strict": True,
+        },
+    }
+
+
+def _carries_constraint(kwargs: dict) -> bool:
+    """Whether ``kwargs`` asks the server to constrain decoding.
+
+    Used to decide if an HTTP 400 should be re-raised as a ladder-advancing
+    :class:`_SchemaRejectError` rather than retried with backoff. A request with
+    no constraint at all has nothing left to degrade to, so its 400 is a genuine
+    failure.
+    """
+
+    if "response_format" in kwargs:
+        return True
+    extra = kwargs.get("extra_body")
+    return isinstance(extra, dict) and "guided_json" in extra
 
 
 def _is_schema_rejection(exc: Exception) -> bool:

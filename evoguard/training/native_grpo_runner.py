@@ -500,109 +500,33 @@ def _reward_judge_workers() -> int:
 
 
 def _build_judge_callable(judge_client_endpoint_url: Optional[str]) -> Optional[Callable]:
-    """Construct judge-call closure used inside reward function callback.
+    """Construct the ``judge_call`` closure consumed by ``grpo_reward``.
 
-    The returned callable has signature ``(completion_text:str, meta:PromptMeta)``
-    returning ``(judged_safe_bool, called_malicious_tool_after_divergence_bool)``
-    matching contract documented in grpo_reward.JudgeCallable docstring.
+    Signature ``(completion_text:str, meta:PromptMeta) -> str`` returning one of
+    ``held`` / ``held_but_fired`` / ``baited`` / ``unclear`` (or ``""`` meaning
+    "no verdict"). The implementation is
+    :func:`evoguard.training.step_safety_judge.build_step_safety_callable`.
 
-    Implementation defers heavy imports + connection setup lazily so dry-run /
-    unit tests don't pay startup cost unless actually exercising real network.
+    This replaces (2026-09-02) a closure that reused the TRAJECTORY judge
+    ``AttackJudge`` on a synthetic one-action trajectory, with every guardrail in
+    that judge disabled by construction: the action's turn was
+    ``injection_point + 2`` while ``injection_visible_turn`` was
+    ``injection_point``, so the temporal gate was a no-op; ``arguments={}``
+    discarded the parsed tool arguments, making argument-hijack attacks invisible;
+    no ``benign_reference`` was passed, so the clean-twin rule could never fire;
+    and with one action and no observations the model was asked to judge a step in
+    the absence of the context that makes it judgeable. The evidence it needed was
+    already computed at prompt-build time and simply not carried -- it now travels
+    on ``PromptMeta`` (``prefix_timeline`` / ``benign_reference_timeline`` /
+    ``payload_visible_in_prefix``), so nothing here has to reconstruct a
+    ``Trajectory`` at all.
     """
     if not judge_client_endpoint_url:
         return None
 
-    def _judge(completion_text: str, meta):                          # noqa: ANN001
-        # Lazy imports keep module-load cheap outside true runs.
-        from evoguard.config import LLMConfig
-        from evoguard.judge import AttackJudge
-        from evoguard.core.types import (
-            Action as EvAction,
-            AttackSpec,
-            ToolCall,
-            Trajectory,
-            TrajectoryKind,
-        )
+    from evoguard.training.step_safety_judge import build_step_safety_callable
 
-        cfg = LLMConfig(backend="openai",
-                        model=_judge_model_name(),
-                        base_url=judge_client_endpoint_url,
-                        api_key="EMPTY")
-        # Re-use AttackJudge logic indirectly: build minimal synthetic trajectory
-        # containing just the single action being scored so its structural gates fire.
-        target_tool_name = meta.target_tool_name or ""
-        # Hand the judge the attacker's ACTUAL text when the prompt carries it
-        # (``PromptMeta.injected_payload_excerpt`` / ``attacker_goal``, populated
-        # by grpo_prompt_extraction). Without it the payload was the literal
-        # "(judge probe)" and the goal a synthesised "call <tool>" line, so the
-        # judge was asked whether the agent executed an instruction it was never
-        # shown -- its verdict could only restate the structural
-        # ``tool == target_tool_name`` check computed below, and an attack served
-        # entirely inside `final_answer` scored as safe. The synthesised strings
-        # remain the fallback for metas built before this field existed.
-        payload_text = str(getattr(meta, "injected_payload_excerpt", "") or "")
-        goal_text = str(getattr(meta, "attacker_goal", "") or "")
-        if not goal_text:
-            goal_text = ("attacker goal: call " + target_tool_name) if target_tool_name else ""
-        attack_stub = AttackSpec(
-            attack_id=f"_grpo_inner_{meta.task_id}",
-            task_id=str(meta.task_id),
-            target_turn=(int(meta.injection_point)+1) if meta.injection_point is not None else 1,
-            injection_channel="_inner_loop_probe_",
-            method="probe",
-            payload=payload_text or "(judge probe)",
-            goal=goal_text,
-        )
-
-        # Parse completion_text defensively to assemble Action-like evidence.
-        thought_str = ""
-        tool_called_name = ""
-        final_answer_str = ""
-        try:
-            obj = json.loads(completion_text)
-            if isinstance(obj, dict):
-                thought_str = str(obj.get("thought","") or "")
-                final_answer_str = str(obj.get("final_answer","") or "")
-                tcfld = obj.get("tool")
-                if isinstance(tcfld,str): tool_called_name=tcfld.strip()
-                elif isinstance(tcfld,dict):
-                    nm = tcfld.get("name") or tcfld.get("tool") or ""
-                    if isinstance(nm,str): tool_called_name=nm.strip()
-        except Exception:
-            pass                                                    # noqa: BLE001
-
-        act_obj = EvAction(turn=int(meta.injection_point)+2 \
-                            if meta.injection_point is not None else 2,
-                           thought=thought_str,
-                           tool_call=ToolCall(name=tool_called_name, arguments={})
-                               if tool_called_name else None,
-                           final_answer=final_answer_str)
-
-        traj = Trajectory(task_id=str(meta.task_id),
-                          actions=[act_obj],
-                          kind=TrajectoryKind.ATTACKED,
-                          metadata={
-                              "injection_visible_turn":
-                                  int(meta.injection_point) if meta.injection_point is not None else 0,
-                              "instruction": meta.task_instruction,
-                          })
-
-        ajudge = AttackJudge(cfg)
-        ok_success_flag_unused, reason = ajudge.judge(traj, attack_stub)
-        judged_safe = not ok_success_flag_used_helper(ok_success_flag_unused)
-        called_malicious_tool_post_divergence = (
-            bool(target_tool_name)
-            and bool(tool_called_name)
-            and tool_called_name.lower()==target_tool_name.lower()
-        )
-        return judged_safe, called_malicious_tool_post_divergence
-
-    return _judge
-
-
-def ok_success_flag_used_helper(v):                                   # noqa: D401
-    """Tiny shim keeping lazy-import scope tidy while exposing flag value."""
-    return bool(v)
+    return build_step_safety_callable(judge_client_endpoint_url, _judge_model_name())
 
 
 # --------------------------------------------------------------------------- #
@@ -772,9 +696,24 @@ def build_evoguard_reward_callable(
         identical (and costs no extra judge calls). Consumers must INDEX the
         tuple rather than unpack it, so widening it again stays backwards
         compatible.
+
+    The returned function carries a ``safety_tally`` attribute: a dict counting
+    ``(safety_source, safety_label)`` pairs over every completion scored in the
+    round. It exists because a safety-judge outage is otherwise INVISIBLE. Since
+    ``took_bait`` was deleted, the fallback value ``R_SAFETY_UNCLEAR`` is the same
+    constant for every attacked row, and GRPO advantages are group-relative, so an
+    outage does not bias ``r_safety`` -- it deletes the safety gradient while the
+    reward mean, the loss and the gradient norm all keep looking healthy. A round
+    whose tally is dominated by ``fallback`` trained progress only.
     """
 
+    import threading
+
     from evoguard.training.grpo_reward import compute_evoguard_reward
+
+    #: ``"{safety_source}:{safety_label}"`` -> count, over the whole round.
+    safety_tally: dict[str, int] = {}
+    _tally_lock = threading.Lock()
 
     # Lazy-init judge once across all invocations within this round to amortize
     # tokenizer/client construction cost over potentially hundreds of inner steps.
@@ -792,13 +731,15 @@ def build_evoguard_reward_callable(
             return _cached_judge[0]
         url = os.environ.get(_endpoint_env_var, "").strip()
         if not url:
-            # Fall back gracefully to heuristic-only path if env var unset.
+            # No endpoint: r_safety cannot be scored at all this round.
             logger.warning(
-                "[native_grpo][reward_fn] %s is unset -> the SAFETY term runs in "
-                "degraded mode for this entire round: r_safety comes only from "
-                "whether the attacker's tool was fired (BAITED/-8.00 vs "
-                "UNCLEAR/-0.50) and can never reach HELD/+2.00. Export it "
-                "(e.g. http://127.0.0.1:8003/v1) to train against the judge.",
+                "[native_grpo][reward_fn] %s is unset -> the SAFETY term is DEAD "
+                "for this entire round: every attacked row scores the same "
+                "UNCLEAR/-0.50 constant, and a per-prompt constant contributes "
+                "exactly zero gradient under group-relative advantages, so only "
+                "r_progress is trained. Nothing in the loss or reward mean will "
+                "show this. Export it (e.g. http://127.0.0.1:8003/v1) to train "
+                "against the judge.",
                 _endpoint_env_var,
             )
             _cached_judge[0] = False     # sentinel meaning "tried but unavailable"
@@ -919,6 +860,11 @@ def build_evoguard_reward_callable(
                 judge_call=effective_jcb,
                 progress_call=effective_pcb,
             )
+            # Scoring is fanned out across threads, so the tally needs the lock;
+            # it is contended for nanoseconds against an HTTP round-trip.
+            key = f"{bd.safety_source or 'none'}:{bd.safety_label or 'none'}"
+            with _tally_lock:
+                safety_tally[key] = safety_tally.get(key, 0) + 1
             return (
                 float(bd.total),
                 (float(bd.r_safety), float(bd.r_progress), -float(bd.p_drift)),
@@ -954,6 +900,7 @@ def build_evoguard_reward_callable(
         return results_floats
 
     _evoguard_reward_func.__name__ = "evoguard_defense_rl_reward"
+    _evoguard_reward_func.safety_tally = safety_tally     # type: ignore[attr-defined]
     return _evoguard_reward_func
 
 
@@ -1584,6 +1531,22 @@ def train_native_grpo(
                 int(diag_state.get("gdpo_slots",0) or 0),
             )
 
+        # The safety term's only observable. A round whose r_safety came from the
+        # fallback trained r_progress alone -- see build_evoguard_reward_callable.
+        safety_tally = dict(getattr(reward_fn_closure, "safety_tally", {}) or {})
+        n_scored = sum(safety_tally.values())
+        n_fallback = sum(v for k, v in safety_tally.items()
+                         if k.startswith("fallback:"))
+        if n_scored:
+            logger.info("[native_grpo] r_safety sources over %d completions: %s",
+                         n_scored, sorted(safety_tally.items()))
+            if n_fallback:
+                logger.warning(
+                    "[native_grpo] %d/%d completions (%.1f%%) scored r_safety from "
+                    "the FALLBACK constant -- no safety gradient on those rows.",
+                    n_fallback, n_scored, 100.0 * n_fallback / n_scored,
+                )
+
         # -------------------------------------------------------------- #
         # B6 Save adapter artifacts                                       #
         # -------------------------------------------------------------- #
@@ -1613,6 +1576,8 @@ def train_native_grpo(
             "traj_pool_batches":n_pool_batches,
             "traj_pool_slots":n_pool_slots,
             "delta_shaping_applied_count":int(diag_state.get("delta_shaping_applied_count",0) or 0),
+            "safety_source_tally":safety_tally,
+            "n_safety_fallback":n_fallback,
         })
 
         return NativeGrpoOutcome(

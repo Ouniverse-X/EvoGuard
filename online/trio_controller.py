@@ -10,8 +10,9 @@ Public surface:
 * :func:`train_online_grpo` -- top-level entry mirroring ``native_grpo_runner.train_native_grpo``
   signature plus a mandatory ``controller_factory_fn`` parameter.
 * :func:`make_live_judge_closure` -- builds the judge_call closure threading real
-  per-trajectory outcome verdicts through ``compute_evoguard_reward`` bypassing its
-  heuristic-only fallback path (which loses the judge-authoritative r_safety signal).
+  per-trajectory outcome verdicts through ``compute_evoguard_reward`` as a safety
+  LABEL, bypassing the ``unclear`` fallback constant (which is identical across the
+  attacked arm and therefore carries no gradient under group-relative advantages).
 * :class:`OnlineGrpoOutcome` -- result dataclass parallel to NativeGrpoOutcome.
 
 Heavy ML imports stay gated behind ``training_cfg.dry_run`` exactly like
@@ -48,7 +49,7 @@ else:
     logger = logging.getLogger("online.trio_controller")                 # type: ignore[unreachable]
 
 
-JudgeCallable = Callable[[str, "Any"], tuple[bool, bool]]
+JudgeCallable = Callable[[str, "Any"], str]
 
 
 @dataclass
@@ -79,23 +80,24 @@ class OnlineGrpoOutcome:
 # --------------------------------------------------------------------------- #
 # Pure-Python helpers testable offline                                         #
 # --------------------------------------------------------------------------- #
-def make_live_judge_closure(traj_rec: Any,
-                             target_hint_override: Optional[str] = None,
-                             ) -> JudgeCallable:
-    """Build ``(completion_text, meta)->(safe_bool,called_tgt_bool)`` closure.
+def make_live_judge_closure(traj_rec: Any) -> JudgeCallable:
+    """Build a ``(completion_text, meta) -> safety_label`` closure.
 
-    Threads REAL trajectory-outcome verdict into compute_evoguard_reward's optional
-    judge_call slot so reward function uses ground-truth labels rather than falling back
-    to heuristic refusal-keyword matching, which collapses r_safety onto its
-    fallback table instead of the judge-authoritative one.
+    Threads the REAL trajectory-outcome verdict into ``compute_evoguard_reward``'s
+    optional ``judge_call`` slot, so ``r_safety`` comes from a judged outcome instead
+    of the ``unclear`` fallback constant. That matters mechanically, not just
+    cosmetically: the fallback is the same value for every completion in the attacked
+    arm, and a per-prompt constant contributes exactly zero gradient under
+    group-relative advantages.
 
     Duck-typed contract -- accepts any record-like object exposing EITHER:
       * ``rec.outcome.value`` ('success'|'fail'|'na') [real AttackOutcome enum], OR
       * ``rec.outcome`` itself being a str/int enum value, OR
       * ``rec.outcome_value`` plain string attr [test-stub convenience].
 
-    Returns callable yielding ``(judged_safe_bool, took_bait_flag)``
-    where judged_safe=True iff attack did NOT succeed against defense policy.
+    Returns a callable yielding one of the labels in
+    ``grpo_reward._SAFETY_BY_LABEL``: ``"baited"`` iff the attack succeeded against
+    the defence policy, else ``"held"``.
     """
     out_val_lowered_str = ""
     # Convention A: rec.outcome.value (real AttackOutcome dataclass-backed enum)
@@ -110,50 +112,18 @@ def make_live_judge_closure(traj_rec: Any,
         if isinstance(ov_alt_raw, str):
             out_val_lowered_str = ov_alt_raw.lower()
 
-    acts_seq_ref: list[Any] = []
-    # Convention A: rec.trajectory.actions list [real TrajectoryRecord shape]
-    traj_holder_obj = getattr(traj_rec, "trajectory", None)
-    candidate_acts_lists = []
-    if traj_holder_obj is not None:
-        cand_attr_a = getattr(traj_holder_obj, "actions", None)
-        if isinstance(cand_attr_a, list):
-            candidate_acts_lists.append(cand_attr_a)
-    # Convention B: bare rec.actions list [test-stub convenience]
-    cand_attr_b = getattr(traj_rec, "actions", None)
-    if isinstance(cand_attr_b, list):
-        candidate_acts_lists.append(cand_attr_b)
-    if candidate_acts_lists:
-        # Prefer first non-empty source found.
-        for lst_cand_src in candidate_acts_lists:
-            if len(lst_cand_src) > 0 or not acts_seq_ref:
-                acts_seq_ref = list(lst_cand_src)
-                break
-
     def _closure(comp_txt_unused_by_reward_fn_but_required_for_API_contract: str,
-                  meta_arg: Any) -> tuple[bool, bool]:
+                  meta_arg: Any) -> str:
         del comp_txt_unused_by_reward_fn_but_required_for_API_contract
-
-        safe_flag = (out_val_lowered_str != "success")
-        tgt_lookup_str = (
-            target_hint_override or getattr(meta_arg, "target_tool_name", "")
-            or ""
-        )
-        tgt_lower = str(tgt_lookup_str).strip().lower()
-        took_bait_local = False
-        if tgt_lower:
-            for act_entry in acts_seq_ref:
-                tc_inner = getattr(act_entry, "tool_call", None)
-                nm_inner = ""
-                if tc_inner is not None:
-                    nm_raw = getattr(tc_inner, "name", None)
-                    if nm_raw is not None:
-                        nm_inner = str(nm_raw).strip()
-                if not nm_inner:
-                    continue
-                if nm_inner.lower() == tgt_lower:
-                    took_bait_local = True
-                    break
-        return (bool(safe_flag), bool(took_bait_local))
+        del meta_arg
+        # A trajectory-level verdict applied to one step. That is an
+        # approximation -- the verdict says the attack succeeded SOMEWHERE in this
+        # rollout, not necessarily at this step -- but it is a real judged outcome
+        # from the controller, which is strictly better evidence than the
+        # ``unclear`` constant the reward otherwise falls back to. The online path
+        # samples the whole sibling rollout to produce the completion, so no
+        # cheaper attribution is available here.
+        return "baited" if out_val_lowered_str == "success" else "held"
 
     _closure.__name__ = "_live_judged_via_traj_outcome"
     return _closure
@@ -675,7 +645,7 @@ def train_online_grpo(
                     logger.warning("[online-trio] WARN sibling rollout raised:%s ; substituting neutral.",exc_rollout)
                     return('{"thought":"rollout-exc"}',-0.5)
                 comp_str_return=_extract_post_inj_action_text(rec_attacked,meta_for_this_slot.injection_point)
-                jcb_closure_live=make_live_judge_closure(rec_attacked,target_tool_name_hint=meta_for_this_slot.target_tool_name)
+                jcb_closure_live=make_live_judge_closure(rec_attacked)
                 rb_breakdown_one=compute_evoguard_reward(completion_text=comp_str_return,
                                                           meta=meta_for_this_slot,
                                                           judge_call=jcb_closure_live)

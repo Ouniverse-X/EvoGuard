@@ -33,6 +33,8 @@ from evoguard.llm.schemas import (
     ATTACK_GENOMES_SCHEMA,
     DEFENSE_ACTION_SCHEMA,
     JUDGE_VERDICT_SCHEMA,
+    STEP_SAFETY_SCHEMA,
+    TASK_COMPLETION_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
 )
 
@@ -284,6 +286,55 @@ class ToolObservationSchemaTests(unittest.TestCase):
             {},
             hint_substr="missing",
         )
+
+
+class TestNoStringLengthBounds(unittest.TestCase):
+    """``maxLength`` anywhere in a shipped schema is a 200x latency regression.
+
+    Measured 2026-09-02 against the served vllm 0.8.5 endpoint: xgrammar rejects
+    string length bounds, vLLM falls back to outlines, and outlines compiles the
+    bounded-repetition FSM on the single-threaded API frontend -- on EVERY
+    request, blocking unrelated traffic on the same endpoint. 156 s vs 0.76 s for
+    the same call. ``STEP_SAFETY_SCHEMA`` pays it once per sampled GRPO
+    completion, so this is a training-throughput invariant, not a style rule.
+    """
+
+    ALL = {
+        "DEFENSE_ACTION_SCHEMA": DEFENSE_ACTION_SCHEMA,
+        "ATTACK_GENOMES_SCHEMA": ATTACK_GENOMES_SCHEMA,
+        "JUDGE_VERDICT_SCHEMA": JUDGE_VERDICT_SCHEMA,
+        "TOOL_OBSERVATION_SCHEMA": TOOL_OBSERVATION_SCHEMA,
+        "TASK_COMPLETION_SCHEMA": TASK_COMPLETION_SCHEMA,
+        "STEP_SAFETY_SCHEMA": STEP_SAFETY_SCHEMA,
+    }
+
+    @staticmethod
+    def _walk(node, path="$"):
+        """Yield ``(path, key)`` for every length/item bound found anywhere."""
+        banned = ("maxLength", "minLength", "maxItems", "minItems")
+        if isinstance(node, dict):
+            for k in banned:
+                if k in node:
+                    yield path, k
+            for k, v in node.items():
+                yield from TestNoStringLengthBounds._walk(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from TestNoStringLengthBounds._walk(v, f"{path}[{i}]")
+
+    def test_no_length_or_item_bounds_anywhere(self):
+        for name, schema in self.ALL.items():
+            hits = list(self._walk(schema, name))
+            self.assertEqual(
+                hits, [],
+                f"{name} carries {hits}; that forces the outlines backend and "
+                "costs ~156s per request. Bound the reply with max_tokens instead.",
+            )
+
+    def test_numeric_bounds_are_still_allowed(self):
+        """Guards against over-correcting: numeric bounds measured clean."""
+        self.assertEqual(JUDGE_VERDICT_SCHEMA["properties"]["turning_turn"]["minimum"], -1)
+        self.assertEqual(TASK_COMPLETION_SCHEMA["properties"]["score"]["maximum"], 1)
 
 
 if __name__ == "__main__":

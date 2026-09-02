@@ -6,7 +6,8 @@ Public surface re-exported here::
                             signature plus ``controller_factory_fn`` parameter driving
                             external G-sibling trajectory collection during GRPO rollout phase.
     make_live_judge_closure -- build judge_call closure threading live outcome verdicts
-                                through compute_evoguard_reward bypassing heuristic fallback.
+                                through compute_evoguard_reward as a safety label,
+                                bypassing the gradient-free ``unclear`` fallback.
     OnlineGrpoOutcome -- result dataclass parallel to NativeGrpoOutcome.
 
 Heavy ML deps stay lazily imported behind dry-run gate exactly like

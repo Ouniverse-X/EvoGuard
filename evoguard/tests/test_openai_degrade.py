@@ -3,13 +3,17 @@
 We don't hit any real network. Instead we monkeypatch ``OpenAIClient._client``
 with a fake whose ``chat.completions.create`` decides per-call whether to
 return success or raise an HTTP-shaped exception that mimics OpenAI's
-:class:`BadRequestError`. This pins down three behaviours:
+:class:`BadRequestError`. This pins down the three-rung constraint ladder:
 
-* First-call rejection triggers exactly one retry WITHOUT ``response_format``;
-  capability cache flips sticky-FALSE afterwards.
-* Once cache reads FALSE subsequent requests skip straight to unconstrained mode
-  -- zero probes against the structured endpoint ever happen again.
-* Successful strict-mode completion flips capability TRUE and sticks across future calls.
+* A bare JSON Schema is WRAPPED into ``{"type": "json_schema", ...}`` before it
+  goes on the wire -- sending the bare schema makes the server read its
+  ``"type": "object"`` as the response-format discriminator.
+* Rejection of rung 1 advances to ``extra_body={"guided_json": ...}``, and
+  rejection of rung 2 advances to unconstrained; each rung is probed at most
+  once per client (capability flags flip sticky-false).
+* Once both flags read FALSE subsequent requests go straight to unconstrained --
+  zero probes against the structured endpoint ever happen again.
+* A successful constrained completion flips that rung's flag TRUE and sticks.
 
 Run::
 
@@ -71,11 +75,12 @@ class _FakeResponse:
 
 
 class _FakeCreate:
-    """Records every invocation; rejects whenever caller sends ``response_format``."""
+    """Records every invocation; rejects the constraint rungs it is told to."""
 
-    def __init__(self, reject_strict_mode: bool = True):
+    def __init__(self, reject_strict_mode: bool = True, reject_guided: bool = True):
         self.calls: list[dict] = []
         self.reject_strict_mode = reject_strict_mode
+        self.reject_guided = reject_guided
 
     def __call__(self, **kwargs):
         snapshot = {k: v for k, v in kwargs.items()}     # shallow copy keeps assertions stable
@@ -88,16 +93,23 @@ class _FakeCreate:
                                 "'json_schema' is unsupported"),
                     "type": "invalid_request_error"}},
             )
+        if self.reject_guided and "guided_json" in (kwargs.get("extra_body") or {}):
+            raise _FakeHTTP400(
+                "unsupported parameter: guided_json",
+                body={"error": {"message": "'guided_json' is unsupported",
+                                "type": "invalid_request_error"}},
+            )
         return _FakeResponse('{"thought":"ok","final_answer":"done"}')
 
 
-def _wire_fake(reject_strict_mode=True):
+def _wire_fake(reject_strict_mode=True, reject_guided=True):
     cfg = LLMConfig(
         backend="openai", base_url="http://localhost/v1",
         api_key="EMPTY", max_retries=1,
     )
     client = OpenAIClient(cfg)
-    fake = _FakeCreate(reject_strict_mode=reject_strict_mode)
+    fake = _FakeCreate(reject_strict_mode=reject_strict_mode,
+                       reject_guided=reject_guided)
     client._client.chat.completions.create = fake      # swap-in callable
     return client, fake
 
@@ -118,56 +130,96 @@ def _messages():
     ]
 
 
+def _guided(call: dict):
+    return (call.get("extra_body") or {}).get("guided_json")
+
+
 class DegradePathTests(unittest.TestCase):
 
-    def test_first_call_rejection_triggers_unconstrained_retry(self):
-        client, fake = _wire_fake(reject_strict_mode=True)
+    def test_bare_schema_is_wrapped_in_openai_envelope(self):
+        client, fake = _wire_fake(reject_strict_mode=False)
+        client.chat(_messages(), response_format=SCHEMA_SNIPPET)
+
+        self.assertEqual(len(fake.calls), 1)
+        rf = fake.calls[0]["response_format"]
+        self.assertEqual(rf["type"], "json_schema",
+                         f"schema went on the wire unwrapped: {rf}")
+        self.assertEqual(rf["json_schema"]["schema"]["properties"],
+                         SCHEMA_SNIPPET["properties"])
+        # $schema is stripped: hosted OpenAI rejects it at a strict schema root.
+        self.assertNotIn("$schema", rf["json_schema"]["schema"])
+
+    def test_already_wrapped_response_format_passes_through(self):
+        client, fake = _wire_fake(reject_strict_mode=False)
+        wrapped = {"type": "json_object"}
+        client.chat(_messages(), response_format=wrapped)
+        self.assertEqual(fake.calls[0]["response_format"], wrapped)
+
+    def test_strict_rejection_advances_to_guided_json(self):
+        client, fake = _wire_fake(reject_strict_mode=True, reject_guided=False)
         resp = client.chat(_messages(), response_format=SCHEMA_SNIPPET)
 
         strict_attempts = [c for c in fake.calls if c.get("response_format") is not None]
-        plain_attempts  = [c for c in fake.calls if c.get("response_format") is None]
+        guided_attempts = [c for c in fake.calls if _guided(c) is not None]
+        plain_attempts = [c for c in fake.calls
+                          if c.get("response_format") is None and _guided(c) is None]
 
-        self.assertEqual(len(strict_attempts), 1,
-                         f"expected exactly 1 strict-attempt; saw {len(strict_attempts)} ({fake.calls})")
-        self.assertEqual(len(plain_attempts), 1,
-                         f"expected exactly 1 degraded attempt; saw {len(plain_attempts)} ({fake.calls})")
-        # Capability flipped sticky-false.
-        self.assertIs(client._schema_supported, False,
-                       f"_schema_supported={client._schema_supported} (expected False)")
-        # Returned text came from the successful degraded call.
+        self.assertEqual(len(strict_attempts), 1, fake.calls)
+        self.assertEqual(len(guided_attempts), 1, fake.calls)
+        self.assertEqual(plain_attempts, [],
+                         f"guided_json worked, must not degrade further: {fake.calls}")
+        # guided_json carries the BARE schema, not the envelope.
+        self.assertEqual(_guided(guided_attempts[0]), SCHEMA_SNIPPET)
+        self.assertIs(client._schema_supported, False)
+        self.assertIs(client._guided_supported, True)
         self.assertIn('"final_answer"', resp.text)
 
-    def test_capability_cache_sticky_false_skips_strict_attempt(self):
-        client, fake = _wire_fake(reject_strict_mode=False)
-        # Pretend prior probe already determined unsupportability.
-        client._schema_supported = False
+    def test_both_rungs_rejected_falls_through_to_unconstrained(self):
+        client, fake = _wire_fake(reject_strict_mode=True, reject_guided=True)
         resp = client.chat(_messages(), response_format=SCHEMA_SNIPPET)
-        del resp
 
         strict_attempts = [c for c in fake.calls if c.get("response_format") is not None]
-        plain_attempts  = [c for c in fake.calls if c.get("response_format") is None]
-        self.assertEqual(strict_attempts, [],
-                         f"strict disabled but sent attempts: {fake.calls}")
-        self.assertEqual(len(plain_attempts), 1)
+        guided_attempts = [c for c in fake.calls if _guided(c) is not None]
+        plain_attempts = [c for c in fake.calls
+                          if c.get("response_format") is None and _guided(c) is None]
+
+        self.assertEqual(len(strict_attempts), 1, fake.calls)
+        self.assertEqual(len(guided_attempts), 1, fake.calls)
+        self.assertEqual(len(plain_attempts), 1, fake.calls)
+        self.assertIs(client._schema_supported, False)
+        self.assertIs(client._guided_supported, False)
+        self.assertIn('"final_answer"', resp.text)
+
+    def test_capability_cache_sticky_false_skips_every_probe(self):
+        client, fake = _wire_fake(reject_strict_mode=False, reject_guided=False)
+        # Pretend prior probes already ruled out both constrained rungs.
+        client._schema_supported = False
+        client._guided_supported = False
+        client.chat(_messages(), response_format=SCHEMA_SNIPPET)
+
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIsNone(fake.calls[0].get("response_format"),
+                          f"strict disabled but sent attempts: {fake.calls}")
+        self.assertIsNone(_guided(fake.calls[0]),
+                          f"guided disabled but sent attempts: {fake.calls}")
         # Cache stays False (no flip-up permitted by spec).
         self.assertIs(client._schema_supported, False)
+        self.assertIs(client._guided_supported, False)
 
     def test_successful_strict_completion_flips_cache_true_and_sticks(self):
         client, fake = _wire_fake(reject_strict_mode=False)
         # Initial state unknown -> probe succeeds -> cache flips TRUE.
-        resp_a = client.chat(_messages(), response_format=SCHEMA_SNIPPET)
+        client.chat(_messages(), response_format=SCHEMA_SNIPPET)
         self.assertIs(client._schema_supported, True)
         self.assertEqual(len(fake.calls), 1)
-        all_strict_a = all(c.get("response_format") is not None for c in fake.calls)
-        self.assertTrue(all_strict_a)
 
         # Second call must remain strictly constrained (cache sticks TRUE).
-        resp_b = client.chat(_messages(), response_format=SCHEMA_SNIPPET)
-        self.assertEqual(client._schema_supported, True)
+        client.chat(_messages(), response_format=SCHEMA_SNIPPET)
+        self.assertIs(client._schema_supported, True)
         self.assertEqual(len(fake.calls), 2)
-        all_strict_ab = all(c.get("response_format") is not None for c in fake.calls)
-        self.assertTrue(all_strict_ab)
-        del resp_a, resp_b
+        self.assertTrue(all(c.get("response_format") is not None for c in fake.calls))
+        # The guided rung is never probed while rung 1 works.
+        self.assertIsNone(client._guided_supported)
 
 
 if __name__ == "__main__":

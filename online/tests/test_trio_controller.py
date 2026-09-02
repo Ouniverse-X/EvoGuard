@@ -111,7 +111,7 @@ def test_assemble_completion_payload_schema():
 def test_live_judge_closure_correct_for_each_outcome():
     """Closure threads real verdict bypassing LLM call."""
     from online.trio_controller import make_live_judge_closure
-    from evoguard.training.grpo_reward import PromptMeta
+    from evoguard.training.grpo_reward import _SAFETY_BY_LABEL, PromptMeta
 
     meta = PromptMeta(task_id="t1", task_instruction="instr",
                       injection_point=1, turning_point=None,
@@ -119,11 +119,11 @@ def test_live_judge_closure_correct_for_each_outcome():
                       clean_twin_action_tool_name="cleantool")
 
     cases = [
-        ("B_success_leak_unsafe",     "success"),
-        ("C_fail_caught_safe",        "fail"),
-        ("clean_reference_na_safe",   "na"),       # treated safe
+        ("B_success_leak_unsafe",     "success", "baited"),
+        ("C_fail_caught_safe",        "fail",    "held"),
+        ("clean_reference_na_safe",   "na",      "held"),   # treated safe
     ]
-    for label, outcome_val in cases:
+    for label, outcome_val, expect_label in cases:
         rec_kind = "attacked" if outcome_val != "na" else "clean"
         fake_traj_rec = _mk_traj_stub(
             kind_value=rec_kind, outcome_value=outcome_val,
@@ -134,27 +134,16 @@ def test_live_judge_closure_correct_for_each_outcome():
         )
         closure = make_live_judge_closure(fake_traj_rec)
 
-        # Sanity-check return tuple structure independent of completion text passed.
-        judged_tuple = closure('{"thought":"x"}', meta)
-        assert isinstance(judged_tuple, tuple) and len(judged_tuple) == 2, \
-            f"[{label}] expected 2-tuple got {type(judged_tuple)}"
-
-        judged_safe_bool, called_tgt_bool = judged_tuple
-        assert isinstance(judged_safe_bool, bool), \
-            f"[{label}] element[0] must be bool got {type(judged_safe_bool)}"
-        assert isinstance(called_tgt_bool, bool), \
-            f"[{label}] element[1] must be bool got {type(called_tgt_bool)}"
-        if outcome_val == "success":
-            assert judged_safe_bool is False, \
-                f"[{label}] B-success leaked -> unsafe but said safe"
-        elif outcome_val == "fail":
-            assert judged_safe_bool is True, \
-                f"[{label}] C-fail caught -> safe but said unsafe"
-
-        # B-success with evil-tool fired -> took_bait=True reflected in slot[1].
-        if outcome_val == "success":
-            assert called_tgt_bool is True, \
-                f"[{label}] success case fired malicious_tool -> bait flag must be true"
+        # The closure ignores the completion text -- the verdict is the trajectory's.
+        judged_label = closure('{"thought":"x"}', meta)
+        assert isinstance(judged_label, str), \
+            f"[{label}] expected a label str got {type(judged_label)}"
+        # A label outside the scoring table silently degrades to the gradient-free
+        # ``unclear`` fallback, so pin membership, not just the string value.
+        assert judged_label in _SAFETY_BY_LABEL, \
+            f"[{label}] {judged_label!r} is not a scorable safety label"
+        assert judged_label == expect_label, \
+            f"[{label}] outcome={outcome_val} -> expected {expect_label!r} got {judged_label!r}"
 
 
 # ---- Test C: LogpAgent parses response raw into token-lps metadata ---------#
@@ -354,8 +343,6 @@ def main() -> int:
                    else f"FAILURES=[{','.join(nm for nm,_ in failures)}]")
     print(f"\n[test_trio_controller summary] {summary_msg}")
     # Best-effort cleanup of legacy-mode temp dirs.
-    for d in list(tempfile._get_tempdir_state()):                       # noqa: SLF001
-        pass                                                            # noqa: E701
     shutil.rmtree("/tmp/_online_dryrun_legacy_" , ignore_errors=True)
     return rc
 

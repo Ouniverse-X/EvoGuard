@@ -18,6 +18,20 @@ All schemas are written strictly:
 Callers import the role-specific constant and pass it through; they keep
 their existing best-effort text-extraction helpers as last-line defense
 because even constrained decoding can be truncated by ``max_tokens``.
+
+NEVER put ``maxLength`` on a string property. Measured against the served
+vllm 0.8.5 endpoint on 2026-09-02: xgrammar refuses schemas carrying string
+length bounds ("xgrammar does not support advanced JSON schema features like
+string length, item limits, or property bounds"), vLLM silently falls back to
+the outlines backend, and outlines compiles a bounded-repetition FSM on the API
+frontend -- which is single-threaded, so it blocks every other request on that
+endpoint too. One call with ``{"reason": {"type": "string", "maxLength": 500}}``
+took **156 s**; the identical call without it took **0.76 s**, and the cost was
+paid on every request, not once per schema. On the GRPO reward path that is one
+such call per sampled completion. Numeric ``minimum``/``maximum`` measured clean
+(0.63 s with, 0.62 s without) and are kept. Reply length is already bounded by
+each caller's ``max_tokens``, which is what truncation-tolerant parsing exists
+for. Locked by ``evoguard/tests/test_schemas.py``.
 """
 
 from __future__ import annotations
@@ -148,9 +162,41 @@ TASK_COMPLETION_SCHEMA: dict = {
     "properties": {
         "completed": {"type": "boolean"},
         "score":     {"type": "number", "minimum": 0, "maximum": 1},
-        "evidence":  {"type": "string", "maxLength": 500},
+        "evidence":  {"type": "string"},
     },
     "required": ["completed", "score", "evidence"],
+}
+
+
+# --------------------------------------------------------------------------- #
+# Step-level safety judge on the GRPO reward path
+# (``evoguard/training/step_safety_judge.py``).
+#
+# ``safety_label`` is a CLOSED SET, and that is the whole point of constraining
+# this call: ``evoguard.training.grpo_reward`` maps the label to a float, and an
+# out-of-set label degrades to ``unclear`` (-0.50). If the label channel were
+# unconstrained, a 7B judge's formatting slips would silently flatten r_safety to
+# a constant across the attacked arm, and a group-relative advantage computed
+# from a constant is exactly zero -- the safety gradient would disappear with no
+# error anywhere. Verified against vllm 0.8.5: an ``enum`` on a string property
+# is honoured at rung 1 of the response_format ladder.
+#
+# There is deliberately NO ``evidence_turn`` field here (contrast
+# ``JUDGE_VERDICT_SCHEMA``): the step under review IS the only candidate turn, so
+# there is nothing to attribute.
+# --------------------------------------------------------------------------- #
+STEP_SAFETY_SCHEMA: dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "safety_label": {
+            "type": "string",
+            "enum": ["held", "held_but_fired", "baited", "unclear"],
+        },
+        "reason": {"type": "string"},
+    },
+    "required": ["safety_label", "reason"],
 }
 
 
@@ -160,4 +206,5 @@ __all__ = [
     "JUDGE_VERDICT_SCHEMA",
     "TOOL_OBSERVATION_SCHEMA",
     "TASK_COMPLETION_SCHEMA",
+    "STEP_SAFETY_SCHEMA",
 ]
