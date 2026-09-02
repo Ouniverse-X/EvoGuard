@@ -136,6 +136,28 @@ export CUDA_VISIBLE_DEVICES="${TRAINER_CUDA_VISIBLE_DEVICES:-7}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
+# ---- Drop /home/opt/nvidia_lib from the library search path ---- #
+# The login profile on this box exports
+#   LD_LIBRARY_PATH=/opt/baidu-cgpu/lib64:/usr/local/lib:/home/opt/nvidia_lib:...
+# and /home/opt/nvidia_lib ships the RAW driver libcuda.so.550.127.08, which wins
+# over the cGPU-intercepting libcuda in /opt/baidu-cgpu/lib64. Under that libcuda
+# EVERY cuDNN handle creation fails with CUDNN_STATUS_NOT_INITIALIZED -- measured
+# 2026-09-03 on a plain Conv2d as well as on torch.nn.functional
+# .scaled_dot_product_attention, which is how it killed r0 SFT of run
+# 20260902_233537 (transformers/integrations/sdpa_attention.py -> SDPA -> cuDNN).
+# Bisecting the six entries pinned it to this one directory; with it removed conv
+# and SDPA both pass and libcuda resolves to the cGPU shim, which is the intended
+# path on this node. The other CUDA components (flash-attn, cuBLAS, NCCL) never
+# needed it -- they come from the wheels inside the conda env.
+_ld_clean=""
+IFS=':' read -ra _ld_parts <<<"${LD_LIBRARY_PATH:-}"
+for _p in ${_ld_parts[@]+"${_ld_parts[@]}"}; do
+    [[ -z "$_p" || "${_p%/}" == "/home/opt/nvidia_lib" ]] && continue
+    _ld_clean="${_ld_clean:+$_ld_clean:}$_p"
+done
+export LD_LIBRARY_PATH="$_ld_clean"
+unset _ld_clean _ld_parts _p
+
 # The GRPO trainer holds several near-identical large logits tensors live at once
 # (policy / reference / old logprobs). With the default caching allocator that
 # churn leaves multi-GiB reserved-but-unallocated holes -- the r3 OOM of run
