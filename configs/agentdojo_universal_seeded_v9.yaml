@@ -1,0 +1,307 @@
+# EvoGuard v9: agentdojo-tragjnew stratified split + UNIVERSAL prewarm seeds +
+# the 2026-09-02 data-supply / GRPO-normalisation knob set.
+#
+# Base: configs/agentdojo_full_seeded_split.yaml (seeded arm of the seeded/noseed
+# pair). Scientific scope of the ATTACKER is untouched -- population_size=15,
+# max_rounds=12, search_method=mcts_delta, same UCB-Delta constants. Every delta
+# below is on the DEFENDER-side data supply, the advantage normalisation, or
+# infrastructure paths that were wrong on this box.
+#
+# Deltas vs configs/agentdojo_full_seeded_split.yaml
+# --------------------------------------------------
+#  A. Data supply (measured: the CLEAN arm was the scarce class, not the C arm --
+#     3704/5126 = 72.3% of C rollouts already clear utility>=0.5 against the
+#     clean arm's own 71.8% delivery rate).
+#       pipeline.clean_rollouts_per_task   1 (implicit) -> 6
+#       training.sft_max_records_per_task  0 (unbounded) -> 6
+#     One A rollout per task had to serve as BOTH the SFT clean supervision and
+#     the clean TWIN; at 71.8% delivery 28% of tasks had no usable twin, and a
+#     task without one loses _corrective phase 3 (its B records degenerate to
+#     "refuse, then stop" -- 33.7% of r0's corrective rows) and has no ADVANCE
+#     ground truth in grpo_reward. N=6 puts P(no twin) at ~0.1%. Deliberately NOT
+#     paired with a temperature rise: the failures are sampling variance and a
+#     hotter policy degrades the very trajectories being imitated.
+#
+#  B. Prompt coverage.
+#       grpo_max_prompts_per_round        32 -> 400
+#     32 rows at K=1 is 32 distinct decision points per round against ~37 training
+#     tasks, so most tasks contributed nothing to any given update.
+#     native_max_steps_per_round is already 400 and is the BINDING cap: at K=1,
+#     steps_per_generation defaults to gradient_accumulation (8) and
+#     per_device_batch_size is 1, so the generation batch is 1x8 = 8 = G and one
+#     optimizer step consumes exactly one prompt.
+#
+#  C. Advantage normalisation.
+#       grpo_gdpo                         false (default) -> true
+#       grpo_traj_group_size              1 (explicit, unchanged)
+#     GDPO standardises EACH reward term inside the group of G siblings, sums the
+#     per-term advantages, then rescales batch-wise. The reward itself is
+#     untouched -- still R = r_safety + r_progress - p_drift. Motivation is the
+#     measured zero-gradient problem: r_safety spans 10 points against
+#     r_progress's 3.7 and p_drift's 0.5, so summing first lets r_safety set the
+#     group std almost alone. Intervention order in _DeltaShapedGRPOTrainer is
+#     GDPO -> trajectory pooling -> Delta shaping; K=1 makes the pooling
+#     fallback a bit-for-bit no-op.
+#
+#  D. Clean prompt ratio.
+#       grpo_clean_prompt_ratio           0.5 -> 0.25
+#     100 benign rows of the 400 budget rather than 200. Still enough to keep
+#     "blocked and still served the user" separable from "blocked and gave up"
+#     (that is what the term is for), but the 400-row budget now buys 300
+#     attacked decision points instead of 16.
+#
+#  E. Infrastructure corrections (not scientific).
+#       training.base_model      /root/yangxiao/models/downloads/qwen2.5-7b-instruct
+#                             -> /root/yangxiao/models/Qwen2.5-7B-Instruct
+#         The `downloads/` path does not exist on this box; the real weights are
+#         the ones already served by the two helper endpoints below.
+#       training.cuda_visible_devices     "4" -> "3"
+#         Actual layout today (the header of the base config describes a layout
+#         that no longer holds):
+#           GPU 0   -> helper vLLM :8002 (TP=1, tool_executor)      [already up]
+#           GPU 1   -> helper vLLM :8003 (TP=1, judge + utility)    [already up]
+#           GPU 2   -> primary defender vLLM :8000 (TP=1, --enable-lora)
+#           GPU 3   -> native SFT/GRPO trainer (single GPU; native_runner has no DDP)
+#           GPU 4-7 -> gpu_keeper.sh (paused for 2,3 only; resumed after the run)
+#
+# LAUNCH CONTRACT -- three env vars this file cannot express
+# ---------------------------------------------------------
+#   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds
+#       mct_searcher._load_prewarm_skeletons_all() reads a fixed seed directory,
+#       NOT env.data_root and NOT the dataset dir. data/seeds/universal_seeds.json
+#       (_meta.version "universal-ipi-v2r", 20 seeds, 12 mechanism families,
+#       target-Delta {d0:4, d1:5, d2:5, d3:6}) parses to suite key "universal",
+#       which then REPLACES the whole cache and so overrides every per-suite
+#       *_seeds.json. All 20 carry turn=0 + a non-empty method + payload_template,
+#       so all 20 inject regardless of per-task tool count. Expect in the log:
+#           [prewarm] loaded skeletons from .../data/seeds across 1 suites (total=20 entries)
+#           [prewarm][task=...] injected 20 skeletons
+#       `total=0 entries` means the run silently degraded to the NOSEED baseline.
+#   EVOGUARD_JUDGE_LLM_BASE_URL / EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8003/v1
+#       The reward-path judges are OPT-IN. Unset, r_safety comes from a heuristic
+#       fallback -- and because GRPO advantages are group-relative, a constant
+#       fallback DELETES the safety gradient rather than biasing it, invisibly in
+#       loss / reward-mean / grad-norm. Confirm the log says `progress judge
+#       active` with no WARNING naming either variable.
+#   EVOGUARD_PY_BIN=/root/miniconda3/envs/evoguard/bin/python
+#       run_grpo_experiment.sh defaults to /root/yangxiao/envs/train/bin/python,
+#       which does not exist here. One env does both training and serving as of
+#       2026-09-02 (transformers pinned 4.51.3).
+
+name: evoguard_agentdojo_universal_seeded_v9
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: qianfan
+    model: glm-5.2                      # creds verified live 2026-09-02 for both
+                                        # glm-5.2 and glm-5; 5.2 is the string every
+                                        # successful historical run used.
+    base_url: null
+    api_key: null                       # credentials come from
+                                        # ${EVOGUARD_SECRETS_FILE:-$HOME/.evoguard_qianfan.env}
+                                        # via EVOGUARD_QIANFAN_APPID / _TOKEN.
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 4096
+    timeout: 300
+    # Backstop only. The real defence against the gateway's measured 60 rpm quota
+    # is the process-wide send pacer in QianFanClient
+    # (EVOGUARD_QIANFAN_MAX_RPM=55, exported by run_grpo_experiment.sh). An
+    # exhausted attacker call makes rollout.py drop the whole task from the round,
+    # silently shrinking the training set.
+    max_retries: 8
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6
+
+env:
+  dataset: agentdojo_split            # -> data/toolsafe/agentdojo-tragjnew/{train,val,test}
+                                      # 80/20 over DISTINCT instructions, stratified on
+                                      # suite AND annotated score (seed 20260817,
+                                      # provenance in that dir's split_manifest.json).
+                                      # The env tags each task metadata["split"] and
+                                      # driver._split_train_val honours it, so
+                                      # pipeline.validation_fraction below is inert.
+                                      # test/ is sha256-guarded: SystemExit if changed.
+  data_root: data
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100                      # not binding; the dataset holds 58 distinct instructions.
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  # Left at the historical default. LLM attribution is measurably better on the
+  # labelled set (11/12 vs scan's 10/12, and scan systematically UNDER-reports
+  # latent attacks -- it stops at the first EXTRA step) but flipping it changes
+  # what Delta MEANS mid-comparison, so it waits for
+  # scripts/study_turning_point_agreement.py against a real judge endpoint.
+  turning_point_method: scan
+
+training:
+  enabled: true
+  # CORRECTED. The base config named /root/yangxiao/models/downloads/qwen2.5-7b-instruct,
+  # which does not exist on this box. This is the same checkpoint the two helper
+  # endpoints are already serving.
+  base_model: /root/yangxiao/models/Qwen2.5-7B-Instruct
+
+  method: sft_then_native_grpo        # r0 -> cold-start LoRA-SFT; >=r1 -> incremental
+                                      # native GRPO (needs <exp>/latest_adapter_dir.txt;
+                                      # hard-errors rather than silently falling back).
+
+  lora_rank: 32                       # <= start_vllm.sh's --max-lora-rank 64, so the
+                                      # per-round hot-load is accepted.
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  # ---- Cold-start SFT (r0 only) -------------------------------------- #
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+  # Per-task PER-CLASS cap (clean / attack_fail / attack_success), records ranked
+  # by utility inside each class before the cut. WAS unset (0 = unbounded), which
+  # let a task's ~15 attacked rollouts drown its clean ones. Must stay >=
+  # pipeline.clean_rollouts_per_task or the extra clean samples are bought and
+  # then thrown away.
+  sft_max_records_per_task: 6
+
+  # ---- Native GRPO --------------------------------------------------- #
+  grpo_learning_rate: 2.0e-6          # base-config value, deliberately not touched.
+  grpo_beta: 0.01                     # loose KL leash -- lets the LoRA leave the SFT
+                                      # warm start. Corollary: per-task forgetting is
+                                      # real, so evaluate the BEST round, not the last.
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 400     # ROW budget. WAS 32. At K=1 rows == trajectories
+                                      # == optimizer steps, so this must be paired with
+                                      # native_max_steps_per_round >= 400 below or the
+                                      # surplus prompts are never reached.
+  grpo_min_new_successes: 3           # skip the incremental retrain below this many
+                                      # fresh B trajectories; prevents noisy micro-updates
+                                      # in the convergence tail.
+
+  # ---- Advantage normalisation --------------------------------------- #
+  grpo_gdpo: true                     # per-term group standardisation, then batch
+                                      # rescale. A NORMALISATION change: the reward is
+                                      # still exactly R = r_safety + r_progress - p_drift.
+  grpo_traj_group_size: 1             # K=1: one prompt per record. The trajectory-pooled
+                                      # baseline fallback is a proven bit-for-bit no-op
+                                      # here, and the 400-row budget buys 400 distinct
+                                      # trajectories instead of 200 x 2 steps.
+
+  # Delta's ONLY path into training: A~ = (1 + lambda*delta_p)*A. lambda=0.0 silently
+  # discards Delta altogether -- a Delta-guided MCTS attacker against a Delta-blind
+  # defender update. Never re-add an inline Delta reward term.
+  grpo_advantage_curriculum_lambda: 1.5
+  # 0.25 of 400 = 100 BENIGN rows cut from clean (A) trajectories, 300 attacked.
+  # WAS 0.5. These rows run the same formula with r_safety pinned, so all their
+  # signal is the judged r_progress term; without them every prompt pays for
+  # blocking, all G siblings converge on blocking, reward std collapses and nothing
+  # in the gradient separates "blocked and still served the user" from "blocked and
+  # gave up". This is also what makes clean_rollouts_per_task: 6 pay off on the RL
+  # side and not only in the SFT corpus.
+  grpo_clean_prompt_ratio: 0.25
+
+  # ---- Trainer infrastructure ---------------------------------------- #
+  # Keep bs=1/accum=8 even on 80GB cards. TRL's GRPO counts
+  # per_device_train_batch_size in *completions*, and the per-forward logits tensor
+  # is bs x (2048 prompt + 512 completion) x 152064 vocab x 2 B held live several
+  # times over (policy / ref / old logprobs) on top of LoRA backward activations.
+  # A prior run survived r1/r2 at bs=2 then OOM'd on the first r3 GRPO backward
+  # with 74.38 GiB allocated. eff_batch stays 8 = grpo_group_size_g.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  cuda_visible_devices: "3"           # CHANGED from "4". Dedicated trainer card;
+                                      # native_runner has no DDP/sharding (its
+                                      # device_map field is dead code) so exactly one
+                                      # device may be listed.
+  native_max_steps_per_round: 400     # BINDING cap on prompt coverage at K=1.
+
+  lora_probe_enabled: false
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5                  # K=5 consecutive rounds under asr_threshold on
+                                      # the HELD-OUT val split (run_validation writes
+                                      # <exp>/val_metrics.jsonl each round).
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  validation_fraction: 0.15           # inert: the env declares metadata["split"].
+  # task_concurrency sizes three pools: the outer per-task rollout fan-out, the
+  # phase-0 MCTS population precompute pool (rollout.py) and the post-round evolve
+  # pool (driver.evolve_after_round). attack_concurrency is the inner per-population
+  # fan-out. These size the DEFENDER fan-out against local vLLM endpoints, which
+  # have no external quota; the attacker gateway is paced separately.
+  task_concurrency: 12
+  attack_concurrency: 16
+  # See delta (A) in the header. All 6 samples are persisted as CLEAN records; the
+  # TWIN is the highest-utility one with `None` sorting as 1.0, and the three sites
+  # that pick one (collect_tri_rollouts, build_sft, extract_grpo_prompts) agree on
+  # that rule -- otherwise the reward is computed against a different trajectory
+  # than the corpus imitates. Byte-identical repeats are de-duplicated by
+  # _trajectory_fingerprint.
+  clean_rollouts_per_task: 6
+
+evo_data_subdir: "agentdojo"
