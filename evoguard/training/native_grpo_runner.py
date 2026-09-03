@@ -414,8 +414,22 @@ def _install_nonfinite_grad_guard(trainer, diag_state: dict) -> None:
     Wraps ``create_optimizer`` rather than the optimizer, because the optimizer
     does not exist until ``train()`` builds it; wrapping the bound method on the
     instance covers both the plain ``GRPOTrainer`` and the Δ-shaped subclass.
+
+    ``opt.step`` MUST be replaced with a *bound method*, never a plain function.
+    ``Trainer.create_optimizer_and_scheduler`` builds the scheduler immediately
+    after the optimizer (``trainer.py:1258`` then ``:1264``), and every
+    ``LRScheduler.__init__`` runs ``patch_track_step_called``, which reads
+    ``func = step_fn.__func__`` and re-binds it via
+    ``func.__get__(opt, opt.__class__)`` (``torch/optim/lr_scheduler.py:158-171``).
+    A plain function has no ``__func__``, so assigning one makes ``train()`` die
+    with ``AttributeError: 'function' object has no attribute '__func__'`` before
+    the first step -- measured 2026-09-03, that took down r1 of run
+    20260903_111934. ``types.MethodType`` hands torch the ``__func__``/``__self__``
+    pair it expects; torch's own wrapper then sits OUTSIDE this guard, so the skip
+    still happens and only torch's ``_opt_called`` bookkeeping runs on a skip.
     """
-    import torch                                    # local: keeps module import cheap
+    import types                                    # local: keeps module import cheap
+    import torch
 
     diag_state.setdefault("nonfinite_grad_skips", 0)
     _orig_create = trainer.create_optimizer
@@ -426,8 +440,8 @@ def _install_nonfinite_grad_guard(trainer, diag_state: dict) -> None:
             return opt
         _orig_step = opt.step
 
-        def _guarded_step(*args, **kwargs):
-            grads = [p.grad for g in opt.param_groups for p in g["params"]
+        def _guarded_step(self, *args, **kwargs):
+            grads = [p.grad for g in self.param_groups for p in g["params"]
                      if p.grad is not None]
             if grads:
                 try:
@@ -448,7 +462,7 @@ def _install_nonfinite_grad_guard(trainer, diag_state: dict) -> None:
                     return None
             return _orig_step(*args, **kwargs)
 
-        opt.step = _guarded_step
+        opt.step = types.MethodType(_guarded_step, opt)
         opt._evoguard_finite_guard = True
         return opt
 

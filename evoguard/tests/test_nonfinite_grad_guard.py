@@ -109,6 +109,61 @@ class TestNonFiniteGradGuard(unittest.TestCase):
         self.assertEqual(opt.n_steps_run, 0)
 
 
+class TestGuardSurvivesLRSchedulerPatch(unittest.TestCase):
+    """``opt.step`` must stay a BOUND METHOD after the guard is installed.
+
+    ``Trainer.create_optimizer_and_scheduler`` builds the scheduler right after
+    the optimizer, and every ``LRScheduler.__init__`` runs
+    ``patch_track_step_called``, which does ``step_fn.__func__`` and re-binds via
+    ``func.__get__(opt, opt.__class__)`` (``torch/optim/lr_scheduler.py:158-171``).
+    An earlier version of the guard assigned a plain closure, so ``train()`` died
+    with ``AttributeError: 'function' object has no attribute '__func__'`` before
+    reaching step 1. This exercises the real torch scheduler, not a stand-in.
+    """
+
+    def _real_harness(self):
+        p = torch.nn.Parameter(torch.zeros(4))
+        opt = torch.optim.SGD([p], lr=0.1)
+
+        class _T:
+            def create_optimizer(self_inner):
+                return opt
+
+        trainer = _T()
+        diag: dict = {}
+        _install_nonfinite_grad_guard(trainer, diag)
+        return p, trainer.create_optimizer(), diag
+
+    def test_step_is_a_bound_method(self):
+        _p, opt, _diag = self._real_harness()
+        self.assertTrue(hasattr(opt.step, "__func__"))
+        self.assertIs(opt.step.__self__, opt)
+
+    def test_lr_scheduler_construction_does_not_raise(self):
+        _p, opt, _diag = self._real_harness()
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _s: 1.0)
+        self.assertTrue(getattr(opt.step, "_wrapped_by_lr_sched", False))
+        self.assertIsNotNone(sched)
+
+    def test_guard_still_skips_through_the_scheduler_wrapper(self):
+        # torch's wrapper sits OUTSIDE the guard, so a skip must still be a skip.
+        p, opt, diag = self._real_harness()
+        torch.optim.lr_scheduler.LambdaLR(opt, lambda _s: 1.0)
+        p.grad = torch.tensor([float("nan"), 0.0, 0.0, 0.0])
+        before = p.detach().clone()
+        opt.step()
+        self.assertEqual(diag["nonfinite_grad_skips"], 1)
+        self.assertTrue(torch.equal(p.detach(), before))
+
+    def test_finite_step_updates_weights_through_the_wrapper(self):
+        p, opt, diag = self._real_harness()
+        torch.optim.lr_scheduler.LambdaLR(opt, lambda _s: 1.0)
+        p.grad = torch.ones(4)
+        opt.step()
+        self.assertEqual(diag["nonfinite_grad_skips"], 0)
+        self.assertAlmostEqual(float(p.detach()[0]), -0.1, places=6)
+
+
 def main() -> None:
     unittest.main(module=__name__, argv=["test_nonfinite_grad_guard"], exit=False)
 
