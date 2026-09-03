@@ -388,6 +388,73 @@ def _apply_advantage_overrides_inplace(advantages_tensor, overrides: dict[int, f
     return advantages_tensor
 
 
+def _install_nonfinite_grad_guard(trainer, diag_state: dict) -> None:
+    """Make the optimizer skip any step whose gradients are not all finite.
+
+    Rare but fatal without this. Measured on r2 of run 20260903_002823: at inner
+    step 17 (of 400) transformers logged ``'grad_norm': nan`` while the loss was
+    finite (0.0002). ``Trainer`` clips before stepping, so the NaN norm scaled
+    EVERY gradient to NaN, the optimizer wrote NaN into the LoRA weights, and the
+    next GRPO rollout died inside ``generate()`` with
+
+        TensorCompare.cu:109 _assert_async_cuda_kernel: Assertion `probability
+        tensor contains either inf, nan or element < 0` failed
+        -> torch.AcceleratorError: CUDA error: device-side assert triggered
+
+    which aborts the whole run two hours in. Skipping the update instead costs
+    one step's worth of signal and leaves the weights finite. Frequency is low
+    enough that this is a guardrail, not a crutch: r1 executed 400 steps with
+    zero non-finite norms (max 6.59), r2 hit one in 17.
+
+    Deliberately NOT a reward/advantage change -- every measured invariant in the
+    reward, GDPO and Δ-shaping paths is untouched. ``Trainer`` calls
+    ``model.zero_grad()`` right after ``optimizer.step()`` (transformers
+    ``trainer.py:2752``), so a skipped step must not zero anything itself.
+
+    Wraps ``create_optimizer`` rather than the optimizer, because the optimizer
+    does not exist until ``train()`` builds it; wrapping the bound method on the
+    instance covers both the plain ``GRPOTrainer`` and the Δ-shaped subclass.
+    """
+    import torch                                    # local: keeps module import cheap
+
+    diag_state.setdefault("nonfinite_grad_skips", 0)
+    _orig_create = trainer.create_optimizer
+
+    def _create_optimizer_with_guard():
+        opt = _orig_create()
+        if getattr(opt, "_evoguard_finite_guard", False):
+            return opt
+        _orig_step = opt.step
+
+        def _guarded_step(*args, **kwargs):
+            grads = [p.grad for g in opt.param_groups for p in g["params"]
+                     if p.grad is not None]
+            if grads:
+                try:
+                    norms = torch.stack(torch._foreach_norm(grads))
+                    finite = bool(torch.isfinite(norms).all().item())
+                except Exception as exc:            # noqa: BLE001
+                    logger.debug("[native_grpo] grad finiteness probe failed "
+                                 "(%s); stepping anyway", exc)
+                    finite = True
+                if not finite:
+                    diag_state["nonfinite_grad_skips"] += 1
+                    logger.warning(
+                        "[native_grpo] non-finite gradient at optimizer step; "
+                        "SKIPPING the update (skips so far this round: %d). The "
+                        "weights stay finite; without this the next rollout dies "
+                        "in generate() on a NaN probability tensor.",
+                        diag_state["nonfinite_grad_skips"])
+                    return None
+            return _orig_step(*args, **kwargs)
+
+        opt.step = _guarded_step
+        opt._evoguard_finite_guard = True
+        return opt
+
+    trainer.create_optimizer = _create_optimizer_with_guard
+
+
 # --------------------------------------------------------------------------- #
 # Outcome container                                                            #
 # --------------------------------------------------------------------------- #
@@ -1477,6 +1544,8 @@ def train_native_grpo(
             # Re-raise for the same fail-fast reason as the fit() crash above.
             raise
 
+        _install_nonfinite_grad_guard(trainer, diag_state)
+
         # -------------------------------------------------------------- #
         # B5 Launch fit                                                   #
         # -------------------------------------------------------------- #
@@ -1578,6 +1647,7 @@ def train_native_grpo(
             "delta_shaping_applied_count":int(diag_state.get("delta_shaping_applied_count",0) or 0),
             "safety_source_tally":safety_tally,
             "n_safety_fallback":n_fallback,
+            "nonfinite_grad_skips":int(diag_state.get("nonfinite_grad_skips",0) or 0),
         })
 
         return NativeGrpoOutcome(

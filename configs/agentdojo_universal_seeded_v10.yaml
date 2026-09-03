@@ -306,6 +306,19 @@ pipeline:
   asr_threshold: 0.05
   stop_on_zero_success: false
   validation_fraction: 0.15           # inert: the env declares metadata["split"].
+  # Held-out validation, ON. The default is False and v10's FIRST launch silently
+  # ran without it: no val_metrics.jsonl was written and patience_rounds/
+  # asr_threshold read TRAINING ASR, which tracks the co-evolving attacker rather
+  # than the defender (rho(ASR, mean_best_fitness) = +0.61 over 12 rounds). This
+  # replays the val split's real vendored injections through the round's adapter
+  # with tools actually EXECUTING (eval/vendored_replay.py) -- the only harness in
+  # the repo whose ASR means what the termination check assumes. ~2-3 min/round.
+  # Verify per round: a "[val] rN adapter=... asr=..." line and a growing
+  # val_metrics.jsonl; failures are swallowed and degrade to training ASR.
+  validate_every_round: true
+  val_dataset_dir: "data/toolsafe/agentdojo-tragjnew/val"   # LEAF split dir
+  val_split: "val"
+  val_concurrency: 8
   task_concurrency: 12
   attack_concurrency: 16
   # All 6 samples are persisted as CLEAN records; the TWIN is the highest-utility
