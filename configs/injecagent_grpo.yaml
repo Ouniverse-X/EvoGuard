@@ -1,0 +1,152 @@
+# EvoGuard experiment: InjecAgent (indirect prompt injection on tool
+# observations) with the native SFT -> GRPO defender path.
+#
+# Dataset: data/InjecAgent (pruned upstream extract + the EvoGuard split). 17
+# user cases x 62 attacker cases = 1054 attack instances across 11 toolkits.
+# See data/InjecAgent/README.md and docs/injecagent_integration.md.
+#
+# FOUR things differ from the agentdojo_* configs; read them before copying.
+#
+#  1. `env.suites` are TOOLKIT names (GitHub, Gmail, TwitterManager, ...), not
+#     suite files. Leaving the list empty loads all eleven.
+#  2. `pipeline.validation_fraction: 0.0` and `val_split: ""` are DELIBERATE.
+#     The split unit is the attacker case, so all 17 user tasks appear in all
+#     three splits and there is no honest task-level label to filter on -- the
+#     env declares no metadata["split"] at all. Held-out-ness comes from
+#     `val_dataset_dir` pointing at the leaf split dir, which restricts the
+#     replayed ATTACKS to val while every task stays available as a carrier.
+#     Consequence: InjecAgent measures "unseen attacker instruction / attacker
+#     tool on a seen user scenario". Do not report it as task-level
+#     generalisation. A non-zero validation_fraction would hold tasks out of
+#     training for no held-out benefit at all.
+#  3. Only 17 tasks, so the per-task budgets are raised rather than the row
+#     budgets: 8 clean rollouts per task (the clean arm is the scarce class) and
+#     170 GRPO rows still covers each task ~10x per round.
+#  4. `defense.max_turns: 6` is sized on the longest legitimate chain: carrier
+#     call -> (data-stealing stage 1) -> (stage 2) -> final answer, with slack.
+#     Raising it mostly buys the attacker retries.
+
+name: evoguard_injecagent_grpo
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 6
+
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: injecagent
+  data_root: data
+  # Toolkits, not suite files. Empty = all eleven.
+  suites: []
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /root/yangxiao/models/qwen2.5-7b-it
+  method: sft_then_native_grpo
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+  # Must stay >= pipeline.clean_rollouts_per_task, else the clean supervision is
+  # capped away before the attacked records are even considered.
+  sft_max_records_per_task: 10
+
+  grpo_learning_rate: 5.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 1.15
+  # 17 tasks only: 170 rows at K=1 covers each task ~10x per round.
+  grpo_max_prompts_per_round: 170
+  grpo_min_new_successes: 3
+  grpo_gdpo: true
+  grpo_traj_group_size: 1
+  grpo_advantage_curriculum_lambda: 1.5
+  grpo_clean_prompt_ratio: 0.25
+
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+  dry_run: false
+  use_native_trainer: true
+  cuda_visible_devices: "1"
+  native_max_steps_per_round: 170
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  # 0.0 = every task trains. See header note 2.
+  validation_fraction: 0.0
+  task_concurrency: 8
+  attack_concurrency: 8
+  # The clean arm is the scarce class and there are only 17 tasks, so sampling
+  # it 8x is cheap and removes the "no usable twin" failure mode.
+  clean_rollouts_per_task: 8
+  validate_every_round: true
+  # Leaf split dir -> restricts the REPLAYED ATTACKS to val. See header note 2.
+  val_dataset_dir: data/InjecAgent/splits/val
+  val_split: ""
+  val_concurrency: 4
+
+evo_data_subdir: "injecagent"

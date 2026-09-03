@@ -1,0 +1,42 @@
+{
+  "dataset": "Agent Security Bench (ASB)",
+  "subset": "Observation Prompt Injection (OPI)",
+  "upstream_repository": "https://github.com/agiresearch/ASB.git",
+  "upstream_commit": "1f561dccf92d55302368fa67679b4ba9d9c8fdc4",
+  "extracted_on": "2026-08-14",
+  "pruned_on": "2026-09-02",
+  "data_files_modified": false,
+  "license": "MIT",
+  "paper": "https://openreview.net/forum?id=V4y0CpX4hK",
+  "kept_from_upstream": [
+    "LICENSE",
+    "config/OPI.yml",
+    "data/all_normal_tools.jsonl",
+    "data/all_attack_tools.jsonl",
+    "agents/<agent>/config.json (was pyopenagi/agents/example/<agent>/config.json)"
+  ],
+  "dropped_from_upstream": {
+    "reason": "unused by EvoGuard; the full checkout is re-clonable at the pinned commit",
+    "paths": [
+      ".git", ".gitignore", "Dockerfile", "README.md", "requirements*.txt",
+      "aios/", "images/", "main_attacker.py", "memory_db/", "memory_defense/",
+      "pyopenagi/ (except the 10 agent config.json)", "runtime/", "scripts/"
+    ],
+    "derivable_data_files": {
+      "data/all_attack_tools_aggressive.jsonl": "all_attack_tools.jsonl filtered on Aggressive == \"True\" (row-for-row equal, verified)",
+      "data/all_attack_tools_non_aggressive.jsonl": "all_attack_tools.jsonl filtered on Aggressive == \"False\" (row-for-row equal, verified)",
+      "data/agent_task.jsonl": "the 51 user tasks with their agent and index are carried by splits/*/all.jsonl (user_task, corresponding_agent, user_task_index)"
+    }
+  },
+  "splits": {
+    "path": "splits/{train,val,test}/all.jsonl",
+    "was": "data/toolsafe/asb-opi-tragjnew",
+    "unit": "attack instance (NOT task)",
+    "ratios": "67/18/20",
+    "stratified_by": "corresponding_agent",
+    "counts": {"train": 289, "val": 86, "test": 76, "total": 451},
+    "composition": {"clean": 51, "injected": 400},
+    "guard": "splits/_sha256_guard.txt",
+    "generated_by": "scripts/split_asb_opi.py (not vendored; the guard digests are the record)"
+  }
+}

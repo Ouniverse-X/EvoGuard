@@ -1,0 +1,145 @@
+# EvoGuard experiment: ASB-OPI (Agent Security Bench, observation prompt
+# injection) with the native SFT -> GRPO defender path.
+#
+# Dataset: data/ASB (pruned upstream extract + the EvoGuard split). 51 distinct
+# (agent, user_task) pairs across 10 agent personas, 400 injected attack
+# instances. See data/ASB/README.md and docs/asb_opi_integration.md.
+#
+# THREE things differ from every agentdojo_* config here; read them before
+# copying this file:
+#
+#  1. `env.suites` are AGENT names (system_admin_agent, ...), not suite files.
+#     Leaving the list empty loads all ten.
+#  2. `pipeline.val_split` is DELIBERATELY EMPTY. The shipped split's unit is the
+#     attack instance, not the task: all 400 attacks sit on the 10
+#     `user_task_index == 0` tasks, so those tasks appear in several splits.
+#     Filtering env tasks by metadata["split"] == "val" would therefore throw
+#     away most of the val attacks. Held-out-ness is enforced by
+#     `val_dataset_dir` pointing at the leaf split dir instead, which restricts
+#     the ATTACKS to that split while every task stays available as a carrier.
+#     Consequence: ASB-OPI measures "unseen attacker tool / instruction on a seen
+#     agent scenario". Do not report it as task-level generalisation.
+#  3. `max_tasks: 0` means unbounded; a small positive value truncates in split
+#     order (train first), which silently biases what gets trained on.
+
+name: evoguard_asb_opi_grpo
+
+defense:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  max_turns: 8
+
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: asb_opi
+  data_root: data
+  # Agent personas, not suite files. Empty = all ten.
+  suites: []
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: llama3-8b-judge
+    base_url: http://127.0.0.1:8002/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+
+training:
+  enabled: true
+  base_model: /root/yangxiao/models/qwen2.5-7b-it
+  method: sft_then_native_grpo
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  llamafactory_root: ""
+  verl_root: ""
+
+  sft_epochs: 2.0
+  sft_learning_rate: 1.0e-4
+  sft_max_records_per_task: 6
+
+  grpo_learning_rate: 5.0e-6
+  grpo_beta: 0.01
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  grpo_rollout_temperature: 1.15
+  # 51 tasks only, so the row budget is deliberately below agentdojo's 400:
+  # 200 rows at K=1 already covers each task ~4x per round.
+  grpo_max_prompts_per_round: 200
+  grpo_min_new_successes: 3
+  grpo_gdpo: true
+  grpo_traj_group_size: 1
+  grpo_advantage_curriculum_lambda: 1.5
+  grpo_clean_prompt_ratio: 0.25
+
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+  dry_run: false
+  use_native_trainer: true
+  cuda_visible_devices: "1"
+  native_max_steps_per_round: 200
+
+pipeline:
+  max_rounds: 12
+  patience_rounds: 5
+  asr_threshold: 0.05
+  stop_on_zero_success: false
+  # Inert: the env declares metadata["split"] from each task's clean row.
+  validation_fraction: 0.15
+  task_concurrency: 8
+  attack_concurrency: 8
+  clean_rollouts_per_task: 6
+  validate_every_round: true
+  # Leaf split dir -> restricts the REPLAYED ATTACKS to val. See header note 2.
+  val_dataset_dir: data/ASB/splits/val
+  val_split: ""
+  val_concurrency: 4
+
+evo_data_subdir: "asb_opi"

@@ -1,11 +1,21 @@
-"""Faithful-replay evaluation against real vendored AgentDojo injections.
+"""Faithful-replay evaluation against real vendored benchmark injections.
 
 This module implements Plan B: instead of synthesising new GA attacks that are
 in-distribution with the defender's training set, we replay the REAL benchmark
-injections that ship inside ``data/toolsafe/agentdojo-tragj/*.json``. Each
-distinct task instruction has its injection payload embedded in a tool
-``Observation`` field; :mod:`evoguard.process.vendored_attack_parser` extracts
-those, and :meth:`Controller.run_replay` substitutes the real vendored
+injections that ship with the dataset. Scenario loading is dispatched on
+``env.dataset`` by :mod:`evoguard.process.vendored_attack_loaders`:
+
+* ``agentdojo`` / ``agentdojo_split`` -- payloads embedded in a tool
+  ``Observation`` field inside ``data/toolsafe/agentdojo-tragj*/*.json``, scraped
+  by :mod:`evoguard.process.vendored_attack_parser`;
+* ``asb_opi`` -- payloads carried as first-class JSONL fields in
+  ``data/ASB/splits/<split>/all.jsonl``, read by
+  :mod:`evoguard.process.asb_attack_loader`;
+* ``injecagent`` -- payloads substituted into the carrier's response template in
+  ``data/InjecAgent/splits/<split>/all.jsonl``, read by
+  :mod:`evoguard.process.injecagent_attack_loader`.
+
+Either way :meth:`Controller.run_replay` substitutes the real vendored
 observation when our defense agent first calls the injection-bearing tool.
 
 For every task with a parseable vendored attack we collect:
@@ -53,10 +63,8 @@ from evoguard.core.types import (
 from evoguard.envs import build_env
 from evoguard.judge import AttackJudge
 from evoguard.process.signals import compute_signals
-from evoguard.process.vendored_attack_parser import (
-    VendoredAttack,
-    load_all_vendored_attacks,
-)
+from evoguard.process.vendored_attack_loaders import load_vendored_scenarios
+from evoguard.process.vendored_attack_parser import VendoredAttack
 from evoguard.utils.logging import get_logger
 from evoguard.utils.metrics import aggregate_round
 
@@ -203,13 +211,18 @@ def run_vendored_replay(
         If not ``_sentinel``, overrides ``defense.llm.lora_adapter`` in the
         config (``None`` -> bare base model).
     dataset_dir
-        Override the injection-scenario source dir (default
-        ``<data_root>/toolsafe/agentdojo-tragj``). Point it at
-        ``data/toolsafe/agentdojo-tragjnew/test`` for a held-out evaluation.
+        Override the injection-scenario source dir (dataset-specific default).
+        Point it at ``data/toolsafe/agentdojo-tragjnew/test``,
+        ``data/ASB/splits/test`` or ``data/InjecAgent/splits/test`` for a held-out
+        evaluation.
     split
         Keep only env tasks whose ``metadata["split"]`` equals this value.
-        Requires a split-aware env (``dataset: agentdojo_split``); tasks with no
-        declared split are dropped when this is set.
+        Requires a split-aware env (only ``agentdojo_split`` and ``asb_opi``
+        declare one); tasks with no declared split are dropped when this is set.
+        Leave EMPTY for ``asb_opi`` and ``injecagent``: their split unit is the
+        attack instance / attacker case, so restricting tasks discards most of the
+        split's attacks (``dataset_dir`` already restricts them correctly), and
+        ``injecagent`` declares no task-level split at all.
     concurrency
         Number of tasks replayed in parallel. Controller/agent/env/judge hold no
         per-run mutable state, so fan-out is safe; each worker owns one task's
@@ -250,7 +263,7 @@ def run_vendored_replay(
     # A single instruction can carry multiple distinct injections (different
     # target tools / observation text); each is a separate test case.
     suites = cfg.env.suites or None
-    scenarios = load_all_vendored_attacks(
+    scenarios = load_vendored_scenarios(
         cfg.env.data_root, suites=suites, dataset_dir=dataset_dir,
         dataset=cfg.env.dataset,
     )
@@ -269,7 +282,7 @@ def run_vendored_replay(
         if not env_tasks:
             raise SystemExit(
                 f"no env tasks carry metadata['split'] == {split!r}; "
-                f"is env.dataset split-aware (agentdojo_split)?"
+                f"is env.dataset split-aware (agentdojo_split / asb_opi)?"
             )
         logger.info("restricted to split=%s: %d env tasks", split, len(env_tasks))
     tasks_by_id = {t.task_id: t for t in env_tasks}
@@ -342,8 +355,7 @@ def run_vendored_replay(
     summary = {
         "adapter": adapter_label,
         "config": config_path,
-        "dataset_dir": dataset_dir or os.path.join(cfg.env.data_root, "toolsafe",
-                                                   "agentdojo-tragj"),
+        "dataset_dir": dataset_dir or f"<{cfg.env.dataset} default>",
         "split": split or "all",
         "n_tasks": len(by_task),
         "n_injection_scenarios": n_scenarios_matched,
@@ -386,14 +398,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--dataset-dir", default=None,
-        help="Override injection-scenario source dir (default "
-             "<data_root>/toolsafe/agentdojo-tragj); e.g. "
-             "data/toolsafe/agentdojo-tragjnew/test for the held-out split.",
+        help="Override injection-scenario source dir (dataset-specific "
+             "default); e.g. data/toolsafe/agentdojo-tragjnew/test or "
+             "data/ASB/splits/test for the held-out split.",
     )
     parser.add_argument(
         "--split", default=None,
         help="Keep only env tasks whose metadata['split'] equals this "
-             "(needs dataset: agentdojo_split). e.g. 'test'.",
+             "(needs agentdojo_split / asb_opi). e.g. 'test'. Omit for "
+             "asb_opi and injecagent -- their split unit is the attack "
+             "instance / attacker case, so --dataset-dir alone is the correct "
+             "held-out filter.",
     )
     parser.add_argument(
         "--concurrency", type=int, default=1,

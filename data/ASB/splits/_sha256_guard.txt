@@ -1,0 +1,7 @@
+# ASB-OPI split immutability guard
+# generated-by: scripts/split_asb_opi.py with --ratios=67/18/20
+# total-input-lines: 451
+# swap-count-after-agent-coverage-fixup: 0
+sha256(train/all.jsonl)=ebf80d86daeaf9d121e50427ea24b3edf31be18fcd6b56adc324b125d9ce1bcf
+sha256(val/all.jsonl)=5cb6aa591dfff4e9808ab05943936623dbfd5600123ca03c98b8f76114c4ee07
+sha256(test/all.jsonl)=799039d44722b52b4c54e7bbd5cd92a8e4945fe2a33a4e9fff95986bb716ff6a

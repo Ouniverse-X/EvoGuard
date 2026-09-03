@@ -1,0 +1,57 @@
+{
+  "dataset": "InjecAgent",
+  "subset": "full benchmark (direct harm + data stealing, base setting)",
+  "upstream_repository": "https://github.com/uiuc-kang-lab/InjecAgent.git",
+  "upstream_commit": "f19c9f2c79a41046eb13c03c51a24c567a8ffa07",
+  "upstream_commit_date": "2024-07-02",
+  "extracted_on": "2026-09-01",
+  "pruned_on": "2026-09-03",
+  "data_files_modified": false,
+  "license": "MIT",
+  "paper": "https://aclanthology.org/2024.findings-acl.624/",
+  "kept_from_upstream": [
+    "LICENCE",
+    "data/tools.json",
+    "data/user_cases.jsonl",
+    "data/attacker_cases_dh.jsonl",
+    "data/attacker_cases_ds.jsonl",
+    "data/attacker_simulated_responses.json"
+  ],
+  "added_by_evoguard": [
+    "benign_fillers.json",
+    "splits/{train,val,test}/all.jsonl",
+    "splits/_sha256_guard.txt",
+    "splits/split_manifest.json",
+    "metadata/SOURCE.json",
+    "metadata/SHA256SUMS",
+    "README.md"
+  ],
+  "dropped_from_upstream": {
+    "reason": "unused by EvoGuard; the full checkout is re-clonable at the pinned commit",
+    "paths": [
+      ".git", ".gitignore", "README.md", "requirements.txt",
+      "asset/ (overview.pdf, overview.png)",
+      "src/ (evaluate_prompted_agent.py, evaluate_finetuned_agent.py, models.py, output_parsing.py, params.py, utils.py, prompts/)"
+    ],
+    "derivable_data_files": {
+      "note": "the 17 x 62 grid was verified set-equal to these four files, field by field, with 0 mismatches, and every 'Tool Response' was reproduced by tool_response_template.replace('<Attacker Instruction>', payload) -- see README.md",
+      "data/test_cases_dh_base.json": "0a8186468d21389af432e8c7b399ae42264d1b93a07b65c7a489468508604305",
+      "data/test_cases_dh_enhanced.json": "885602716b72c18af80695ce6c2e1f242fa03163bc90b0788b0c5e4ab6216d50",
+      "data/test_cases_ds_base.json": "4daab35c62a3845e8b9400f4dca58b9c9f37e57cd33b2337552557fbb26282e9",
+      "data/test_cases_ds_enhanced.json": "7bc510868df032511053fc40e8470e68a041fb7148d055112093594bf73ab0ce"
+    }
+  },
+  "splits": {
+    "path": "splits/{train,val,test}/all.jsonl",
+    "unit": "attacker case (NOT task, NOT row)",
+    "ratios": "60/20/20",
+    "stratified_by": ["attack_class", "Attack Type"],
+    "attack_setting": "base",
+    "seed": 20260903,
+    "counts": {"train": 646, "val": 204, "test": 204, "total": 1054},
+    "attacker_cases": {"train": 38, "val": 12, "test": 12, "total": 62},
+    "user_cases_per_split": 17,
+    "guard": "splits/_sha256_guard.txt",
+    "generated_by": "evoguard/process/split_injecagent.py"
+  }
+}

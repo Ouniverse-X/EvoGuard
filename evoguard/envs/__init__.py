@@ -9,7 +9,9 @@ from __future__ import annotations
 from typing import Callable
 
 from evoguard.config import EnvConfig
+from evoguard.envs.asb import ASBOPIEnv
 from evoguard.envs.base import SimulatedToolEnv, ToolEnv
+from evoguard.envs.injecagent import InjecAgentEnv
 from evoguard.envs.toolsafe import AgentDojoEnv, AgentDojoSplitEnv, AgentHarmEnv
 from evoguard.llm import build_client
 from evoguard.llm.base import LLMClient
@@ -18,6 +20,8 @@ _REGISTRY: dict[str, Callable[..., ToolEnv]] = {
     "agentdojo": AgentDojoEnv,
     "agentdojo_split": AgentDojoSplitEnv,
     "agentharm": AgentHarmEnv,
+    ASBOPIEnv.name: ASBOPIEnv,
+    InjecAgentEnv.name: InjecAgentEnv,
 }
 
 
@@ -73,6 +77,8 @@ __all__ = [
     "AgentDojoEnv",
     "AgentDojoSplitEnv",
     "AgentHarmEnv",
+    "ASBOPIEnv",
+    "InjecAgentEnv",
     "build_env",
     "register_env",
     "available_envs",

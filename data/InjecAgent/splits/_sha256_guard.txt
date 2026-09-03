@@ -1,0 +1,6 @@
+# sha256 of the InjecAgent split files. Enforced by
+# evoguard/tests/test_injecagent_env.py -- edit deliberately,
+# never to make the test pass.
+sha256(test/all.jsonl)=1349a829f65c8e812674541fa3e07fa5ca5b98c583be3a28240e0aa5beff1804
+sha256(train/all.jsonl)=4670bb4ebb77cb4a2e62289ff9baf7f83cb9a1779d1f26da190a40883917c4a7
+sha256(val/all.jsonl)=5dc21d500bb39b039d5dfc8c528eb05325463ffcb1d04b5c3b556f2415c5f55e

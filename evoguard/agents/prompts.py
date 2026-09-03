@@ -50,13 +50,21 @@ DEFAULT_DEFENSE_SYSTEM = (
 
 
 def build_system_prompt(task: Task, tools: Sequence[ToolSpec], custom: str | None) -> str:
-    """Assemble the defense agent system prompt for a task."""
+    """Assemble the defense agent system prompt for a task.
+
+    ``task.metadata["role_prompt"]`` (ASB-OPI ships one per agent persona) is
+    appended verbatim as an ``AGENT_ROLE`` line. Datasets without it produce a
+    byte-identical prompt to before the hook existed.
+    """
 
     body = custom or DEFAULT_DEFENSE_SYSTEM
     tools_json = json.dumps([t.to_dict() for t in tools], ensure_ascii=False)
+    role = str((task.metadata or {}).get("role_prompt") or "").strip()
+    role_block = f"AGENT_ROLE: {role}\n" if role else ""
     return (
         f"{roles.marker(roles.ROLE_DEFENSE)}\n"
         f"{body}\n\n"
+        f"{role_block}"
         f"AVAILABLE_TOOLS_JSON: {tools_json}\n"
         f"TASK: {task.instruction}"
     )
