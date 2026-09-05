@@ -163,6 +163,14 @@ class EnvConfig:
     utility_judge_llm: LLMConfig = field(
         default_factory=lambda: LLMConfig(temperature=0.0, max_tokens=512)
     )
+    # Append the sensitive out-of-scope decoy tools of
+    # ``attacks/harmful_catalog.py`` to every AgentDojo task's tool list, so the
+    # attacker has a sink to divert the agent TO. ASB and InjecAgent ship their
+    # own attacker tools and ignore this flag. Off by default: the tool list is
+    # part of every prompt, so flipping it changes the SFT corpus and the GRPO
+    # prompts, and historical runs must stay reproducible. Applied to BOTH arms
+    # -- a tool present only under attack would leak the attack.
+    inject_harmful_tools: bool = False
 
 
 @dataclass

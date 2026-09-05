@@ -16,6 +16,11 @@ from typing import Any, Literal, Optional, Sequence
 
 from evoguard.attacks.base import AttackGenerator
 from evoguard.attacks.genetic import EvaluatedAttack
+from evoguard.attacks.harmful_catalog import (
+    HarmfulGoal,
+    resolve_placeholders,
+    sample_goal,
+)
 from evoguard.config import AttackerConfig
 from evoguard.core.types import AttackSpec, Task, ToolSpec
 from evoguard.utils.logging import get_logger
@@ -193,6 +198,28 @@ class DeltaGuidedMCTSAttacker:
         self._buffer_specs: list[AttackSpec] = []
         self._buffer_paths: list[list[str]] = []
 
+        # Independent malicious objective (harmful_catalog). Before 2026-09-04
+        # ``goal`` was ``task.instruction``, i.e. the attacker's stated objective
+        # WAS the user's task, so forging a return value inside the benign plan
+        # already counted as serving the goal and the search converged on
+        # in-scope poisoning. ``None`` (task exposes no sensitive sink) keeps the
+        # old behaviour rather than inventing an objective.
+        self._harmful_goal = sample_goal(task, self.tools)
+        if self._harmful_goal is None:
+            logger.warning(
+                "Task %s exposes no sensitive sink; attacker falls back to "
+                "goal=task.instruction (in-scope forgery is reachable again).",
+                (self.task.task_id or "?")[:60],
+            )
+        else:
+            logger.info(
+                "[harmful_goal][task=%s] kind=%s tool=%s in_benign_plan=%s",
+                (self.task.task_id or "?")[:60],
+                self._harmful_goal.goal_kind,
+                self._harmful_goal.harmful_tool,
+                self._harmful_goal.in_benign_plan,
+            )
+
         self._ensure_L1_children()
         self._inject_prewarm_skeletons()
 
@@ -345,6 +372,10 @@ class DeltaGuidedMCTSAttacker:
             tmpl = str(
                 ent.get("payload_template", ent.get("payload")) or ""
             ).strip()
+            # Seeds name their diversion target abstractly ({{TARGET_TOOL}}); bind
+            # it to THIS task's sampled sink so the warm start already points at a
+            # concrete out-of-scope tool instead of leaving braces for the mutator.
+            tmpl = resolve_placeholders(tmpl, self._harmful_goal)
             try:
                 t_val = int(turn_raw)
             except (TypeError, ValueError):
@@ -495,6 +526,7 @@ class DeltaGuidedMCTSAttacker:
                 node.discriminator.get("method"),
                 self.task,
                 payload=node.cached_payload_text or "",
+                harmful_goal=self._harmful_goal,
             )
             # 基于占位 spec 生成一个具体的攻击 payload 文本
             mutated = self.generator.mutate(self.task, self.tools, placeholder, generation=self.generation)
@@ -562,10 +594,22 @@ class DeltaGuidedMCTSAttacker:
         # If payload missing (freshly created L2 without L3 yet?), synthesize
         # placeholder via generator.mutate so controller/judge receive valid strings.
         if not payload:
-            tmp_spec = _construct_seed_from_cell(tgt_turn, method, self.task, payload="")
+            tmp_spec = _construct_seed_from_cell(
+                tgt_turn, method, self.task, payload="",
+                harmful_goal=self._harmful_goal,
+            )
             mut = self.generator.mutate(self.task, self.tools, tmp_spec, generation=self.generation)
             payload = mut.payload or ""
             leaf.cached_payload_text = payload
+
+        metadata: dict[str, Any] = {
+            "tree_path": list(path), "leaf_id": leaf.node_id,
+        }
+        if self._harmful_goal is not None:
+            metadata["harmful_goal"] = self._harmful_goal.to_dict()
+            goal = self._harmful_goal.goal_text
+        else:
+            goal = self.task.instruction[:200]
 
         spec = AttackSpec(
             attack_id=AttackSpec.new_id(),
@@ -574,11 +618,11 @@ class DeltaGuidedMCTSAttacker:
             injection_channel="",              # filled in by generator pipeline elsewhere
             method=method,
             payload=payload,
-            goal=self.task.instruction[:200],  
+            goal=goal,
             generation=self.generation,
             parents=[leaf.node_id],
             origin=f"mcts_{leaf.level}",
-            metadata={"tree_path": list(path), "leaf_id": leaf.node_id},
+            metadata=metadata,
         )
         return self.sanitize_spec(spec)
 
@@ -689,7 +733,8 @@ class DeltaGuidedMCTSAttacker:
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
 def _construct_seed_from_cell(turn: int, method: str, task: Task, *,
-                              payload: str = "") -> AttackSpec:
+                              payload: str = "",
+                              harmful_goal: Optional[HarmfulGoal] = None) -> AttackSpec:
     """Build a minimal valid AttackSpec representing the cell identified by
     (turn, method). Used solely as scaffolding around generator.mutate() calls
     expecting an individual argument"""
@@ -700,11 +745,13 @@ def _construct_seed_from_cell(turn: int, method: str, task: Task, *,
         injection_channel="",
         method=str(method or ""),
         payload=str(payload or ""),
-        goal=getattr(task, "instruction", ""),
+        goal=(harmful_goal.goal_text if harmful_goal is not None
+              else getattr(task, "instruction", "")),
         generation=-1,                            # sentinel marks scaffold-not-real-rollout-spec
         parents=[],
         origin="mcts_scaffold",
-        metadata={},
+        metadata=({"harmful_goal": harmful_goal.to_dict()}
+                  if harmful_goal is not None else {}),
     )
 
 

@@ -6,6 +6,7 @@ from :class:`~evoguard.config.EnvConfig`.
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable
 
 from evoguard.config import EnvConfig
@@ -54,6 +55,15 @@ def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int
             str(exc)[:200],
         )
     builder = _REGISTRY[config.dataset]
+    extra: dict[str, object] = {}
+    # Only the toolsafe envs accept this; ASB / InjecAgent ship their own
+    # attacker tools. Probed rather than passed blindly so a builder that does
+    # not know the knob keeps its ``utility_judge`` instead of falling through
+    # to the reduced call below.
+    if getattr(config, "inject_harmful_tools", False) and _accepts(
+        builder, "inject_harmful_tools"
+    ):
+        extra["inject_harmful_tools"] = True
     try:
         return builder(
             executor,
@@ -61,6 +71,7 @@ def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int
             suites=config.suites,
             max_tasks=config.max_tasks,
             utility_judge=utility_judge_client,
+            **extra,
         )
     except TypeError:
         return builder(
@@ -69,6 +80,13 @@ def build_env(config: EnvConfig, *, executor: LLMClient | None = None, seed: int
             suites=config.suites,
             max_tasks=config.max_tasks,
         )
+
+
+def _accepts(builder: Callable[..., ToolEnv], name: str) -> bool:
+    try:
+        return name in inspect.signature(builder).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 __all__ = [

@@ -26,6 +26,7 @@ from typing import Optional
 from evoguard.core.types import Task, ToolSpec, Trajectory
 from evoguard.envs.base import SimulatedToolEnv, ToolEnv
 from evoguard.envs.tool_parsing import parse_env_info
+from evoguard.attacks.harmful_catalog import injected_tools_for
 from evoguard.envs.utility_judge import score_utility as _score_utility_impl
 from evoguard.llm.base import LLMClient
 from evoguard.utils.logging import get_logger
@@ -49,6 +50,7 @@ class _ToolSafeEnv(SimulatedToolEnv):
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
         utility_judge: Optional[LLMClient] = None,
+        inject_harmful_tools: bool = False,
     ):
         super().__init__(executor)
         self._data_dir = data_dir
@@ -56,6 +58,11 @@ class _ToolSafeEnv(SimulatedToolEnv):
         self._max_tasks = max_tasks
         self._tasks: list[Task] = []
         self._tools_by_task: dict[str, list[ToolSpec]] = {}
+        # Append the out-of-scope sensitive sinks of attacks/harmful_catalog.py
+        # (EnvConfig.inject_harmful_tools). AgentDojo ships none of its own, and
+        # 55/58 of its tasks only expose sinks the benign plan itself uses, so
+        # without this the attacker has nowhere out-of-scope to divert the agent.
+        self._inject_harmful_tools = bool(inject_harmful_tools)
         # Dedicated judge client used by the benign-completion scorer fallback
         # path (Plan C). May be None when caller opts out of utility scoring;
         # in that case score_utility returns 0.0 with method='skipped_no_llm'.
@@ -90,6 +97,11 @@ class _ToolSafeEnv(SimulatedToolEnv):
                            getattr(task, "task_id", "?"), exc)
             return (0.0, "error", f"{type(exc).__name__}: {str(exc)[:300]}")
 
+    #: Attacker prewarm artifacts share the dataset dir but are not task files.
+    #: They hold a ``{"seeds": [...]}`` mapping, so a loader that treats them as
+    #: a record list iterates the dict's KEYS and dies on ``str.get``.
+    _NON_TASK_SUFFIXES = ("_seeds", "_seeds_base")
+
     # ---- loading ---------------------------------------------------------- #
     def _iter_files(self):
         if not os.path.isdir(self._data_dir):
@@ -98,6 +110,8 @@ class _ToolSafeEnv(SimulatedToolEnv):
             if not fname.endswith(".json"):
                 continue
             suite = os.path.splitext(fname)[0]
+            if suite.endswith(self._NON_TASK_SUFFIXES):
+                continue
             if self._suite_filter and suite not in self._suite_filter:
                 continue
             yield suite, os.path.join(self._data_dir, fname)
@@ -141,6 +155,12 @@ class _ToolSafeEnv(SimulatedToolEnv):
                     tool_names=[t.name for t in tools],
                     metadata=metadata,
                 )
+                if self._inject_harmful_tools:
+                    extra = injected_tools_for(task, tools)
+                    if extra:
+                        tools = list(tools) + extra
+                        task.tool_names = [t.name for t in tools]
+                        metadata["injected_harmful_tools"] = [t.name for t in extra]
                 seen[uid] = task
                 self._tools_by_task[uid] = tools
                 if self._max_tasks and len(seen) >= self._max_tasks:
@@ -164,12 +184,14 @@ class AgentDojoEnv(_ToolSafeEnv):
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
         utility_judge: Optional[LLMClient] = None,
+        inject_harmful_tools: bool = False,
     ):
         data_dir = os.path.join(data_root, "toolsafe", "agentdojo-tragj")
         super().__init__(
             executor, data_dir,
             suites=suites, max_tasks=max_tasks,
             utility_judge=utility_judge,
+            inject_harmful_tools=inject_harmful_tools,
         )
 
 
@@ -195,12 +217,14 @@ class AgentDojoSplitEnv(_ToolSafeEnv):
         max_tasks: int = 0,
         utility_judge: Optional[LLMClient] = None,
         subdir: str = "agentdojo-tragjnew",
+        inject_harmful_tools: bool = False,
     ):
         data_dir = os.path.join(data_root, "toolsafe", subdir)
         super().__init__(
             executor, data_dir,
             suites=suites, max_tasks=max_tasks,
             utility_judge=utility_judge,
+            inject_harmful_tools=inject_harmful_tools,
         )
 
     def _iter_files(self):
@@ -242,10 +266,12 @@ class AgentHarmEnv(_ToolSafeEnv):
         suites: Optional[list[str]] = None,
         max_tasks: int = 0,
         utility_judge: Optional[LLMClient] = None,
+        inject_harmful_tools: bool = False,
     ):
         data_dir = os.path.join(data_root, "toolsafe", "agentharm-traj")
         super().__init__(
             executor, data_dir,
             suites=suites, max_tasks=max_tasks,
             utility_judge=utility_judge,
+            inject_harmful_tools=inject_harmful_tools,
         )
