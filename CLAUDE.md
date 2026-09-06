@@ -35,6 +35,7 @@ Per task, the controller produces **tri trajectories**: **A** = clean, **B** = a
 - `data/toolsafe/` — step-level safety annotations (AgentHarm/AgentDojo trajectories); `data/agentdojo/`, `data/agentharm/` vendored tool defs
 - `data/ASB/` — pruned Agent Security Bench extract + the ASB-OPI split (env `envs/asb.py`, scenarios `process/asb_attack_loader.py`, config `configs/asb_opi_grpo.yaml`); read `docs/asb_opi_integration.md` before touching it
 - `data/InjecAgent/` — pruned InjecAgent extract + the EvoGuard split (env `envs/injecagent.py`, scenarios `process/injecagent_attack_loader.py`, split generator `process/split_injecagent.py`, config `configs/injecagent_grpo.yaml`); read `docs/injecagent_integration.md` before touching it
+- `data/agentdojo_latent/` — 48 authored high-Δ (business-process-camouflaged) IPI attacks on AgentDojo v1 + 46 paired clean rows; **eval-only held-out probe, never train on it** (env `envs/agentdojo_latent.py`, scenarios `process/agentdojo_latent_loader.py`, builder `scripts/build_agentdojo_latent.py`, config `configs/agentdojo_latent_probe.yaml`, tests `tests/test_agentdojo_latent.py`); read `data/agentdojo_latent/README.md` before touching it
 - `rounds/<exp>/round_<id>/` — per-round JSONL artifacts; `results/` summaries + curves
 - `configs/` — YAML experiment configs; `scripts/` — thin bash wrappers; `docs/` — design notes (save implementation explanations here)
 

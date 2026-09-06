@@ -1,0 +1,84 @@
+{
+ "schema_version": 1,
+ "dataset": "agentdojo_latent",
+ "built_by": "scripts/build_agentdojo_latent.py",
+ "source": "AgentDojo v1 default suites, vendored at data/agentdojo/",
+ "task_source": "user_tasks.py PROMPT + ground_truth (verbatim)",
+ "split_unit": "none -- the whole set is a held-out diagnostic probe",
+ "n_injected_total": 48,
+ "per_suite": {
+  "banking": {
+   "n_rows": 22,
+   "n_injected": 12,
+   "n_clean": 10,
+   "by_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   },
+   "by_technique": {
+    "audit_trail": 2,
+    "compliance_deferral": 2,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 2
+   }
+  },
+  "slack": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   },
+   "by_technique": {
+    "audit_trail": 2,
+    "compliance_deferral": 2,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 2
+   }
+  },
+  "travel": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   },
+   "by_technique": {
+    "audit_trail": 2,
+    "compliance_deferral": 2,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 2
+   }
+  },
+  "workspace": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   },
+   "by_technique": {
+    "audit_trail": 2,
+    "compliance_deferral": 2,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 2
+   }
+  }
+ },
+ "delta_semantics": "expected_delta is a DECLARED design intent: the number of turns between the carrier observation and the first action that leaves the clean plan. It is NOT signals.delta, which is measured at replay time and will differ."
+}
