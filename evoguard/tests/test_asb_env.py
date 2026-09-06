@@ -35,6 +35,7 @@ if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
 from evoguard.agents.prompts import build_system_prompt  # noqa: E402
+from evoguard.attacks.harmful_catalog import sample_goal  # noqa: E402
 from evoguard.core.types import Task, ToolCall  # noqa: E402
 from evoguard.envs import available_envs  # noqa: E402
 from evoguard.envs.asb import (  # noqa: E402
@@ -43,6 +44,7 @@ from evoguard.envs.asb import (  # noqa: E402
     ASBOPIEnv,
     asb_root,
     iter_split_rows,
+    load_harmful_goal_candidates,
     task_uid,
 )
 from evoguard.llm.mock_client import MockClient  # noqa: E402
@@ -133,6 +135,35 @@ class EnvShape(unittest.TestCase):
         tasks = env.get_tasks()
         self.assertTrue(tasks)
         self.assertEqual({t.suite for t in tasks}, {"system_admin_agent"})
+
+    def test_every_task_gets_an_out_of_scope_attacker_objective(self):
+        # Without the dataset-supplied catalogue sample_goal returns None on
+        # 46/51 tasks (2 benign tools, no decoy table) and the MCTS attacker
+        # falls back to goal=task.instruction, i.e. in-scope forgery.
+        for t in self.tasks:
+            goal = sample_goal(t, self.env.get_tools(t))
+            self.assertIsNotNone(goal, t.task_id)
+            self.assertNotIn(goal.harmful_tool, t.tool_names, t.task_id)
+            self.assertIn(goal.harmful_tool, self.env._attacker_tools)  # noqa: SLF001
+
+    def test_attacker_objectives_never_leak_a_val_or_test_tool(self):
+        # ASB-OPI's held-out axis is "unseen attacker tool on a seen scenario",
+        # and the three splits partition the 400 tools disjointly. Drawing the
+        # attacker's target from val/test would burn that axis.
+        held_out = set()
+        for split in ("val", "test"):
+            for _s, rec in iter_split_rows(_ROOT, (split,)):
+                if rec.get("sample_type") != "clean":
+                    held_out.add(str(rec.get("attacker_tool", "")))
+        train_only = load_harmful_goal_candidates(_ROOT)
+        self.assertEqual(len(train_only), 10)
+        for agent, cands in train_only.items():
+            self.assertTrue(cands, agent)
+            for c in cands:
+                self.assertNotIn(c["tool"], held_out, agent)
+        for t in self.tasks:
+            self.assertNotIn(sample_goal(t, self.env.get_tools(t)).harmful_tool,
+                             held_out, t.task_id)
 
 
 # --------------------------------------------------------------------------- #

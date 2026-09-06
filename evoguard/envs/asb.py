@@ -20,7 +20,9 @@ drive everything below:
    only the payload mentions, which the defense agent is free to do (nothing
    validates action names against the list). :meth:`ASBOPIEnv._tool_spec`
    resolves the attacker catalogue so the *executor* can still simulate the
-   bait faithfully; only the agent-facing prompt stays benign.
+   bait faithfully; only the agent-facing prompt stays benign. The same
+   catalogue, restricted to the TRAIN split, is what the MCTS attacker draws its
+   own malicious objective from (:func:`load_harmful_goal_candidates`).
 3. **The split unit is the attack instance.** All injected rows sit on the 10
    ``user_task_index == 0`` tasks, so those tasks appear in several splits. A
    task's ``metadata["split"]`` is taken from its single *clean* row, which is
@@ -36,6 +38,7 @@ import os
 from collections import OrderedDict
 from typing import Iterator, Optional
 
+from evoguard.attacks.harmful_catalog import GOAL_CANDIDATES_KEY
 from evoguard.core.types import Task, ToolCall, ToolSpec, Trajectory
 from evoguard.envs.base import SimulatedToolEnv
 from evoguard.envs.utility_judge import score_utility as _score_utility_impl
@@ -51,6 +54,10 @@ DATASET_NAME = "asb_opi"
 
 #: Split subdirectories, train first so ``max_tasks`` truncation keeps training.
 SPLITS = ("train", "val", "test")
+
+#: Split whose attacker tools may become the training attacker's own objective.
+#: See :func:`load_harmful_goal_candidates`.
+GOAL_CANDIDATE_SPLIT = "train"
 
 
 def asb_root(data_root: str = "data", subdir: str = "ASB") -> str:
@@ -134,6 +141,45 @@ def iter_split_rows(root: str, splits: Optional[tuple[str, ...]] = None) -> Iter
             yield split, rec
 
 
+def load_harmful_goal_candidates(
+    root: str, *, split: str = GOAL_CANDIDATE_SPLIT,
+) -> dict[str, list[dict[str, str]]]:
+    """Per-agent out-of-scope sinks for the attacker, from ONE split's rows.
+
+    The MCTS attacker needs an independent malicious objective per task
+    (``attacks/harmful_catalog.py``); left to its own inference it finds none
+    here, because an ASB agent exposes two benign tools and this dataset has no
+    decoy table -- so the attacker would fall back to ``goal=task.instruction``
+    and in-scope forgery would count as success again. ASB already ships the
+    right objects: ``attacker_tool`` + ``attack_goal``, absent from
+    ``get_tools`` by construction.
+
+    Restricted to ``split`` (train) on purpose. The three splits partition the
+    400 attacker tools disjointly (256 / 75 / 69, verified zero overlap), and
+    ASB-OPI's whole held-out axis is "unseen attacker tool on a seen scenario";
+    drawing the attacker's target from the full catalogue would put val/test
+    tool names into training payloads and burn that axis.
+    """
+
+    by_agent: dict[str, dict[str, dict[str, str]]] = {}
+    for _split, rec in iter_split_rows(root, (split,)):
+        if rec.get("sample_type") == "clean":
+            continue
+        agent = str(rec.get("corresponding_agent", "")).strip()
+        tool = str(rec.get("attacker_tool", "")).strip()
+        if not agent or not tool:
+            continue
+        by_agent.setdefault(agent, {}).setdefault(tool, {
+            "tool": tool,
+            "description": str(rec.get("attacker_tool_description", "")).strip(),
+            "goal_text": str(rec.get("attack_goal", "")).strip(),
+        })
+    # Sorted by tool name: sample_goal indexes into this list by sha1(task_id),
+    # so file order must not decide which sink a task targets.
+    return {agent: [tools[k] for k in sorted(tools)]
+            for agent, tools in by_agent.items()}
+
+
 def _read_jsonl(path: str) -> Iterator[dict]:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ASB data file not found: {path}")
@@ -167,6 +213,7 @@ class ASBOPIEnv(SimulatedToolEnv):
         self._agents = load_agent_configs(self._root)
         self._normal_tools, self._achievements = load_normal_tools(self._root)
         self._attacker_tools = load_attacker_tools(self._root)
+        self._goal_candidates = load_harmful_goal_candidates(self._root)
         self._tasks: list[Task] = []
         self._tools_by_task: dict[str, list[ToolSpec]] = {}
         self._load()
@@ -268,6 +315,9 @@ class ASBOPIEnv(SimulatedToolEnv):
                 "n_vendored_attacks": n_attacks.get(uid, 0),
                 "attack_splits": sorted(attack_splits.get(uid, ())),
                 "split_from_clean_row": uid in clean_split,
+                # Out-of-scope sinks for the attacker's own objective; train
+                # split only (see load_harmful_goal_candidates).
+                GOAL_CANDIDATES_KEY: self._goal_candidates.get(agent, []),
             }
             seen[uid] = Task(
                 task_id=uid,
@@ -294,11 +344,13 @@ class ASBOPIEnv(SimulatedToolEnv):
 __all__ = [
     "ASBOPIEnv",
     "DATASET_NAME",
+    "GOAL_CANDIDATE_SPLIT",
     "SPLITS",
     "asb_root",
     "iter_split_rows",
     "load_agent_configs",
     "load_attacker_tools",
+    "load_harmful_goal_candidates",
     "load_normal_tools",
     "task_uid",
 ]

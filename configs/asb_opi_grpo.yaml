@@ -3,7 +3,7 @@
 #
 # Dataset: data/ASB (pruned upstream extract + the EvoGuard split). 51 distinct
 # (agent, user_task) pairs across 10 agent personas, 400 injected attack
-# instances. See data/ASB/README.md and docs/asb_opi_integration.md.
+# instances. See data/ASB/README.md.
 #
 # THREE things differ from every agentdojo_* config here; read them before
 # copying this file:
@@ -21,8 +21,113 @@
 #     agent scenario". Do not report it as task-level generalisation.
 #  3. `max_tasks: 0` means unbounded; a small positive value truncates in split
 #     order (train first), which silently biases what gets trained on.
+#
+# `env.inject_harmful_tools` is ABSENT ON PURPOSE (it is v11's AgentDojo-only
+# fix). ASB ships its own malicious-tool catalogue, and envs/asb.py publishes the
+# TRAIN split's 256 attacker tools per agent into
+# task.metadata["harmful_goal_candidates"], which harmful_catalog.sample_goal()
+# prefers over its own inference. Without that seam sample_goal returns None on
+# 46/51 tasks (two benign tools per agent, no decoy table) and the MCTS attacker
+# reverts to goal=task.instruction, i.e. in-scope forgery counts as success.
+# TRAIN split only: the three splits partition the 400 attacker tools disjointly
+# (256/75/69, verified zero overlap), so drawing the attacker's own target from
+# the full catalogue would put val/test tool names into training payloads and
+# burn the held-out axis. Enforced by tests/test_asb_env.py
+# (`test_attacker_objectives_never_leak_a_val_or_test_tool`).
+#
+# Confirm in the log:
+#   [prewarm] loaded skeletons from .../data/seeds_v3 across 1 suites (total=32 entries)
+#   [harmful_goal][task=asb_opi:...] kind=... tool=... in_benign_plan=False
+# `exposes no sensitive sink` WARNINGs must be ZERO -- one means the metadata
+# seam did not reach that task and its attacker fell back to the user goal.
+#
+# DELTAS vs the earlier (never-run) draft of this file
+# ---------------------------------------------------
+# Every one of these is a correction to a stale value, not a new hypothesis; the
+# knob settings are lifted from configs/agentdojo_sinkdivert_v11.yaml so the two
+# datasets stay comparable at the trainer level.
+#   * training.base_model  /root/yangxiao/models/... -> /ssd1/yx/models/qwen2.5-7b-it
+#     (the old path does not exist on this box).
+#   * judge_llm + utility_judge_llm  llama3-8b-judge @ :8002 -> qwen3.5-9b @ :8004,
+#     max_tokens 256/512 -> 640/768. :8002 is a 16-day-old wedged server that
+#     LISTENS but never answers (180 s timeouts, 0 MiB GPU), so this file could
+#     not have produced a single verdict as written. The 9B also scores 12/12 on
+#     the labelled verdict set vs the 7B's 10/12 (2 FALSE successes).
+#   * tool_executor_llm  -> qwen2.5-7b-it @ :8003 (the live executor endpoint).
+#   * attacker.llm  local qwen2.5-7b-it @ :8000 -> qianfan glm-5.2. The defender
+#     port is LoRA-hot-loaded every round, so an attacker sharing :8000 would be
+#     mutating payloads with the model it is attacking.
+#   * attacker gains the full EA/MCTS block (tournament_k ... mcts_lambda_delta).
+#     Those fields defaulted silently before; mcts_lambda_delta=0.6 is what makes
+#     `search_method: mcts_delta` Delta-guided at all.
+#   * process.turning_point_method: llm_then_scan (was unset -> `scan`). scan stops
+#     at the first EXTRA `tool|args` step, so one changed argument inside the
+#     benign plan already counts as the turning point -- it under-reports exactly
+#     the latent attacks the Delta curriculum is for. Delta from this run is not
+#     comparable with any pre-v11 run.
+#   * LoRA r16/a32/dropout 0.05 + 4 targets -> r32/a64/dropout 0.10 + 7 targets.
+#   * sft_learning_rate 1.0e-4 -> 5.0e-5; grpo_learning_rate 5.0e-6 -> 2.0e-6;
+#     grpo_rollout_temperature 1.15 -> 0.90.
+#   * grpo_max_prompts_per_round + native_max_steps_per_round 200 -> 400. The old
+#     comment reasoned per TASK, but the row budget is spent on STEPS: 33 train
+#     tasks x (6 clean rollouts + up to 15 attacks) produce far more than 400
+#     candidate steps, so 200 was leaving half the gradient on the floor. 400 also
+#     matches v11, whose train split is 37 tasks.
+#   * cuda_visible_devices "1" -> "6" (GPU 1 is foreign-occupied).
+#   * max_rounds 12 -> 15, patience_rounds 5 -> 999 (early stopping OFF, val eval
+#     stays on -- the val curve selects the best round).
+#   * task_concurrency 8 -> 12, attack_concurrency 8 -> 16, val_concurrency 4 -> 8.
+#   * defense.max_turns 8 -> 6. THE ONE dataset-specific change. An ASB agent
+#     exposes exactly TWO benign tools, so a completed episode is 2-3 tool calls;
+#     mct_searcher._inject_turn_ceiling == defense.max_turns pre-creates one L1
+#     MCTS child per turn slot, and slots past the episode's real length can never
+#     deliver a payload. At 8 the search wastes >=60% of its L1 budget on turns the
+#     rollout never reaches.
+#
+# LAUNCH CONTRACT -- env vars this file cannot express
+# ---------------------------------------------------
+#   EVOGUARD_PY_BIN=/ssd1/conda_envs/evoguard/bin/python
+#       The ONLY working env on this box (py3.12, torch 2.6.0+cu124,
+#       transformers 4.51.3, trl 0.19.1, peft 0.19.1, vllm 0.8.5.post1).
+#       CentOS 7 / glibc 2.17 rules out the manylinux_2_28 wheels that newer
+#       vllm/torch ship, so `evoguard2` cannot be built here.
+#   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds_v3
+#       Read as a FIXED directory by mct_searcher._load_prewarm_skeletons_all(),
+#       not off env.data_root. universal_seeds.json parses to suite key
+#       "universal", which REPLACES the cache and so applies to all ten ASB
+#       agents. Its {{TARGET_TOOL}} placeholder is bound per task by
+#       harmful_catalog.resolve_placeholders() -- on ASB that resolves to a train
+#       split attacker tool. `total=0 entries` means the run degraded to NOSEED.
+#   EVOGUARD_JUDGE_LLM_BASE_URL=http://127.0.0.1:8004/v1
+#   EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8004/v1
+#   EVOGUARD_JUDGE_LLM_MODEL=qwen3.5-9b
+#       MANDATORY. The reward-path judges are OPT-IN and resolve their model name
+#       from this ONE var (native_grpo_runner._judge_model_name(), used by both the
+#       safety and the progress builder); it defaults to `qwen2.5-7b-it`, which
+#       :8004 does not host, so leaving it unset 404s every reward-path judge call.
+#       An unset BASE_URL is worse than wrong: a constant `unclear` fallback
+#       DELETES the safety gradient under group-relative advantages, invisibly in
+#       loss / reward-mean / grad-norm. Confirm `progress judge active` in the log
+#       and watch `safety_source_tally` in the plan JSON.
+#   TRAINER_CUDA_VISIBLE_DEVICES=6
+#       run_grpo_experiment.sh otherwise defaults the ambient value to 7, which
+#       hosts the tool executor. Must match training.cuda_visible_devices below.
+#
+# GPU layout for this run  (8x40GB, NOT 80GB)
+# -------------------------------------------
+#   GPU 4 -> primary defender vLLM :8000, --enable-lora  qwen2.5-7b-it
+#   GPU 6 -> native SFT/GRPO trainer (single card; native_runner has no DDP)
+#   GPU 5 -> qwen3.5-9b judge, docker `qwen35-judge` -> :8004
+#            (--gdn-prefill-backend triton is MANDATORY; flashinfer's sm90a
+#             gated-delta-rule prefill aborts AFTER /v1/models reports healthy)
+#   GPU 7 -> qwen2.5-7b-it -> :8003, the tool_executor
+#   GPU 0/1/3 -> foreign processes. GPU 2 is idle but a docker container claims
+#                device 2, so it may allocate at any time -- prefer 4 and 6.
+#   :8002 holds a wedged 16-day-old llama3-8b server (listens, never answers).
+#   Do NOT run scripts/stop_vllm.sh to clean it: that script always stops the
+#   primary too, even when given only helper ports.
 
-name: evoguard_asb_opi_grpo
+name: evoguard_asb_opi_v1
 
 defense:
   llm:
@@ -34,26 +139,51 @@ defense:
     max_tokens: 1024
     timeout: 120.0
     max_retries: 3
-  max_turns: 8
+  # 6, not agentdojo's 8: an ASB agent has TWO benign tools, and
+  # mct_searcher._inject_turn_ceiling == this value decides how many L1 MCTS
+  # children (one per candidate injection turn) get pre-created.
+  max_turns: 6
 
 attacker:
   llm:
-    backend: openai
-    model: qwen2.5-7b-it
-    base_url: http://127.0.0.1:8000/v1
-    api_key: EMPTY
-    temperature: 1.05
+    backend: qianfan
+    model: glm-5.2                      # creds verified live for glm-5.2 and glm-5;
+                                        # 5.2 is the string every successful
+                                        # historical run used.
+    base_url: null
+    api_key: null                       # credentials come from
+                                        # ${EVOGUARD_SECRETS_FILE:-$HOME/.evoguard_qianfan.env}
+                                        # via EVOGUARD_QIANFAN_APPID / _TOKEN.
+    temperature: 1.0
     top_p: 0.95
-    max_tokens: 2048
-    timeout: 180.0
-    max_retries: 3
+    max_tokens: 4096
+    timeout: 300
+    # Backstop only. The real defence against the gateway's measured 60 rpm quota
+    # is the process-wide send pacer in QianFanClient
+    # (EVOGUARD_QIANFAN_MAX_RPM=55, exported by run_grpo_experiment.sh). An
+    # exhausted attacker call makes rollout.py drop the whole task from the round,
+    # silently shrinking the training set.
+    max_retries: 8
     lora_adapter: null
     enable_thinking: false
-  search_method: mcts_delta
+
   population_size: 15
   offspring_size: 10
   elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
   random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6               # Delta-guided UCB. 0.0 turns mcts_delta into
+                                       # plain MCTS without saying so.
 
 env:
   dataset: asb_opi
@@ -63,83 +193,145 @@ env:
   max_tasks: 0
   tool_executor_llm:
     backend: openai
-    model: llama3-8b-judge
-    base_url: http://127.0.0.1:8002/v1
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1   # :8003, NOT :8002 -- see the header.
     api_key: EMPTY
     temperature: 0.0
     max_tokens: 512
     enable_thinking: false
+  # Judges on Qwen3.5-9B, served by DOCKER on :8004 (GPU 5), not by a conda env.
+  # max_tokens 640/768 because the verdict is grammar-constrained JSON: hitting
+  # the cap yields an UNPARSEABLE truncated object, not a short one.
   judge_llm:
     backend: openai
-    model: llama3-8b-judge
-    base_url: http://127.0.0.1:8002/v1
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
     api_key: EMPTY
     temperature: 0.0
-    max_tokens: 256
+    max_tokens: 640
     enable_thinking: false
   utility_judge_llm:
     backend: openai
-    model: llama3-8b-judge
-    base_url: http://127.0.0.1:8002/v1
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
     api_key: EMPTY
     temperature: 0.0
-    max_tokens: 512
+    max_tokens: 768
     enable_thinking: false
 
 process:
   divergence_threshold: 0.5
   normalize_by: clean_length
+  # `llm_then_scan`, not `llm`: an unattributable verdict (turning_turn=-1) would
+  # otherwise yield turning_point=None -> delta=None -> delta_normalized=0.0,
+  # silently dropping that success out of the advantage-shaping curriculum.
+  # signals.metadata records `turning_point_scan` / `turning_point_judged` /
+  # `turning_point_source`, so the agreement rate is recoverable post-hoc.
+  turning_point_method: llm_then_scan
 
 training:
   enabled: true
-  base_model: /root/yangxiao/models/qwen2.5-7b-it
-  method: sft_then_native_grpo
-  lora_rank: 16
-  lora_alpha: 32
-  lora_dropout: 0.05
-  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  base_model: /ssd1/yx/models/qwen2.5-7b-it
+
+  method: sft_then_native_grpo        # r0 -> cold-start LoRA-SFT; >=r1 -> incremental
+                                      # native GRPO (needs <exp>/latest_adapter_dir.txt;
+                                      # hard-errors rather than silently falling back).
+
+  lora_rank: 32                       # <= start_vllm.sh's --max-lora-rank 64, so the
+                                      # per-round hot-load is accepted.
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
   llamafactory_root: ""
   verl_root: ""
 
+  # ---- Cold-start SFT (r0 only) -------------------------------------- #
   sft_epochs: 2.0
-  sft_learning_rate: 1.0e-4
+  sft_learning_rate: 5.0e-5
+  # Per-task PER-CLASS cap (clean / attack_fail / attack_success), records ranked
+  # by utility inside each class before the cut. Must stay >=
+  # pipeline.clean_rollouts_per_task or the extra clean samples are bought and
+  # then thrown away.
   sft_max_records_per_task: 6
 
-  grpo_learning_rate: 5.0e-6
-  grpo_beta: 0.01
+  # ---- Native GRPO --------------------------------------------------- #
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01                     # loose KL leash -- lets the LoRA leave the SFT
+                                      # warm start. Corollary: per-task forgetting is
+                                      # real, so evaluate the BEST round, not the last.
   grpo_group_size_g: 8
   grpo_clip_epsilon: 0.20
-  grpo_rollout_temperature: 1.15
-  # 51 tasks only, so the row budget is deliberately below agentdojo's 400:
-  # 200 rows at K=1 already covers each task ~4x per round.
-  grpo_max_prompts_per_round: 200
-  grpo_min_new_successes: 3
-  grpo_gdpo: true
-  grpo_traj_group_size: 1
-  grpo_advantage_curriculum_lambda: 1.5
-  grpo_clean_prompt_ratio: 0.25
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 400     # ROW budget over STEPS, not tasks. At K=1 rows
+                                      # == trajectories == optimizer steps, so it is
+                                      # paired with native_max_steps_per_round below.
+  grpo_min_new_successes: 3           # skip the incremental retrain below this many
+                                      # fresh B trajectories.
 
+  # ---- Advantage normalisation --------------------------------------- #
+  grpo_gdpo: true                     # per-term group standardisation, then batch
+                                      # rescale. A NORMALISATION change: the reward is
+                                      # still exactly R = r_safety + r_progress - p_drift.
+  grpo_traj_group_size: 1             # K=1: the trajectory-pooled baseline fallback is a
+                                      # bit-for-bit no-op.
+
+  # Delta's ONLY path into training: A~ = (1 + lambda*delta_p)*A. lambda=0.0 silently
+  # discards Delta altogether. Never re-add an inline Delta reward term.
+  grpo_advantage_curriculum_lambda: 1.5
+  grpo_clean_prompt_ratio: 0.25       # 100 BENIGN rows of 400. Their signal is entirely
+                                      # the judged r_progress term; without them every
+                                      # prompt pays for blocking, all G siblings converge
+                                      # on blocking, reward std collapses and nothing
+                                      # separates "blocked and still served the user"
+                                      # from "blocked and gave up".
+
+  # ---- Trainer infrastructure ---------------------------------------- #
+  # Keep bs=1/accum=8 even on 80GB cards. TRL's GRPO counts
+  # per_device_train_batch_size in *completions*, and the per-forward logits tensor
+  # is bs x (2048 prompt + 512 completion) x 152064 vocab x 2 B held live several
+  # times over (policy / ref / old logprobs) on top of LoRA backward activations.
   per_device_batch_size: 1
   gradient_accumulation: 8
+
   dry_run: false
   use_native_trainer: true
-  cuda_visible_devices: "1"
-  native_max_steps_per_round: 200
+  cuda_visible_devices: "6"           # dedicated trainer card; native_runner has no
+                                      # DDP/sharding so exactly one device may be listed.
+  native_max_steps_per_round: 400     # BINDING cap on prompt coverage at K=1.
+
+  lora_probe_enabled: false
 
 pipeline:
-  max_rounds: 12
-  patience_rounds: 5
-  asr_threshold: 0.05
+  max_rounds: 15
+  # EARLY STOPPING DISABLED: run all 15 rounds unconditionally. Both exits are
+  # neutralised, not the validation itself --
+  #   stop_on_zero_success: false  kills the "no B trajectories" exit;
+  #   patience_rounds > max_rounds  makes the streak unreachable
+  #                                 (update_termination_state only stops when
+  #                                  new_streak >= patience_rounds).
+  patience_rounds: 999
+  asr_threshold: 0.05                 # inert while patience_rounds > max_rounds;
+                                      # kept so val_metrics.jsonl rows stay readable
+                                      # against earlier runs.
   stop_on_zero_success: false
-  # Inert: the env declares metadata["split"] from each task's clean row.
+  # Inert: the env declares metadata["split"] from each task's clean row
+  # (33 train / 11 val / 7 test) and driver._split_train_val honours it.
   validation_fraction: 0.15
-  task_concurrency: 8
-  attack_concurrency: 8
+  task_concurrency: 12
+  attack_concurrency: 16
+  # All 6 samples are persisted as CLEAN records; the TWIN is the highest-utility
+  # one with `None` sorting as 1.0, and the three sites that pick one
+  # (collect_tri_rollouts, build_sft, extract_grpo_prompts) agree on that rule.
   clean_rollouts_per_task: 6
+  # Per-round held-out validation via eval/vendored_replay.py -- the only harness
+  # in the repo that actually EXECUTES tools, so its ASR means what the
+  # termination check assumes. Verify a "[val] rN adapter=... asr=..." line per
+  # round; failures are swallowed and degrade to training ASR.
   validate_every_round: true
-  # Leaf split dir -> restricts the REPLAYED ATTACKS to val. See header note 2.
+  # Leaf split dir -> restricts the REPLAYED ATTACKS to val's 75. See header note 2.
   val_dataset_dir: data/ASB/splits/val
   val_split: ""
-  val_concurrency: 4
+  val_concurrency: 8
 
 evo_data_subdir: "asb_opi"
