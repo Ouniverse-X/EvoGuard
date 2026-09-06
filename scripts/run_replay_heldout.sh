@@ -52,10 +52,13 @@ if [[ -n "$SPLIT" ]]; then
 fi
 
 mkdir -p "$OUT"
+# ${arr[@]+"${arr[@]}"}, not "${arr[@]}": bash < 4.4 (this box ships 4.2) treats an
+# empty array expansion as an unbound variable under `set -u`, which made the
+# documented EVOGUARD_REPLAY_SPLIT= (ASB-OPI / InjecAgent) invocation unrunnable.
 PYTHONPATH="$PWD" "$PY" -m evoguard.eval.vendored_replay \
     --config "$CONFIG" \
     --dataset-dir "$DATASET_DIR" \
-    "${SPLIT_ARGS[@]}" \
+    ${SPLIT_ARGS[@]+"${SPLIT_ARGS[@]}"} \
     --lora-adapter "$ADAPTER" \
     --concurrency "$CONC" \
     --output-dir "$OUT" 2>&1 | tee "$OUT/replay.log"

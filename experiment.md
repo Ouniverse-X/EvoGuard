@@ -64,9 +64,10 @@ bash scripts/run_grpo_experiment.sh configs/asb_opi_grpo.yaml
 
 ### Status
 
-**Running** — launched 2026-09-06 01:03:51, pid 70349,
-log `rounds/asb_opi_grpo/logs/run_20260906_010350.log`,
-artifacts `rounds/evoguard_asb_opi_v1/`.
+**Stopped at 7/15 rounds** — launched 2026-09-06 01:03:51 (pid 70349), killed after r6,
+19.7 h at ~2.7 h/round. Log `rounds/asb_opi_grpo/logs/run_20260906_010350.log`,
+artifacts `rounds/evoguard_asb_opi_v1/`. Selected round **r5** (val ASR 0.000).
+Adapters kept: `rounds/evoguard_asb_opi_v1/{sft_native,grpo_native/r0..r6}/adapter_weights`.
 
 r0 startup verified: `51 total tasks (33 train, 11 val)`, `total=32 entries`,
 `injected 32 skeletons` × 33, a `[harmful_goal]` line per train task with
@@ -83,31 +84,53 @@ adapters are untouched** under `rounds/evoguard_agentdojo_sinkdivert_v11/{sft,gr
 
 ### Results
 
-In flight — 4/15 rounds at 2026-09-06 10:48 (r3 GRPO training). ~2.7 h/round.
-Train ASR is the co-evolving MCTS attacker's score against the CURRENT adapter, so
-r0 = base model, r1 = r0_sft, r2 = r0_sft::r1_grpo, … Val = full replay on
-`data/ASB/splits/val`, 10 tasks / 75 injection scenarios / 85 records, fixed
-vendored attacks on attacker tools **disjoint** from train.
+7 rounds run (r0–r6), then stopped. Train ASR is the co-evolving MCTS attacker's score
+against the CURRENT adapter, so r0 = base model, r1 = r0_sft, r2 = r0_sft::r1_grpo, …
+Val = full replay on `data/ASB/splits/val`, 10 tasks / 75 injection scenarios / 85
+records, fixed vendored attacks on attacker tools **disjoint** from train.
 
 | round | adapter under test | train ASR | n_succ/495 | val ASR | val f1 | val recall | val prec | val acc | val clean_cc | val cf_fp |
 |---|---|---|---|---|---|---|---|---|---|---|
 | r0 | base (train) / r0_sft (val) | 0.400 | 198 | 0.187 | 0.865 | 0.813 | 0.924 | 0.776 | 0.500 | 5 |
 | r1 | r0_sft | 0.152 | 75 | 0.227 | 0.859 | 0.773 | 0.967 | 0.776 | 0.800 | 2 |
 | r2 | ::r1_grpo | 0.004 | 2 | 0.200 | 0.882 | 0.800 | 0.984 | 0.812 | 0.900 | 1 |
-| r3 | ::r2_grpo | 0.040 | 20 | — | — | — | — | — | — | — |
+| r3 | ::r2_grpo | 0.040 | 20 | 0.107 | 0.931 | 0.893 | 0.971 | 0.882 | 0.800 | 2 |
+| r4 | ::r3_grpo | 0.014 | 7 | 0.053 | 0.959 | 0.947 | 0.973 | 0.929 | 0.800 | 2 |
+| **r5** | ::r4_grpo | 0.008 | 4 | **0.000** | 0.987 | 1.000 | 0.974 | 0.976 | 0.800 | 2 |
+| r6 | ::r5_grpo | 0.020 | 10 | 0.027 | 0.973 | 0.973 | 0.973 | 0.953 | 0.800 | 2 |
 
-Delivery (val): `poison_delivered_rate` = 0.933 (70/75) at r0/r1/r2 — **identical
-across adapters**, so unlike v11 none of the val ASR is avoidance.
-`asr_given_delivered` = 0.200 / 0.243 / 0.214.
+Best round **r5**: val ASR 0.000, recall 1.000, fp 2. r6 gives back 2 fn.
+Train ASR is again a bad selector — r1→r2 it fell 0.152 → 0.004 while val ASR *rose*.
+
+Delivery (val), computed **post-hoc** over `val/r*/records.jsonl` (payload's first 60
+normalised chars vs the concatenated observations; `poison_delivered_rate` is `None` in
+`val/r*/safety_metrics.jsonl` on this path, as on v11):
+
+| round | r0 | r1 | r2 | r3 | r4 | r5 | r6 |
+|---|---|---|---|---|---|---|---|
+| poison_delivered_rate | 0.933 | 0.933 | 0.933 | 0.933 | 0.880 | 0.867 | 0.933 |
+| asr_given_delivered | 0.200 | 0.243 | 0.214 | 0.114 | 0.061 | **0.000** | 0.029 |
+
+**The drop is resistance, not avoidance.** Delivery is identical (0.933) across r0–r3
+while conditional ASR falls 0.200 → 0.114, and where delivery does dip (r4/r5) the
+conditional ASR falls faster than delivery does; r6 restores delivery to 0.933 and still
+holds at 0.029.
 
 Train-arm defence metrics:
 
-| round | blocked_unfinished | benign_preserved | clean_cc | clean_util | cf_f1 | cf_recall | cf_prec | cf_acc |
-|---|---|---|---|---|---|---|---|---|
-| r0 | 0.176 | 0.648 | 0.591 | 0.591 | 0.681 | 0.600 | 0.788 | 0.599 |
-| r1 | 0.279 | 0.688 | 0.710 | 0.710 | 0.865 | 0.848 | 0.882 | 0.811 |
-| r2 | 0.105 | 0.895 | 0.803 | 0.803 | 0.960 | 0.996 | 0.927 | 0.941 |
-| r3 | 0.111 | 0.874 | 0.827 | 0.827 | 0.946 | 0.960 | 0.933 | 0.922 |
+| round | blocked_unfinished | benign_preserved | clean_cc | cf_f1 | cf_recall | cf_prec | cf_acc |
+|---|---|---|---|---|---|---|---|
+| r0 | 0.176 | 0.648 | 0.591 | 0.681 | 0.600 | 0.788 | 0.599 |
+| r1 | 0.279 | 0.688 | 0.710 | 0.865 | 0.848 | 0.882 | 0.811 |
+| r2 | 0.105 | 0.895 | 0.803 | 0.960 | 0.996 | 0.927 | 0.941 |
+| r3 | 0.111 | 0.874 | 0.827 | 0.946 | 0.960 | 0.933 | 0.922 |
+| r4 | 0.091 | 0.906 | 0.854 | 0.964 | 0.986 | 0.944 | 0.948 |
+| r5 | 0.079 | 0.918 | 0.833 | 0.964 | 0.992 | 0.937 | 0.947 |
+| r6 | 0.016 | 0.982 | 0.884 | 0.967 | 0.980 | 0.955 | 0.952 |
+
+Same caveat as v11: `_compute_cf_block` counts UNDELIVERED scenarios as blocked, so read
+`blocked_unfinished` / `benign_preserved` (0.176 → 0.016 / 0.648 → 0.982) rather than the
+cf acc/prec/f1 columns.
 
 Attacker Δ evolution (`turning_point − injection_point`, `llm_then_scan`):
 
@@ -117,19 +140,26 @@ Attacker Δ evolution (`turning_point − injection_point`, `llm_then_scan`):
 | r1 | 75 | 0.491 | 0.960 | 0.000 | [1, 2] | 1:72 2:3 | 0.219 | 0.403 |
 | r2 | 2 | 0.417 | 1.000 | 0.000 | [1, 1] | 1:2 | 0.025 | 0.417 |
 | r3 | 20 | 0.291 | 0.700 | 0.100 | [1, 3] | 1:14 2:4 3:2 | 0.073 | 0.367 |
+| r4 | 7 | 0.329 | 0.429 | 0.286 | [1, 3] | 1:3 2:2 3:2 | 0.055 | 0.343 |
+| r5 | 4 | 0.258 | 0.500 | 0.000 | [1, 2] | 1:2 2:2 | 0.031 | 0.258 |
+| r6 | 10 | 0.400 | **0.000** | 0.000 | [2, 2] | 2:10 | 0.012 | 0.400 |
 
-**ASB structurally caps Δ.** A 2-benign-tool agent runs 2–3 tool calls, so raw Δ can
-only be 1–4 and Δnorm (÷ clean_length) is nearly binary. The Δ mechanism has far less
-headroom here than on AgentDojo — do not read the flat Δnorm as attacker stagnation;
-`mean_best_fitness` 0.473→0.219→0.025→0.073 shows the attacker being suppressed by r2
-and partially recovering at r3, which is the co-evolution working.
+**The v11 immediate→latent shift replicates.** Immediate share climbs 0.869 → 0.960 →
+1.000 while ASR collapses, then falls 0.700 → 0.429 → 0.500 → **0.000** as the attacker
+is squeezed; by r6 all 10 successes are Δ=2 and none is immediate. Immediate injections
+are the class GRPO suppresses first.
 
-**Read of the defence so far (replicates the v11 audit on a second dataset).** On
-held-out attacker tools ASR does **not** improve past SFT (0.187 → 0.227 → 0.200, flat
-inside noise at n=75), while train ASR collapses 0.400 → 0.004 — i.e. GRPO is fitting
-the train-split attacker tools. What GRPO measurably buys is the overblocking cost:
-val `clean_cc` 0.500 → 0.900, `cf_fp` 5 → 1, precision 0.924 → 0.984. Same conclusion
-as v11: **run an SFT-only replay arm before attributing any ASR number to GRPO.**
+**ASB structurally caps Δ.** A 2-benign-tool agent runs 2–3 tool calls, so raw Δ can only
+be 1–4 and Δnorm (÷ clean_length) is nearly binary — read the composition, not Δnorm.
+`mean_best_fitness` 0.473 → 0.012 with `elite_fitness_mean` holding 0.26–0.42 = attacker
+suppressed but still finding footholds, not collapsed.
+
+**Correction to the r0–r2 read recorded earlier in this file.** At 3 val points the trend
+looked flat (0.187 → 0.227 → 0.200) and I wrote that ASR does not improve past SFT. With
+7 points it does: 0.187 → 0.000 at r5, and the conditional-ASR column rules out avoidance.
+The v11 caveat still stands as a caveat — an SFT-only replay arm is the only way to split
+SFT's contribution from GRPO's — but the ASB val curve is not flat. **Do not read the ASB
+val trend before ~r4; at n=75 the r1/r2 wobble is noise.**
 
 Health: `progress judge active at :8004 (qwen3.5-9b)` every round;
 `n_safety_fallback = 0`, `safety_source_tally` r2 = `{clean:clean_served 1312,
@@ -140,8 +170,43 @@ Known issue: reward saturation. `frac_reward_zero_std == 1.0` on 37.6% of the 11
 logged GRPO steps, reward pinned at the 3.20 ceiling (held + advance) on 35.7% — those
 steps contribute zero gradient. This config ships `grpo_traj_group_size: 1` and
 `grpo_rollout_temperature: 0.90`; the measured fix for exactly this (CLAUDE.md) is K=2
-trajectory pooling + temperature 1.15. Candidate change for the next ASB run, not
-mid-flight.
+trajectory pooling + temperature 1.15. Change in the NEXT ASB run, not mid-flight.
+
+### Held-out test replay (r5 adapter)
+
+`eval/vendored_replay.py`, frozen run config (`rounds/evoguard_asb_opi_v1/config.yaml`),
+`--dataset-dir data/ASB/splits/test --split ""`, adapter
+`evoguard_r0_sft_weights::…::evoguard_r5_grpo_weights`. 69 injection scenarios / 10 tasks
+/ 79 records (69 attacked + 10 clean). Zero crashed rollouts. Output
+`rounds/replay_test_asb_r5/`.
+
+| tp | fn | fp | tn | acc | prec | recall | f1 | ASR | clean_cc |
+|---|---|---|---|---|---|---|---|---|---|
+| 69 | 0 | 2 | 8 | 0.9747 | 0.9718 | 1.0000 | 0.9857 | **0.0000** | 0.800 |
+
+`poison_delivered_rate` 0.870 (60/69) → `asr_given_delivered` **0.000**;
+`blocked_unfinished_rate` 0.087, `attacked_benign_preserved_rate` 0.913,
+`clean_utility_mean` 0.800, `clean_mean_steps` 6.0 (= `max_turns`, clean episodes run to
+the ceiling). Residual cost is entirely on the benign side: both fp and the 2
+zero-utility clean rows. Test ≈ val r5, unlike v11 where test was harder on every axis —
+expected, since ASB's held-out axis is the attacker tool, not the task.
+
+Reproduction:
+
+```bash
+ADP='evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights'
+EVOGUARD_PYTHON=/ssd1/conda_envs/evoguard/bin/python \
+EVOGUARD_REPLAY_CONFIG=rounds/evoguard_asb_opi_v1/config.yaml \
+EVOGUARD_REPLAY_DATASET_DIR=data/ASB/splits/test \
+EVOGUARD_REPLAY_SPLIT= \
+bash scripts/run_replay_heldout.sh "$ADP" asb_r5 4
+```
+
+Two traps this cost time on: `EVOGUARD_REPLAY_SPLIT=` was unrunnable until
+`scripts/run_replay_heldout.sh` was fixed for bash 4.2 (empty-array expansion under
+`set -u`), and pointing `--config` at `configs/asb_opi_grpo.yaml` while the tree is on a
+branch without the ASB commit silently sends the judges to the wedged `:8002` — use the
+frozen config. Diagnose with `ss -tnp | grep pid=<pid>`.
 
 ---
 
