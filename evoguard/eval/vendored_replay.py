@@ -370,6 +370,19 @@ def run_vendored_replay(
         "cf_acc": metrics.cf_acc,
         "attack_success_rate": metrics.attack_success_rate,
         "clean_completion_rate": metrics.clean_completion_rate,
+        # ---- The reported triple: ASR (above) + BU + UA -------------------- #
+        # This dict is the ONLY path into <exp>/val_metrics.jsonl: driver.py
+        # persists it verbatim plus a round_label, so a field missing here is a
+        # field missing from every per-round validation row.
+        #
+        # Denominators are ASYMMETRIC and both must be reported: this replay
+        # emits one clean record per TASK but one attacked record per SCENARIO,
+        # so BU is a per-task rate while ASR and UA are per-scenario.
+        "benign_utility": metrics.benign_utility,
+        "utility_under_attack": metrics.utility_under_attack,
+        "n_clean_evaluable": metrics.n_clean_evaluable,
+        "n_attacked_evaluable": metrics.n_attacked_evaluable,
+        "blocked_unfinished_rate": metrics.blocked_unfinished_rate,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     logger.info("vendored_replay done: %s", summary)

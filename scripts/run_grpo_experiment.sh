@@ -39,7 +39,7 @@ fi
 echo "[preflight] using config: $CONFIG"
 
 # ---- Resolve python interpreter ---- #
-PYTHON_BIN="${EVOGUARD_PY_BIN:-/root/yangxiao/envs/train/bin/python}"
+PYTHON_BIN="${EVOGUARD_PY_BIN:-/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python}"
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "[error] python interpreter not executable: $PYTHON_BIN" >&2
     exit 3
@@ -103,21 +103,30 @@ else
     printf '%s\n' "$LORA_PROBE_BODY" | head -c 300
 fi
 
-# ---- Inject QianFan creds for attacker backend ---- #
+# ---- Inject QianFan creds, but ONLY if the config asks for that backend ---- #
+# Gated on the config because an all-local config (every llm block on a local
+# vLLM, e.g. configs/injecagent_grpo.yaml) has nothing to authenticate against,
+# and the unconditional `:?` guards below used to abort such a launch outright.
+# The pattern tolerates a trailing `#` comment on the same line -- an anchored
+# `$` match misses agentdojo_full_grpo.yaml, whose qianfan line carries one.
 SECRETS_FILE="${EVOGUARD_SECRETS_FILE:-$HOME/.evoguard_qianfan.env}"
-if [[ -f "$SECRETS_FILE" ]]; then
-    # shellcheck disable=SC1090
-    set +u; source "$SECRETS_FILE"; set -u
-    export EVOGUARD_QIANFAN_APPID EVOGUARD_QIANFAN_TOKEN
-    echo "[preflight] loaded qianfan creds from $SECRETS_FILE"
+if grep -qE '^[[:space:]]*backend:[[:space:]]*"?qianfan"?[[:space:]]*(#.*)?$' "$CONFIG"; then
+    if [[ -f "$SECRETS_FILE" ]]; then
+        # shellcheck disable=SC1090
+        set +u; source "$SECRETS_FILE"; set -u
+        export EVOGUARD_QIANFAN_APPID EVOGUARD_QIANFAN_TOKEN
+        echo "[preflight] loaded qianfan creds from $SECRETS_FILE"
+    else
+        # No inline literals here on purpose: this file is committed, and a bearer
+        # token pushed to a git remote is a published token. Same contract as
+        # scripts/run_real.sh -- supply the two vars, or drop them into a secrets file.
+        : "${EVOGUARD_QIANFAN_APPID:?set EVOGUARD_QIANFAN_APPID or create $SECRETS_FILE exporting EVOGUARD_QIANFAN_APPID=app-<id>}"
+        : "${EVOGUARD_QIANFAN_TOKEN:?set EVOGUARD_QIANFAN_TOKEN or create $SECRETS_FILE exporting EVOGUARD_QIANFAN_TOKEN=bce-v3/<your-bearer-token>}"
+        export EVOGUARD_QIANFAN_APPID EVOGUARD_QIANFAN_TOKEN
+        echo "[preflight] no secrets file at $SECRETS_FILE; using ambient env appid=$EVOGUARD_QIANFAN_APPID"
+    fi
 else
-    # No inline literals here on purpose: this file is committed, and a bearer
-    # token pushed to a git remote is a published token. Same contract as
-    # scripts/run_real.sh -- supply the two vars, or drop them into a secrets file.
-    : "${EVOGUARD_QIANFAN_APPID:?set EVOGUARD_QIANFAN_APPID or create $SECRETS_FILE exporting EVOGUARD_QIANFAN_APPID=app-<id>}"
-    : "${EVOGUARD_QIANFAN_TOKEN:?set EVOGUARD_QIANFAN_TOKEN or create $SECRETS_FILE exporting EVOGUARD_QIANFAN_TOKEN=bce-v3/<your-bearer-token>}"
-    export EVOGUARD_QIANFAN_APPID EVOGUARD_QIANFAN_TOKEN
-    echo "[preflight] no secrets file at $SECRETS_FILE; using ambient env appid=$EVOGUARD_QIANFAN_APPID"
+    echo "[preflight] OK  ${CONFIG} declares no 'backend: qianfan'; skipping cred injection"
 fi
 
 # ---- Derive log filename + ensure exp dir structure ready ---- #
@@ -172,6 +181,21 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # and rollout.py drops whole tasks from the round. 55 leaves a ~10% margin.
 export EVOGUARD_QIANFAN_MAX_RPM="${EVOGUARD_QIANFAN_MAX_RPM:-55}"
 
+# Reward-path judge fan-out (native_grpo_runner._reward_judge_workers, clamped to
+# 64). The old default of 16 was sized for a judge endpoint SHARED with the
+# tool_executor and other roles; on this box the judge owns a whole H800 and has
+# a replica, so the ceiling is the judge's own batch throughput, not contention.
+export EVOGUARD_REWARD_JUDGE_WORKERS="${EVOGUARD_REWARD_JUDGE_WORKERS:-32}"
+
+# Pre-flight free-VRAM floor for the trainer card. Read AT IMPORT TIME by
+# training/native_runner.py, hence exported here rather than inside python: the
+# module-level `_TRAINER_MIN_FREE_MIB` is bound before any config is parsed.
+# Only r0 SFT consults it -- _wait_for_free_gpu_memory is never called on the
+# GRPO path. At the old 72 GiB default it spent ~30 min reserving memory in 1 GiB
+# blocks to evict an oversubscription filler and still logged "only secured
+# 73212 MiB of 73728 MiB"; a 7B LoRA SFT does not need 72 GB.
+export EVOGUARD_TRAINER_MIN_FREE_MIB="${EVOGUARD_TRAINER_MIN_FREE_MIB:-40960}"
+
 cat <<EOF
 [preflight]
   config        : $CONFIG
@@ -179,8 +203,13 @@ cat <<EOF
   exp name      : $EXP_NAME
   log file      : $RUN_LOG
   CUDA_VISIBLE  : $CUDA_VISIBLE_DEVICES  (for non-trainer subprocess only; trainer pins own device via yaml)
-  qianfan_appid : $EVOGUARD_QIANFAN_APPID
+  qianfan_appid : ${EVOGUARD_QIANFAN_APPID:-<n/a -- config declares no qianfan backend>}
   qianfan_rpm   : $EVOGUARD_QIANFAN_MAX_RPM  (process-wide send pacing; measured quota is 60/min)
+  judge_workers : $EVOGUARD_REWARD_JUDGE_WORKERS  (reward-path judge fan-out, clamp 64)
+  min_free_mib  : $EVOGUARD_TRAINER_MIN_FREE_MIB  (r0 SFT pre-flight only)
+  judge_url     : ${EVOGUARD_JUDGE_LLM_BASE_URL:-<UNSET -- safety gradient will be DELETED>}
+  progress_url  : ${EVOGUARD_PROGRESS_LLM_BASE_URL:-<unset; falls back to judge_url>}
+  judge_model   : ${EVOGUARD_JUDGE_LLM_MODEL:-<unset -> qwen2.5-7b-it>}
 
 [launching]
 nohup "$PYTHON_BIN" -m evoguard.run --config "$CONFIG" >"$RUN_LOG" 2>&1 &

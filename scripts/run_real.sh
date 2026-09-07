@@ -32,11 +32,10 @@ else
     export EVOGUARD_QIANFAN_APPID EVOGUARD_QIANFAN_TOKEN
 fi
 
-# Resolve python interpreter inside evoguard conda env.
-# The conda env lives on /ssd1 not /root/miniforge3 -- mamba list shows its real home.
-PYTHON_BIN="/ssd1/conda_envs/evoguard/bin/python"
+# Resolve python interpreter inside the evoguard conda env.
+PYTHON_BIN="${EVOGUARD_PY_BIN:-/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python}"
 if [[ ! -x "$PYTHON_BIN" ]]; then
-    PYTHON_BIN="$(/root/miniforge3/bin/mamba run -n evoguard which python 2>/dev/null || true)"
+    PYTHON_BIN="$(command -v conda >/dev/null 2>&1 && conda run -n evoguard which python 2>/dev/null || true)"
 fi
 if [[ -z "$PYTHON_BIN" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
     echo "error: cannot locate 'evoguard' env's python interpreter" >&2

@@ -71,6 +71,27 @@ class DefenseConfig:
     )
     max_turns: int = 12
     system_prompt: Optional[str] = None
+    #: Which defense implementation :func:`evoguard.agents.build_defense_agent`
+    #: constructs. ``"llm"`` is the co-evolution defender and the only value the
+    #: training path supports; the other two are *baselines* for the AgentDojo-
+    #: Latent vs -Stock probe and are eval-only:
+    #:
+    #: * ``"shieldagent_guard"`` -- the ``llm`` agent with a ShieldAgent
+    #:   classifier in front of every action; an ``unsafe`` verdict replaces the
+    #:   action with a refusal, which terminates the trajectory. Needs
+    #:   :attr:`guard_llm`.
+    #: * ``"secalign"``          -- the ``llm`` agent rebuilt as a multi-message
+    #:   conversation that puts each raw observation in Meta-SecAlign's ``input``
+    #:   role instead of flattening it into the user turn.
+    agent: str = "llm"
+    #: Endpoint of the ShieldAgent classifier. Read only when
+    #: ``agent == "shieldagent_guard"``. Declared non-Optional on purpose:
+    #: ``_dataclass_from_dict`` only recurses into a field whose resolved type
+    #: ``is_dataclass``, and ``Optional[LLMConfig]`` is not, so a YAML block under
+    #: an Optional field would land as a raw dict.
+    guard_llm: LLMConfig = field(
+        default_factory=lambda: LLMConfig(temperature=0.0, max_tokens=64)
+    )
 
 
 @dataclass
@@ -314,6 +335,48 @@ class TrainingConfig:
     # count".
     grpo_gdpo: bool = False
 
+    # ---- GRPO rollout backend (2026-09-07) -------------------------------- #
+    # False (default, legacy) = TRL generates the G siblings with HF
+    # ``model.generate``. At per_device_train_batch_size=1 that is one unbatched
+    # decode per completion and it dominates the round: measured 13.37 s/prompt at
+    # G=4 on an H800, and production runs at G=8.
+    #
+    # True = ``use_vllm=True, vllm_mode="colocate"``, i.e. TRL builds an in-process
+    # ``vllm.LLM`` on the SAME device as the trainer and re-syncs the LoRA-merged
+    # weights into it via ``_move_model_to_vllm`` on every optimizer step. Weight
+    # sync is the whole point: GRPO needs ON-POLICY samples, so pointing the
+    # trainer at the long-lived defender server on :8000 is not an option (its
+    # adapter is only hot-reloaded once per ROUND).
+    #
+    # ``vllm_mode="server"`` is NOT usable here: ``import trl.scripts.vllm_serve``
+    # raises ``ImportError: cannot import name 'GuidedDecodingParams' from
+    # vllm.sampling_params`` against vllm 0.19.1.
+    #
+    # Colocate prerequisites, set just-in-time around ``trainer.train()`` by
+    # ``native_grpo_runner``: ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` (so the V1
+    # ``LLMEngine`` keeps an in-process ``.model_executor`` for the weight sync to
+    # reach through) plus ``RANK``/``LOCAL_RANK``/``WORLD_SIZE``/``MASTER_ADDR``/
+    # ``MASTER_PORT`` (vLLM's ``ExecutorWithExternalLauncher`` initialises the
+    # process group with ``env://``). world_size is 1, so no torchrun is involved.
+    #
+    # Advantage maths is untouched: ``_DeltaShapedGRPOTrainer`` calls
+    # ``super()._generate_and_score_completions`` and then rewrites only
+    # ``out_dict["advantages"]``, so the generation backend is invisible to GDPO,
+    # trajectory pooling and Δ shaping. Treat any change in
+    # ``mean_reward_after`` between the two settings as a BUG, not a speedup.
+    grpo_use_vllm_colocate: bool = False
+
+    # Fraction of the WHOLE trainer card handed to the colocated vLLM engine.
+    # vLLM profiles free memory at init, so the budget competes with the policy
+    # (~14 GB), the reference model (loaded whenever ``grpo_beta > 0``, ~14 GB) and
+    # backward activations (~15 GB): 0.25 x 80 GB ~= 20 GB leaves ~63 GB of 80 in
+    # use. Drop to 0.18 on OOM before touching ``gradient_checkpointing``. Nothing
+    # else may occupy the trainer card while this is on -- an oversubscription
+    # filler will make the profiling step reserve too little KV cache.
+    # NOTE: config parsing is field-driven with no type coercion, so write 0.25 in
+    # YAML, never "0.25".
+    grpo_vllm_gpu_memory_utilization: float = 0.25
+
     # ---- SFT dataset quality gate (item D1, 2026-08-20) ------------------- #
     # Utility below which a source trajectory is too poor to imitate.
     # 0.0 = no filtering (legacy behaviour bit-for-bit). At 0.5, a clean (A)
@@ -395,6 +458,14 @@ class PipelineConfig:
     """Top-level co-evolution loop settings."""
 
     max_rounds: int = 20
+    # First round id to run, so an interrupted experiment can be resumed in place
+    # instead of being restarted as a differently-named run. The loop is
+    # `range(start_round, max_rounds)`, round LABELS stay `r{rid}`, and the
+    # defender warm-starts from `<exp>/latest_adapter_dir.txt` exactly as it would
+    # mid-run. Two things it deliberately does NOT restore: the attacker
+    # population (rebuilt from the prewarm seeds, so its r<start evolution is
+    # lost) and the termination streak (reset to 0). 0 == the original behaviour.
+    start_round: int = 0
     # Termination: stop after K consecutive rounds with ASR < epsilon on val set.
     patience_rounds: int = 5     # K
     asr_threshold: float = 0.05  # epsilon

@@ -6,10 +6,10 @@
 # rounds/vllm.log and the PID is recorded under rounds/vllm.pid so callers can
 # stop it cleanly later (`scripts/stop_vllm.sh`).
 #
-# Interpreter: /root/yangxiao/envs/vllm085 (vllm 0.8.5.post1 + torch 2.6.0+cu124).
-# It is deliberately SEPARATE from the training venv: vllm 0.8.5 pins
-# transformers ~4.51 while the native TRL trainers run on transformers 5.x.
-# Keeping two venvs lets each side hold its own pins without conflict.
+# Interpreter: the SAME conda env that runs the trainer
+# (/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard, vllm 0.19.1 +
+# torch 2.10.0+cu128). One env both serves and trains on this box; see the
+# resolution block below for why each pin is what it is.
 #
 # GPU_ID accepts a comma-separated list; tensor-parallel size is derived from
 # how many devices are listed (e.g. EVOGUARD_VLLM_GPU="0,1" -> --tensor-parallel-size 2).
@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT"
 
-MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/yangxiao/models/Qwen2.5-7B-Instruct}"
+MODEL_PATH="${EVOGUARD_VLLM_MODEL:-/root/paddlejob/workspace/yangxiao/models/Qwen2.5-7B-Instruct}"
 PORT="${EVOGUARD_VLLM_PORT:-8000}"
 GPU_ID="${EVOGUARD_VLLM_GPU:-0,1}"
 SERVED_NAME="${EVOGUARD_VLLM_NAME:-qwen2.5-7b-it}"
@@ -56,7 +56,8 @@ fi
 # Priority order (highest first):
 #   1. EVOGUARD_VLLM_PYBIN explicit override (e.g. /opt/conda/envs/foo/bin/python)
 #   2. EVOGUARD_PY_BIN exported by scripts/setup_evoguard_env.sh's activation hook
-#   3. The conda env that also runs the trainer. `evoguard2` (2026-09-02) holds
+#   3. The conda env that also runs the trainer:
+#      /root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard holds
 #      vllm 0.19.1 + torch 2.10.0+cu128 + transformers 4.57.6 + trl 0.19.0 +
 #      peft 0.19.0: one env serves AND trains. Why this exact set:
 #        * vllm >= 0.20 ships a CUDA-13 wheel stack (nvidia-*-cu13) which needs
@@ -71,14 +72,12 @@ fi
 #          GRPOTrainer._generate_and_score_completions (GDPO + trajectory pooling
 #          + Delta shaping all hang off it), so trl 1.x is a code migration, not
 #          an env bump.
-#      The predecessor `evoguard` env (vllm 0.8.5 + torch 2.6) is left intact as
-#      the rollback target.
 if [[ -n "${EVOGUARD_VLLM_PYBIN:-}" && -x "$EVOGUARD_VLLM_PYBIN" ]]; then
     VLLM_PY="$EVOGUARD_VLLM_PYBIN"
 elif [[ -n "${EVOGUARD_PY_BIN:-}" && -x "$EVOGUARD_PY_BIN" ]]; then
     VLLM_PY="$EVOGUARD_PY_BIN"
 else
-    VLLM_PY="/root/miniconda3/envs/evoguard2/bin/python"
+    VLLM_PY="/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python"
 fi
 echo "   python_bin   : $VLLM_PY"
 

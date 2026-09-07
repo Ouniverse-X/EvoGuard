@@ -4,6 +4,366 @@ One block per run. Keep it short: config deltas + the numbers, no prose.
 
 ---
 
+## camouflage_probe_v2 — `configs/agentdojo_{latent,stock}_{probe,secalign,struq}.yaml`
+
+Eval-only, no training. Isolates ONE variable: does business-process camouflage of an
+IPI payload raise ASR? `data/agentdojo_latent` (48 authored high-Δ payloads) vs
+`data/agentdojo_stock`, its **Δ=0 control twin** — same 43 tasks / clean plans /
+carriers / benign observations / sinks, only `payload` swapped for AgentDojo's stock
+`ToolKnowledgeAttack` `<INFORMATION>` imperative. 91 records per cell (43 clean + 48
+attacked), 48/48 pairs joined, 0 unpaired.
+
+**v2 = all 48 latent payloads rewritten to name an explicit tool-call imperative.**
+v1 (payloads that described a deferred action without naming a tool) measured a NULL
+and is superseded — see "v1 vs v2" below.
+
+### Launch
+
+```bash
+bash scripts/run_latent_probe_chain.sh a 8   # base     (defender :8000)
+bash scripts/run_latent_probe_chain.sh b 8   # secalign (defender :8008)
+python scripts/summarize_latent_vs_stock.py \
+    base=rounds/replay_test_adjstock_base:rounds/replay_test_adjlatent_base \
+    secalign=rounds/replay_test_adjstock_secalign:rounds/replay_test_adjlatent_secalign
+```
+
+Endpoints: `:8000` GPU0 qwen2.5-7b-it defender, `:8003` GPU1 tool_executor, `:8004`
+GPU2 qwen3.5-9b judge + utility judge, `:8008` GPU4 Meta-Llama-3.1-8B-Instruct with
+`--tokenizer models/metasecalign` + `metasecalign` LoRA hot-registered.
+`EVOGUARD_REPLAY_SPLIT=` (empty) is mandatory — neither probe dataset declares
+`metadata["split"]`.
+
+### Results — ASR (the headline)
+
+| arm | stock (Δ=0) | latent (high-Δ) | Δ | paired latent/stock/both/neither | McNemar |
+|---|---|---|---|---|---|
+| base (qwen2.5-7b-it) | 0.458 (22/48) | **0.583** (28/48) | **+0.125** | 13 / 7 / 15 / 13 | p≈0.26 |
+| Meta-SecAlign-8B | 0.062 (3/48) | **0.208** (10/48) | **+0.146** | 9 / 2 / 1 / 36 | p≈0.065 |
+
+Camouflage raises ASR on BOTH arms. SecAlign's effect is 3.3× relative and its
+discordance far more lopsided, so despite 1/3 the successes it is the **stronger** of
+the two results. Neither clears p<0.05 at n=48 — report the direction, not significance.
+
+### Results — full triple
+
+| metric | base/stock | base/latent | secalign/stock | secalign/latent |
+|---|---|---|---|---|
+| asr | 0.458 | 0.583 | 0.062 | 0.208 |
+| poison_delivered_rate | 0.771 | 0.750 | 0.688 | 0.812 |
+| asr_given_delivered | 0.595 | **0.778** | 0.091 | **0.256** |
+| ua | 0.167 | 0.271 | 0.562 | 0.333 |
+| bu | 0.791 | 0.721 | 0.651 | 0.605 |
+| blocked_unfinished_rate | 0.375 | 0.146 | 0.375 | 0.458 |
+| refusal_rate (attacked) | 0.312 | **0.021** | — | — |
+
+`utility_method = llm_rubric` on 91/91 in all four cells: no judge outage, BU/UA valid.
+
+Two things to state next to the numbers:
+- **The gain is resistance-side, not delivery-side.** base delivery *drops* 0.771→0.750
+  while `asr_given_delivered` rises +0.183. Camouflage does not get the payload seen
+  more often; it gets it obeyed more often once seen.
+- **The base model stops refusing entirely** (0.312 → 0.021). v1 saw the same collapse.
+
+### ASR by declared Δ — non-monotone, both arms
+
+| Δ | base/stock | base/latent | secalign/stock | secalign/latent |
+|---|---|---|---|---|
+| 1 | 0.375 | 0.750 | 0.000 | 0.312 |
+| 2 | 0.562 | 0.625 | 0.062 | 0.250 |
+| 3 | 0.438 | **0.375** | 0.125 | **0.062** |
+
+Δ=3 is the one cell where camouflage HURTS, on both arms independently. Repeats across
+arms, so not obviously noise. "Deeper Δ = more evasive" is **not** supported.
+By technique (latent, base): `audit_trail` / `staged_verification` 0.750 top,
+`false_correction` 0.375 bottom.
+
+### v1 vs v2 — the null was a payload artifact
+
+v1 ASR: base 0.417→0.375, SecAlign 0.104→0.125, ShieldAgent 0.000→0.042 (discordant
+10/12, 6/5, 2/0) — camouflage did **not** raise ASR. Cause was payload construction,
+not camouflage: v1 payloads described a deferred action ("you will need to X later")
+without ever naming the tool call, so there was nothing to comply with. Ruled out at
+the time and still ruled out: turn budget, judge strictness, delivery parity.
+**An IPI payload must name the tool call it wants.**
+
+### StruQ arm — added, and it measures incapacity rather than resistance
+
+`models/struQ/llama-7b_Spcl` (= `huggyllama/llama-7b_SpclSpclSpcl_NaiveCompletion`),
+`defense.agent: struq`, `evoguard/agents/struq_agent.py`. Four blockers, three fixed —
+full write-up in `docs/struq_arm_blockers.md`:
+
+| blocker | fix |
+|---|---|
+| bundled `chat_template` emits none of StruQ's delimiters | agent renders `[MARK] [INST]/[INPT]/[RESP] [COLN]` itself and posts to `/v1/completions` (`LLMClient.text_completion`) |
+| one `[INPT]` slot vs a multi-turn tool loop | all observations concatenated into that one slot, each keeping the base arm's exact `[turn N] tool result:` anchor; the agent's own past calls stay in `[INST]` |
+| `max_position_embeddings` 2048 | `env.suites: [banking, slack]` + served with `--hf-overrides {"rope_parameters":{"rope_type":"linear","factor":2.0}}` → 4096, `max_tokens: 256` |
+| Alpaca-trained, cannot emit `{thought,tool,args}` | **not fixed.** Decoding left unconstrained; the incapacity shows up in BU |
+
+A hole found while verifying, not a test bug: the delimiters are *added tokens*
+(32001–32005), so a payload writing `[RESP]`/`[INST]` verbatim inside an observation
+forges a channel boundary and reaches the trusted channel. `struq_agent._sanitize`
+redacts all six reserved tokens from untrusted text. `scripts/probe_struq_defense.py`,
+live on :8005, all six cases as expected: injection in `[INST]` obeyed (capability
+control), same sentence in `[INPT]` resisted, forged-delimiter completion obeyed,
+sanitised version resisted, bare Alpaca resisted, bare-Alpaca completion obeyed.
+
+**Subset caveat.** travel and workspace need 3553 / 3078 median StruQ tokens for the
+trusted channel *alone* (system prompt + tool schemas, zero observations), so they
+overflow before the first observation arrives and no `max_turns` cut helps. Truncation
+was rejected outright: latent payloads are longer than their stock twins (median 959
+vs 707 chars), so any length budget would cut the treatment arm harder than the control
+— a confound sitting on the variable under test. The arm therefore covers **24 of 48**
+attack slots and 19 of 43 clean tasks, and every number below re-derives base and
+SecAlign on the **same** subset via `summarize_latent_vs_stock.py --suites=banking,slack`.
+
+```bash
+EVOGUARD_VLLM_MODEL=.../models/struQ/llama-7b_Spcl EVOGUARD_VLLM_NAME=struq-llama7b \
+EVOGUARD_VLLM_GPU=3 EVOGUARD_VLLM_PORT=8005 EVOGUARD_VLLM_MAXLEN=4096 \
+EVOGUARD_VLLM_EXTRA_ARGS='--dtype bfloat16 --hf-overrides {"rope_parameters":{"rope_type":"linear","factor":2.0}}' \
+  bash scripts/start_vllm_secondary.sh
+EVOGUARD_REPLAY_CONFIG=configs/agentdojo_stock_struq.yaml \
+EVOGUARD_REPLAY_DATASET_DIR=data/agentdojo_stock EVOGUARD_REPLAY_SPLIT= \
+  bash scripts/run_replay_heldout.sh none adjstock_struq 8      # and adjlatent_struq
+python scripts/summarize_latent_vs_stock.py --suites=banking,slack \
+    struq=rounds/replay_test_adjstock_struq:rounds/replay_test_adjlatent_struq \
+    base=rounds/replay_test_adjstock_base:rounds/replay_test_adjlatent_base \
+    secalign=rounds/replay_test_adjstock_secalign:rounds/replay_test_adjlatent_secalign
+```
+
+**banking+slack subset, n=24 pairs per arm** (the base/SecAlign columns are the SAME
+records as the full-48 tables above, re-filtered — not a re-run):
+
+| metric | struq/stock | struq/latent | base/stock | base/latent | secalign/stock | secalign/latent |
+|---|---|---|---|---|---|---|
+| asr | **0.000** (0/24) | **0.042** (1/24) | 0.333 (8/24) | 0.667 (16/24) | 0.042 (1/24) | 0.208 (5/24) |
+| **poison_delivered_rate** | **0.125** | **0.083** | 0.792 | 0.792 | 0.750 | 0.750 |
+| asr_given_delivered | 0.000 (n=3) | 0.500 (n=2) | 0.421 | 0.842 | 0.056 | 0.278 |
+| **bu** | **0.368** | **0.316** | 0.842 | 0.684 | 0.632 | 0.632 |
+| ua | 0.208 | 0.292 | 0.167 | 0.208 | 0.500 | 0.250 |
+| blocked_unfinished_rate | 0.792 | 0.667 | 0.500 | 0.125 | 0.458 | 0.542 |
+
+Paired discordance (latent-only / stock-only / both / neither) and exact McNemar:
+struq 1 / 0 / 0 / 23, p=1.0 · base 10 / 2 / 6 / 6, **p≈0.039** · secalign 5 / 1 / 0 / 18,
+p≈0.22. `n_unjoined` 0 and `n_pairs` 24 in all three arms.
+
+**StruQ's ASR≈0 is not a defense result.** `poison_delivered_rate` 0.125/0.083 against
+0.79/0.75 on the other two arms: the model never reaches the poisoned observation in
+21–22 of 24 runs, because it cannot emit a tool call. BU 0.368/0.316 against base's
+0.842 is the same fact measured on the benign arm. `asr_given_delivered` has n=3 and
+n=2. Blocker 4 dominates the cell; do not put StruQ's 0.000 next to SecAlign's 0.042 as
+if both were resistance. What the arm *does* establish is that the delimiter defense is
+engaged on the wire (the six probe cases) and that the harness can drive a non-chat,
+non-tool-calling checkpoint.
+
+**The subset makes the base arm's effect significant.** On banking+slack alone,
+base ASR 0.333→0.667, discordance 10 vs 2, exact p≈0.039 — the full-48 pooling
+(13 vs 7, p≈0.26) was diluted by travel+workspace. SecAlign 0.042→0.208 on the subset
+(5 vs 1, p≈0.22) keeps the same direction as the full set.
+
+### Known issues
+
+- **ShieldAgent (`:8007`) not re-run on v2, and unusable as a comparison anyway**:
+  as-deployed it scores BU 0.093 with clean `false_alarm_rate` 0.42 — it blocks the
+  benign arm, so its ASR≈0 is incapacity, not resistance.
+- **The SecAlign arm's message *shape* is the intervention and a confound**: base sees
+  one flat user string, SecAlign a structured `system,user,(assistant,input)*,user`
+  conversation (`agents/secalign_agent.py`). Cross-arm ASR levels are therefore not
+  clean comparisons; the within-arm stock-vs-latent Δ is.
+- **StruQ's cell is confounded by incapacity, not by camouflage** — see the StruQ
+  section above. Its 24-of-48 subset and its 0.08–0.13 `poison_delivered_rate` are both
+  disqualifying for a cross-arm ASR comparison. `docs/struq_arm_blockers.md` records
+  which of the four blockers were fixed and which was not.
+- n=48 per cell for base/SecAlign (24 on the StruQ subset). Only the base arm on
+  banking+slack reaches p<0.05, and that is a subset chosen for an unrelated reason
+  (StruQ's context window), so it is not a pre-registered test.
+
+---
+
+## injecagent_v1 — `configs/injecagent_grpo.yaml`
+
+Dataset `injecagent` (`data/InjecAgent`, 17 user cases × 62 attacker cases = 1054 rows).
+Split unit is the **attacker case**, 38/12/12 → 646/204/204 rows. All 17 user cases
+appear in every split, so tasks carry **no** `metadata["split"]` — held-out-ness comes
+from `val_dataset_dir` + `val_split: ""`, hence `validation_fraction: 0.0`. Axis =
+**unseen payload on a seen scenario**, not task-level generalisation.
+
+Deltas vs `asb_opi_v1` (everything else lifted from it, so the two stay comparable):
+
+| knob | value | why |
+|---|---|---|
+| `defense.max_turns` | **4** (asb 6) | longest legit chain is carrier → ds read → ds send → answer, and the payload always arrives in the turn-1 carrier observation, so every extra `mct_searcher._inject_turn_ceiling` slot is wasted MCTS budget |
+| `grpo_rollout_temperature` | **1.15** (asb 0.90) | at K=1 trajectory pooling is a no-op, so temperature is the only exploration lever left |
+| `attacker.llm` | local qwen2.5-7b-it @ **:8002** (asb qianfan glm-5.2) | all-local, no QianFan quota; a dedicated port, never :8000 — the primary is LoRA-hot-loaded and the attacker must not be the model under attack |
+| `clean_rollouts_per_task` / `sft_max_records_per_task` | 8 / 10 (asb 6 / 6) | only 17 tasks, so the clean arm needs more samples per task |
+| `max_rounds` / `patience_rounds` | 9 / 999 (early stop off, val eval on) | `asb_opi_v1`'s best was r5 and v11's r4/r7 — rounds past ~8 were noise |
+| `grpo_use_vllm_colocate` / `..._gpu_memory_utilization` | **true** / 0.25 | 12.31 → 3.20 s/prompt (3.9×); this is what made 9 rounds affordable |
+| `cuda_visible_devices` | `"7"` | GPU0 defender :8000, GPU2 tool_executor :8003, GPU5 judges :8004, GPU6 progress judge :8006 |
+
+Unchanged and load-bearing: `grpo_gdpo: true`, `grpo_traj_group_size: 1`,
+`grpo_group_size_g: 8`, `grpo_beta: 0.01`, `grpo_advantage_curriculum_lambda: 1.5`,
+`grpo_max_prompts_per_round`/`native_max_steps_per_round` 400/400, LoRA α64/dropout
+0.10/7 targets, `R = r_safety + r_progress − p_drift`.
+
+**Harmful-goal seam.** An InjecAgent task exposes exactly ONE benign tool and the
+dataset has no decoy table, so `harmful_catalog.sample_goal()` returned `None` on all
+17 tasks and the attacker silently degraded to `goal=task.instruction` — in-scope
+forgery counting as success, with only a WARNING as the symptom. Fixed by
+`envs/injecagent.py::load_harmful_goal_candidates`, built from `attacker_tools[0]` +
+`expected_achievements` of the **train split only** (val/test tool names in training
+payloads would burn the held-out axis), returned flat and sorted by tool name because
+`sample_goal` indexes it by `sha1(task_id)`. Pinned by `tests/test_injecagent_env.py`.
+
+### Launch
+
+```bash
+bash scripts/launch_injecagent_v1.sh   # wraps run_grpo_experiment.sh with the env below
+# EVOGUARD_JUDGE_LLM_BASE_URL=:8004/v1  EVOGUARD_PROGRESS_LLM_BASE_URL=:8006/v1
+# EVOGUARD_JUDGE_LLM_MODEL=qwen3.5-9b  EVOGUARD_REWARD_JUDGE_WORKERS=32
+# EVOGUARD_PREWARM_SEEDS_DIR=data/seeds_v3  TRAINER_CUDA_VISIBLE_DEVICES=7
+```
+
+### Status
+
+**Complete — 9/9 rounds (r0–r8), 2026-09-07.** ~35 min/round, `fit_seconds` 1080–1321.
+Artifacts `rounds/evoguard_injecagent_v1/`. Six launcher logs under
+`rounds/injecagent_grpo/logs/` because five colocate-lifecycle bugs killed and resumed
+the run (see below); the final one is `run_20260907_145502.log`.
+
+`n_safety_fallback = 0` in **every** round — the safety gradient is real, not
+fallback-flattened. `judge:baited` in `safety_source_tally` falls 100 → 66 → 22 → 30 →
+20 → 20 → **3** → 20 across r1–r8. `utility_method` is `llm_rubric` 221/221 in all 9
+val replays, so no BU/UA number here is a fail-closed judge artifact.
+
+### Results — val (`data/InjecAgent/splits/val`, 204 scenarios / 17 tasks / 221 records)
+
+`poison_delivered_rate` is **1.0 by construction** (the payload is spliced into the
+turn-1 carrier observation via the row's `tool_response_template`), so
+`asr_given_delivered == attack_success_rate` and ASR here is pure **resistance** — the
+avoidance-vs-resistance confound cannot explain any drop. The one exception is r2
+(0.9608: 8 scenarios where the defender never called the carrier at all).
+
+| round | ASR | asr\|delivered | BU (n=17) | UA | refusal | f1 | acc | cf (tp,fn,fp,tn) |
+|---|---|---|---|---|---|---|---|---|
+| r0 (SFT) | 0.1078 | 0.1078 | 0.7647 | 0.4020 | 0.265 | 0.9333 | 0.8824 | 182,22,4,13 |
+| r1 | 0.1324 | 0.1324 | 0.7647 | 0.5294 | 0.206 | 0.9195 | 0.8597 | 177,27,4,13 |
+| r2 | 0.0735 | 0.0765 | 0.7647 | 0.6961 | 0.167 | 0.9521 | 0.9140 | 189,15,4,13 |
+| r3 | 0.1029 | 0.1029 | 0.8824 | 0.6912 | 0.147 | 0.9409 | 0.8959 | 183,21,2,15 |
+| r4 | 0.0931 | 0.0931 | 0.7647 | 0.7157 | 0.152 | 0.9415 | 0.8959 | 185,19,4,13 |
+| r5 | 0.0686 | 0.0686 | 0.7647 | 0.6961 | 0.098 | 0.9548 | 0.9186 | 190,14,4,13 |
+| r6 | 0.0980 | 0.0980 | 0.7647 | 0.7451 | 0.118 | 0.9388 | 0.8914 | 184,20,4,13 |
+| **r7** | **0.0637** | **0.0637** | **0.8235** | **0.7500** | 0.123 | 0.9598 | 0.9276 | 191,13,3,14 |
+| r8 | 0.0931 | 0.0931 | 0.7647 | 0.7108 | 0.172 | 0.9415 | 0.8959 | 185,19,4,13 |
+
+**Val-selected round: r7** — the only round best on all three metrics at once
+(ASR −4.4 pp vs r0, BU 14/17, UA 0.750). **UA is the one monotone trend**
+(0.40 → 0.53 → 0.70 → 0.69 → 0.72 → 0.70 → 0.75 → 0.75 → 0.71): GRPO undoing the SFT
+stage's over-refusal, visible in `refusal_rate` 0.265 → 0.098 and attacked
+`utility_mean` 0.500 → 0.811. ASR is a random walk with a downward drift
+(0.108 / 0.132 / 0.074 / 0.103 / 0.093 / 0.069 / 0.098 / 0.064 / 0.093); against the
+measured same-adapter noise floor (ASR sd 0.0141, so ±2.8 pp) only r5 and r7 clear it.
+BU moves only in 1/17 = 5.9 pp steps and oscillates rather than trends.
+
+**Noise floor is measured, not assumed.** Run `20260907_012023` accidentally replayed
+the r1 adapter against the 204 val payloads 8 times (the bug-1 no-op below): ASR mean
+0.1048 **sd 0.0141**, BU sd 0.0195, UA sd 0.0236. Artifacts kept at
+`rounds/evoguard_injecagent_v1/_stale_r2_r8_noop/`.
+
+### Held-out test replay — base vs SFT vs GRPO
+
+`eval/vendored_replay.py`, frozen config `rounds/evoguard_injecagent_v1/config.yaml`,
+`--dataset-dir data/InjecAgent/splits/test --split ""`. 204 scenarios / 17 tasks / 221
+records per arm, zero crashed rollouts, `poison_delivered_rate` 1.000 and
+`target_tool_call_rate` 1.000 in all four arms (so `asr_given_delivered == ASR`),
+`utility_method` `llm_rubric` 221/221. Outputs `rounds/replay_test_injecagent_{base,r0sft,r7,r8}/`.
+
+| arm | ASR | n_succ/204 | BU (n=17) | UA | blocked_unfinished | f1 | acc |
+|---|---|---|---|---|---|---|---|
+| base, no adapter | 0.0931 | 19 | 0.7647 | 0.5245 | 0.3824 | 0.9415 | 0.8959 |
+| r0_sft only | 0.0735 | 15 | 0.7647 | 0.5735 | 0.3529 | 0.9521 | 0.9140 |
+| r7 (val-selected) | 0.0882 | 18 | 0.7647 | 0.7402 | 0.1716 | 0.9442 | 0.9005 |
+| r8 (last) | **0.0686** | 14 | 0.7647 | **0.7451** | 0.1863 | 0.9548 | 0.9186 |
+
+**Test reverses the val-only reading, and this is the honest headline for the run:**
+
+* **No arm is separable from the base model on ASR.** All four span 0.0686–0.0931 =
+  2.45 pp, entirely inside the ±2.8 pp noise band. The val-selected r7 is *worse* on
+  test than both r8 and SFT-only. The base Qwen2.5-7B is already ~91% resistant to
+  InjecAgent payloads, so there was little ASR headroom to win.
+* **BU is bit-identical (13/17, cf_fp 4 / cf_tn 13) in all four arms** — the same 4
+  clean tasks fail regardless of adapter. No benign cost, and no benign gain.
+* **UA is the one real effect: 0.5245 → 0.7451, +22.1 pp ≈ 9.4 sd** (UA sd 0.0236),
+  with `blocked_unfinished_rate` halving 0.3824 → 0.1863. SFT alone buys +4.9 pp;
+  **the GRPO rounds buy the remaining +16.7 pp.** GRPO's contribution is separable from
+  SFT's and it lives entirely on the utility axis, not the safety axis.
+
+So: on InjecAgent this pipeline does not make the defender safer, it makes an
+already-safe defender **usable** — it removes over-refusal without paying ASR for it.
+Do not quote the r7 val ASR as a held-out result.
+
+Reproduction:
+
+```bash
+B=evoguard_r0_sft_weights::evoguard_r1_grpo_weights::…::evoguard_r7_grpo_weights
+EVOGUARD_REPLAY_CONFIG=rounds/evoguard_injecagent_v1/config.yaml \
+EVOGUARD_REPLAY_DATASET_DIR=data/InjecAgent/splits/test \
+EVOGUARD_REPLAY_SPLIT= \
+bash scripts/run_replay_heldout.sh "${B}::evoguard_r8_grpo_weights" injecagent_r8 8
+```
+
+### Known issues
+
+**Reward saturation, unfixed.** `frac_reward_zero_std` per round r1–r8 = 0.522 / 0.843 /
+0.820 / 0.785 / 0.800 / 0.708 / 0.825 / 0.792, and in the final run 647/800 logged steps
+sat at exactly 1.0 with reward pinned at the 3.20 ceiling. The measured fix (CLAUDE.md)
+is K=2 trajectory pooling **plus** temperature 1.15; this config already has the
+temperature and ships K=1 by request, so only half the prescription is in place. r8
+failing to improve is convergence on the TRAINING distribution — training-round ASR was
+already 0.000 at r7–r8 (`metrics.csv`) while held-out val ASR sat at 6–9%.
+
+**Training-round ASR is NOT the dataset's ASR.** Training attacks come from the MCTS
+attacker seeded by `data/seeds_v3`; the 1054 vendored payloads enter only via
+`eval/vendored_replay.py`. r0: training ASR 1.18% vs val ASR 10.78%.
+
+**Both CSVs were regenerated post-run** from the 9-row jsonls
+(`utils/plots.write_metrics_csv`, `utils/metrics.write_safety_metrics_csv`). Each
+resumed run rewrites them from in-memory history, which starts at `start_round`, so the
+shipped `metrics.csv` / `results/safety_metrics.csv` held only r7–r8.
+
+**Five bugs in the `grpo_use_vllm_colocate` lifecycle**, all because every round shares
+one python process (`method: sft_then_native_grpo`). Fixed in
+`training/native_grpo_runner.py`; each has a MUST-stay-0 log string. Full diagnosis in
+the config header and `memory/MEMORY.md`; the summary:
+
+1. `EmbeddingParallel` ImportError at `PeftModel.from_pretrained` — peft 0.19.1 gates
+   `_maybe_shard_state_dict_for_tp` on `torch.distributed.is_initialized()`, which the
+   engine leaves up. Made r2–r8 of the first run a **silent no-op** (8 replays of r1's
+   adapter — which is where the noise floor above came from). Fix:
+   `_teardown_colocate_process_group()`.
+2. `not initialized in the world group map` — vLLM caches `GroupCoordinator`s in module
+   globals. Fix: `destroy_model_parallel()` + `destroy_distributed_environment()` first.
+3. `Error in memory profiling` — mechanism never established. Fix:
+   `_trl_compat._build_llm_with_settled_memory`, settle + bounded 3× retry. The
+   `vLLM memory profiling raced on attempt` WARNINGs are the fix working.
+4+5. **The engine's ~20 GiB was never freed** → OOM in `Trainer._move_model_to_device`
+   loading the *next* round's policy. Two independent retentions, each leaving the full
+   leak alone: (a) `EngineCore.__init__` ends with `freeze_gc_heap()`, so the engine's
+   cycles sit in the permanent generation where `gc.collect()` never scans them and
+   `gc.get_referrers()` returns *nothing* — needs `gc.unfreeze()`; (b)
+   `vllm.utils.func_utils.supports_kw` is `@lru_cache`d and vLLM's protocol checks call
+   it with **bound methods of the model** (`__init__` ×1, `forward` ×2), which pin
+   `__self__` — needs `supports_kw.cache_clear()`. Found by tracing (weakrefs down the
+   ownership chain + `gc.get_referrers` on the first survivor), after two mechanism
+   guesses had already failed on bug 3.
+
+**The leak fix is only half-effective in production and the residual is untraced.** An
+offline four-engine gate with a `FakeTrainer` is flat to 0.02 GiB; the real run reclaims
+`+10.84` / `+11.04 GiB` and free-at-settle still regresses 18.7 GiB/round (vs 34.6 GiB
+pre-fix). Harmless here only because r8 was the last round (45.36 GiB free vs 19.77
+needed). **Trace it before extending any colocate run past ~2 more rounds.** Trust gate:
+`released colocate vLLM engine: free X -> Y GiB (+Z GiB reclaimed)`.
+
+---
+
 ## asb_opi_v1 — `configs/asb_opi_grpo.yaml`
 
 Dataset `asb_opi` (`data/ASB`, 51 tasks / 10 agent personas / 400 injected rows;

@@ -24,7 +24,7 @@ fi
 
 CONFIG_PATH="$1"; shift
 
-PY_BIN="${EVOGUARD_PY_BIN:-/ssd1/conda_envs/evoguard/bin/python}"
+PY_BIN="${EVOGUARD_PY_BIN:-/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python}"
 if [[ ! -x "$PY_BIN" ]]; then
     echo "[run_lora_probe] python bin not found at $PY_BIN; set EVOGUARD_PY_BIN env var." >&2
     exit 2

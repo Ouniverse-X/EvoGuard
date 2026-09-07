@@ -24,12 +24,22 @@ from typing import Any, Optional
 # Enums
 # --------------------------------------------------------------------------- #
 class Role(str, Enum):
-    """Chat message role."""
+    """Chat message role.
+
+    ``INPUT`` is not an OpenAI role. Meta-SecAlign's defense *is* the role: its
+    chat template renders an unrecognised role name verbatim as
+    ``<|start_header_id|>input<|end_header_id|>``, and the adapter was trained to
+    treat everything under that header as untrusted data carrying no authority.
+    Only :class:`evoguard.agents.secalign_agent.SecAlignDefenseAgent` emits it;
+    on a model whose template lacks that branch it degrades to a stray header, so
+    it must never be used for a general-purpose message.
+    """
 
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
+    INPUT = "input"
 
 
 class TrajectoryKind(str, Enum):

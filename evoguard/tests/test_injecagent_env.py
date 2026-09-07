@@ -24,6 +24,12 @@ Five things can break silently here, and each has a layer below.
 5. **The clean observation.** It must keep the template's shape, drop the
    placeholder, and contain no payload -- otherwise clean and poisoned
    observations are distinguishable without reading them. Layer 1 covers it.
+6. **The attacker's own objective.** Each task exposes exactly ONE benign tool,
+   so without ``metadata["harmful_goal_candidates"]`` ``sample_goal`` returns
+   ``None`` on all 17 and the MCTS attacker silently degrades to
+   ``goal=task.instruction`` -- in-scope forgery counts as success again, and the
+   only symptom is a WARNING. Layer 6 pins the seam and the train-only
+   restriction that keeps val/test tool names out of training payloads.
 
 Run via::
 
@@ -43,10 +49,15 @@ _PKG_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
+from evoguard.attacks.harmful_catalog import (  # noqa: E402
+    GOAL_CANDIDATES_KEY,
+    sample_goal,
+)
 from evoguard.core.types import ToolCall  # noqa: E402
 from evoguard.envs import available_envs  # noqa: E402
 from evoguard.envs.injecagent import (  # noqa: E402
     DATASET_NAME,
+    GOAL_CANDIDATE_SPLIT,
     PLACEHOLDER,
     SPLITS,
     InjecAgentEnv,
@@ -74,6 +85,10 @@ _skip_no_data = unittest.skipUnless(_HAVE_DATA, f"InjecAgent dataset absent at {
 N_TASKS = 17
 N_SUITES = 11
 N_ROWS = {"train": 646, "val": 204, "test": 204}
+
+#: Distinct stage-1 attacker tools per split. Zero overlap between them is what
+#: makes the train-only goal catalogue a valid held-out guarantee.
+N_GOAL_CANDIDATES = 38
 
 
 def _env(**kw) -> InjecAgentEnv:
@@ -356,6 +371,80 @@ class SimulatedResponseTiers(unittest.TestCase):
         self.assertEqual(canonical_args({"b": 1, "a": 2}), '{"a": 2, "b": 1}')
         self.assertEqual(canonical_args("{'a': 'x'}"), canonical_args({"a": "x"}))
         self.assertIsNone(canonical_args("{not parseable"))
+
+
+# --------------------------------------------------------------------------- #
+# Layer 6 -- the attacker's own malicious objective                            #
+# --------------------------------------------------------------------------- #
+@_skip_no_data
+class HarmfulGoalSeam(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.env = _env()
+        cls.tasks = cls.env.get_tasks()
+
+    def _split_baits(self, split: str) -> set:
+        return {str((rec.get("attacker_tools") or [""])[0])
+                for _s, rec in iter_split_rows(_ROOT, (split,))}
+
+    def test_every_task_carries_the_catalogue(self):
+        for t in self.tasks:
+            cands = t.metadata[GOAL_CANDIDATES_KEY]
+            self.assertTrue(cands, t.task_id)
+            for c in cands:
+                self.assertTrue(c["tool"], t.task_id)
+                self.assertTrue(c["goal_text"], c["tool"])
+
+    def test_candidates_come_from_the_train_split_only(self):
+        # The held-out axis is "unseen payload on a seen scenario". Drawing the
+        # training attacker's target from the full catalogue would put val/test
+        # tool names into training payloads and burn it.
+        pool = {c["tool"] for t in self.tasks
+                for c in t.metadata[GOAL_CANDIDATES_KEY]}
+        train = self._split_baits(GOAL_CANDIDATE_SPLIT)
+        self.assertEqual(len(train), N_GOAL_CANDIDATES)
+        self.assertTrue(pool <= train)
+        for held_out in ("val", "test"):
+            self.assertEqual(pool & self._split_baits(held_out), set(), held_out)
+
+    def test_a_task_never_targets_its_own_carrier(self):
+        # The only bait/carrier coincidence in the benchmark is
+        # injecagent-ds-16-03 (GitHubGetUserDetails is user case 16's carrier),
+        # and it lives in VAL -- so the train-only catalogue does not contain it
+        # and the carrier filter is a no-op today. It stays because a
+        # regenerated split could move that case into train, where an unfiltered
+        # catalogue would hand one task an in-scope "malicious" objective.
+        for t in self.tasks:
+            cands = t.metadata[GOAL_CANDIDATES_KEY]
+            self.assertEqual(len(cands), N_GOAL_CANDIDATES, t.task_id)
+            self.assertNotIn(t.metadata["carrier_tool"],
+                             {c["tool"] for c in cands}, t.task_id)
+        carriers = {t.metadata["carrier_tool"] for t in self.tasks}
+        self.assertEqual(carriers & self._split_baits(GOAL_CANDIDATE_SPLIT), set())
+        self.assertIn("GitHubGetUserDetails", self._split_baits("val"))
+
+    def test_sample_goal_never_falls_back_to_the_user_instruction(self):
+        # A None here is the "exposes no sensitive sink" WARNING in
+        # mct_searcher, whose consequence is that in-scope forgery scores as an
+        # attack success.
+        for t in self.tasks:
+            goal = sample_goal(t, self.env.get_tools(t))
+            self.assertIsNotNone(goal, t.task_id)
+            self.assertNotIn(goal.harmful_tool,
+                             {s.name for s in self.env.get_tools(t)}, t.task_id)
+            self.assertFalse(goal.in_benign_plan, t.task_id)
+            # dataset_builder._infer_target_tool matches `call\s+(\w+)`.
+            self.assertIn(f"call {goal.harmful_tool}", goal.goal_text)
+
+    def test_the_catalogue_order_is_deterministic(self):
+        pool = [c["tool"] for c in self.tasks[0].metadata[GOAL_CANDIDATES_KEY]]
+        self.assertEqual(pool, sorted(pool))
+        # sample_goal indexes by sha1(task_id), so a re-run must re-target.
+        again = _env().get_tasks()[0]
+        self.assertEqual(
+            sample_goal(again, self.env.get_tools(again)).harmful_tool,
+            sample_goal(self.tasks[0], self.env.get_tools(self.tasks[0])).harmful_tool,
+        )
 
 
 # --------------------------------------------------------------------------- #

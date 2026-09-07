@@ -441,7 +441,14 @@ def train_native_sft(
         from transformers import AutoModelForCausalLM, AutoTokenizer    # type: ignore
 
         from evoguard.training._trl_compat import patch_trl_probes
-        patch_trl_probes()
+        # SFT never generates through vLLM, but shim 3 is a PROCESS-WIDE, one-shot
+        # decision (it fixes what trl.trainer.grpo_trainer imports at module scope).
+        # `sft_then_native_grpo` runs r0 SFT and r>=1 GRPO in the SAME process, so
+        # latching False here would silently veto colocate for every later round.
+        # Pass the GRPO flag through instead; the aliases are inert for SFTTrainer.
+        patch_trl_probes(
+            enable_vllm=bool(getattr(training_cfg, "grpo_use_vllm_colocate", False))
+        )
         from trl import SFTConfig, SFTTrainer                           # type: ignore
 
         target_modules_list = [str(m) for m in (

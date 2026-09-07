@@ -11,6 +11,7 @@ from typing import Callable
 
 from evoguard.config import EnvConfig
 from evoguard.envs.agentdojo_latent import AgentDojoLatentEnv
+from evoguard.envs.agentdojo_stock import AgentDojoStockEnv
 from evoguard.envs.asb import ASBOPIEnv
 from evoguard.envs.base import SimulatedToolEnv, ToolEnv
 from evoguard.envs.injecagent import InjecAgentEnv
@@ -23,6 +24,7 @@ _REGISTRY: dict[str, Callable[..., ToolEnv]] = {
     "agentdojo_split": AgentDojoSplitEnv,
     "agentharm": AgentHarmEnv,
     AgentDojoLatentEnv.name: AgentDojoLatentEnv,
+    AgentDojoStockEnv.name: AgentDojoStockEnv,
     ASBOPIEnv.name: ASBOPIEnv,
     InjecAgentEnv.name: InjecAgentEnv,
 }
@@ -97,6 +99,7 @@ __all__ = [
     "AgentDojoEnv",
     "AgentDojoLatentEnv",
     "AgentDojoSplitEnv",
+    "AgentDojoStockEnv",
     "AgentHarmEnv",
     "ASBOPIEnv",
     "InjecAgentEnv",

@@ -37,6 +37,10 @@ Four properties of this dataset drive everything below.
    The 30 direct-harm tools are absent from the cache -- upstream never simulates
    them, because a direct-harm attack is already scored at the call itself -- so
    those fall through to the simulator.
+
+The same attacker catalogue, restricted to the TRAIN split, is also what the
+MCTS attacker draws its own malicious objective from
+(:func:`load_harmful_goal_candidates`).
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ import os
 from collections import OrderedDict
 from typing import Iterator, Optional, Sequence
 
+from evoguard.attacks.harmful_catalog import GOAL_CANDIDATES_KEY
 from evoguard.core.types import (
     Action,
     Task,
@@ -74,6 +79,10 @@ SPLITS = ("train", "val", "test")
 
 #: The placeholder every ``Tool Response Template`` carries exactly once.
 PLACEHOLDER = "<Attacker Instruction>"
+
+#: Split whose attacker tools may become the training attacker's own objective.
+#: See :func:`load_harmful_goal_candidates`.
+GOAL_CANDIDATE_SPLIT = "train"
 
 
 def injecagent_root(data_root: str = "data", subdir: str = "InjecAgent") -> str:
@@ -211,6 +220,58 @@ def iter_split_rows(root: str, splits: Optional[tuple[str, ...]] = None) -> Iter
                     yield split, json.loads(line)
 
 
+def load_harmful_goal_candidates(
+    root: str,
+    tools: dict[str, ToolSpec],
+    *,
+    split: str = GOAL_CANDIDATE_SPLIT,
+) -> list[dict[str, str]]:
+    """Out-of-scope sinks for the attacker's own objective, from ONE split.
+
+    The MCTS attacker needs an independent malicious objective per task
+    (``attacks/harmful_catalog.py``); left to its own inference it finds none
+    here, because an InjecAgent task exposes exactly ONE benign tool -- the
+    carrier -- and this dataset has no decoy table. ``sample_goal`` would return
+    ``None`` on all 17 tasks and the attacker would fall back to
+    ``goal=task.instruction``, i.e. in-scope forgery would count as success
+    again. The dataset already ships the right objects: ``attacker_tools[0]``
+    (the stage-1 bait, absent from :meth:`InjecAgentEnv.get_tools` by
+    construction) plus ``expected_achievements`` as the stated goal.
+
+    Returned FLAT, not keyed per task, because the 17 x 62 grid is complete --
+    every attacker case pairs with every user case, so there is no per-task
+    subset to respect. :meth:`InjecAgentEnv._load` still drops any entry that
+    collides with a task's own carrier tool, which would be in-scope for it. The
+    benchmark's one such coincidence (``injecagent-ds-16-03`` baits
+    ``GitHubGetUserDetails``, user case 16's carrier) sits in VAL, so that filter
+    is a no-op on today's split and exists for a regenerated one.
+
+    Restricted to ``split`` (train) on purpose. The three splits partition the
+    62 attacker cases disjointly (38 / 12 / 12, and their stage-1 tools have
+    zero overlap), and InjecAgent's whole held-out axis is "unseen payload on a
+    seen scenario"; drawing the attacker's target from the full catalogue would
+    put val/test tool names into training payloads and burn that axis.
+    """
+
+    by_tool: dict[str, dict[str, str]] = {}
+    for _split, rec in iter_split_rows(root, (split,)):
+        attacker_tools = rec.get("attacker_tools") or []
+        if not attacker_tools:
+            continue
+        name = str(attacker_tools[0]).strip()
+        if not name:
+            continue
+        spec = tools.get(name)
+        by_tool.setdefault(name, {
+            "tool": name,
+            "description": spec.description if spec is not None else "",
+            "goal_text": str(rec.get("expected_achievements", "")).strip(),
+        })
+    # Sorted by tool name: sample_goal indexes into this list by sha1(task_id),
+    # so file order must not decide which sink a task targets.
+    return [by_tool[k] for k in sorted(by_tool)]
+
+
 class InjecAgentEnv(SimulatedToolEnv):
     """InjecAgent tasks from ``data/InjecAgent``."""
 
@@ -234,6 +295,7 @@ class InjecAgentEnv(SimulatedToolEnv):
         self._tools, self._toolkits = load_tool_catalogue(self._root)
         self._fillers = load_benign_fillers(self._root)
         self._sim_exact, self._sim_default = load_simulated_responses(self._root)
+        self._goal_candidates = load_harmful_goal_candidates(self._root, self._tools)
         self._tasks: list[Task] = []
         self._tools_by_task: dict[str, list[ToolSpec]] = {}
         self._load()
@@ -354,6 +416,11 @@ class InjecAgentEnv(SimulatedToolEnv):
                     "tool_response_template": str(rec.get("tool_response_template", "")),
                     "user_level": str(rec.get("user_level", "")),
                     "user_case_index": rec.get("user_case_index"),
+                    # Out-of-scope sinks for the attacker's own objective; train
+                    # split only, minus this task's own carrier (which is
+                    # in-scope for it). See load_harmful_goal_candidates.
+                    GOAL_CANDIDATES_KEY: [c for c in self._goal_candidates
+                                          if c["tool"] != user_tool],
                 },
             )
             self._tools_by_task[uid] = [spec]
@@ -373,6 +440,7 @@ class InjecAgentEnv(SimulatedToolEnv):
 
 __all__ = [
     "DATASET_NAME",
+    "GOAL_CANDIDATE_SPLIT",
     "PLACEHOLDER",
     "SPLITS",
     "InjecAgentEnv",
@@ -380,6 +448,7 @@ __all__ = [
     "injecagent_root",
     "iter_split_rows",
     "load_benign_fillers",
+    "load_harmful_goal_candidates",
     "load_simulated_responses",
     "load_tool_catalogue",
     "task_uid",

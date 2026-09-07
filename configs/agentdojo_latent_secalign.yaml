@@ -1,0 +1,125 @@
+# Baseline arm: Meta-SecAlign-8B on AgentDojo-Latent.
+#
+# EVAL-ONLY. One of the six cells of the camouflage probe (3 arms x 2 datasets).
+# Read configs/agentdojo_latent_probe.yaml for the probe's design and Δ caveat and
+# data/agentdojo_latent/README.md before quoting a number; everything below that
+# is not the arm itself is copied from there unchanged, because the arms are only
+# comparable if nothing else moves.
+#
+# `defense.agent: secalign` is a DIFFERENT BASE MODEL, not a different prompt:
+# Meta-SecAlign-8B is a LoRA on Llama-3.1-8B-Instruct, served on :8008 with
+# `--tokenizer <metasecalign dir>` (the adapter ships its own chat template) and
+# hot-registered as `metasecalign`. Pass that name as run_replay_heldout.sh's
+# first argument -- with `none` this cell silently measures bare Llama-3.1.
+#
+# The agent's job is the message SHAPE: each raw tool observation goes into the
+# custom `input` chat role, verbatim, with no delimiters. That role IS the
+# defense; flattening the transcript into one user turn (what the `llm` agent
+# does) hands every payload full instruction authority and measures a defense
+# that was never engaged. Two consequences for the write-up:
+#   * the base/ShieldAgent arms see one flat user string and this arm a
+#     structured conversation. That confound is the intervention, not a bug, but
+#     it cannot be silently dropped from the comparison;
+#   * so is the base model. latent-vs-stock WITHIN this arm is still clean (same
+#     model, same shape, only the payload moves), and that within-arm Δ effect is
+#     what this cell contributes. Cross-arm absolute ASR is not a fair fight.
+#
+# How to run it (SecAlign :8008, tool executor :8003, judge :8004):
+#
+#   EVOGUARD_REPLAY_CONFIG=configs/agentdojo_latent_secalign.yaml \
+#   EVOGUARD_REPLAY_DATASET_DIR=data/agentdojo_latent \
+#   EVOGUARD_REPLAY_SPLIT= scripts/run_replay_heldout.sh metasecalign adjlatent_secalign
+#
+# `EVOGUARD_REPLAY_SPLIT=` (empty) is MANDATORY -- the probe declares no
+# metadata["split"], so a task filter would match nothing.
+
+name: evoguard_agentdojo_latent_secalign
+
+defense:
+  agent: secalign
+  llm:
+    backend: openai
+    model: llama3.1-8b-it
+    base_url: http://127.0.0.1:8008/v1
+    api_key: EMPTY
+    # Overridden by run_replay_heldout.sh's first argument; named here so the
+    # config alone documents which adapter this cell means.
+    lora_adapter: metasecalign
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+    enable_thinking: false
+  max_turns: 18
+
+# Present because ExperimentConfig requires it; the probe replays authored
+# observations and never invokes the attacker.
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: agentdojo_latent
+  data_root: data
+  suites: []
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  turning_point_method: llm_then_scan
+
+training:
+  enabled: false
+  base_model: /root/paddlejob/workspace/yangxiao/models/Meta-Llama-3.1-8B-Instruct
+  method: native_sft
+  dry_run: true
+
+pipeline:
+  max_rounds: 1
+  validation_fraction: 0.0
+  task_concurrency: 8
+  attack_concurrency: 8
+  validate_every_round: false
+  val_split: ""
+
+evo_data_subdir: "agentdojo_latent"

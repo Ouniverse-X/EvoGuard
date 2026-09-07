@@ -10,7 +10,7 @@
 set -euo pipefail
 
 CONFIG="${1:-configs/agentdojo_full_v4grpo_v2_test.yaml}"
-PY=/ssd1/conda_envs/evoguard/bin/python
+PY="${EVOGUARD_PY_BIN:-/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python}"
 
 echo "[preflight] config: $CONFIG"
 echo "[preflight] python: $PY ($($PY -V 2>&1))"

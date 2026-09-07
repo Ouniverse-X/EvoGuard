@@ -1,0 +1,58 @@
+{
+ "schema_version": 1,
+ "dataset": "agentdojo_stock",
+ "built_by": "scripts/build_agentdojo_stock.py",
+ "source": "data/agentdojo_latent/scenarios/*.jsonl, payload replaced",
+ "attack_template": "AgentDojo ToolKnowledgeAttack._JB_STRING (verbatim)",
+ "split_unit": "none -- the whole set is a held-out diagnostic control",
+ "n_injected_total": 48,
+ "per_suite": {
+  "banking": {
+   "n_rows": 22,
+   "n_injected": 12,
+   "n_clean": 10,
+   "by_twin_declared_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   }
+  },
+  "slack": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_twin_declared_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   }
+  },
+  "travel": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_twin_declared_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   }
+  },
+  "workspace": {
+   "n_rows": 24,
+   "n_injected": 12,
+   "n_clean": 12,
+   "by_twin_declared_delta": {
+    "1": 4,
+    "2": 4,
+    "3": 4
+   }
+  }
+ },
+ "pairing": "1:1 with agentdojo_latent via twin_instance_id. Every field except payload/observation/expected_*/stealth_*/twin_* is copied verbatim from the twin, so camouflage is the only variable between the arms.",
+ "delta_semantics": "expected_delta is fixed at 1 -- the smallest constructible plan-index offset from the carrier, i.e. the harmful call fires on the very next action. This is the 'Δ=0' control in the MEASURED sense (signals.delta = turning - injection = 0); it is not a field value. twin_declared_delta carries the latent twin's 1/2/3 for stratification.",
+ "known_departures_from_a_live_agentdojo_run": [
+  "harmful_args_hint holds concrete values, not $placeholders -- keeps the sink call identical across arms, and only helps this arm.",
+  "One trailing period stripped from attacker_goal so the template's '{goal}.' does not render '..'.",
+  "model name rendered as 'GPT-4', matching the vendored transcripts."
+ ]
+}

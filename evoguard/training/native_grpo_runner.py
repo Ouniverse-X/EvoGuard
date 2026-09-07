@@ -469,6 +469,360 @@ def _install_nonfinite_grad_guard(trainer, diag_state: dict) -> None:
     trainer.create_optimizer = _create_optimizer_with_guard
 
 
+def _install_phase_timers(trainer, diag_state: dict) -> None:
+    """Time the rollout+scoring phase so ``fit_seconds`` can be attributed.
+
+    Before this, the only wall-clock number the round reported was
+    ``fit_seconds``, which made the measured ~13 s/prompt unattributable between
+    generation, the policy/reference logprob forwards, blocking judge HTTP and
+    backward. TRL does have its own ``profiling_context``, but on this
+    configuration it is a dead end: ``trl/extras/profiling.py:63-68`` forwards
+    ``profiling/Time taken: ...`` to wandb/mlflow ONLY, and ``report_to=[]`` here,
+    so those durations never reach ``logs`` or ``self._metrics``.
+
+    Wraps ``_generate_and_score_completions`` as a BOUND method on the instance,
+    which covers both the plain ``GRPOTrainer`` and ``_DeltaShapedGRPOTrainer``
+    (whose own override is what gets wrapped, so GDPO / trajectory pooling / Δ
+    shaping are all inside the measured window and none of them is perturbed --
+    the wrapper only reads a clock).
+
+    Combined with the reward function's own ``reward_seconds`` this yields a
+    three-way split of the round:
+
+        judge+reward        = reward_seconds
+        generate+logprobs   = gen_score_seconds - reward_seconds
+        backward+optimizer  = fit_seconds - gen_score_seconds
+    """
+    import types
+    import time as _time
+
+    diag_state.setdefault("gen_score_seconds", 0.0)
+    diag_state.setdefault("gen_score_calls", 0)
+    inner = getattr(trainer, "_generate_and_score_completions", None)
+    if inner is None:                       # pragma: no cover - TRL API drift
+        logger.warning("[native_grpo] no _generate_and_score_completions to time; "
+                       "phase timings will be absent from the plan JSON.")
+        return
+    if getattr(trainer, "_evoguard_phase_timed", False):
+        return
+    _orig = inner
+
+    def _timed(self, *args, **kwargs):      # noqa: ARG001 - self unused, bound for symmetry
+        t0 = _time.perf_counter()
+        try:
+            return _orig(*args, **kwargs)
+        finally:
+            diag_state["gen_score_seconds"] += _time.perf_counter() - t0
+            diag_state["gen_score_calls"] += 1
+
+    trainer._generate_and_score_completions = types.MethodType(_timed, trainer)
+    trainer._evoguard_phase_timed = True
+
+
+def _enter_colocate_env() -> dict[str, Optional[str]]:
+    """Set the env vars vLLM colocate needs; return the previous values.
+
+    Two independent requirements, both read at engine-construction time:
+
+    * ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` -- with multiprocessing on, the V1
+      ``LLMEngine`` (``vllm/v1/engine/llm_engine.py:129-131``) does not expose
+      ``.model_executor``, and TRL's ``_move_model_to_vllm`` reaches through
+      ``llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner
+      .model`` to push the merged LoRA weights in. Without it the per-step weight
+      sync -- the only thing that keeps generation ON-POLICY -- raises.
+    * ``RANK``/``LOCAL_RANK``/``WORLD_SIZE``/``MASTER_ADDR``/``MASTER_PORT`` --
+      TRL passes ``distributed_executor_backend="external_launcher"``, and vLLM's
+      ``ExecutorWithExternalLauncher`` initialises the process group with
+      ``env://``, so it expects a launcher to have set these. world_size is 1
+      here (``native_runner`` is deliberately single-process; DDP would split a
+      G-sibling group across ranks and break GDPO/pooling/Δ silently), so setting
+      them in-process is enough and no torchrun is involved.
+
+    Mirrors the save/restore contract of ``_set_cuda_visible_devices`` so the
+    caller can undo it in a ``finally``.
+    """
+    keys = {
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "MASTER_ADDR": "127.0.0.1",
+        # Fixed rather than random: world_size==1 means nothing else ever dials
+        # this port, and a deterministic value keeps logs comparable.
+        "MASTER_PORT": os.environ.get("EVOGUARD_COLOCATE_MASTER_PORT", "29513"),
+    }
+    prev: dict[str, Optional[str]] = {}
+    for k, v in keys.items():
+        prev[k] = os.environ.get(k)
+        os.environ[k] = v
+    logger.info("[native_grpo] colocate env set: %s",
+                {k: os.environ[k] for k in keys})
+    return prev
+
+
+def _restore_env(prev: dict[str, Optional[str]]) -> None:
+    for k, v in (prev or {}).items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def _release_colocate_engine(trainer) -> None:
+    """Drop the colocated vLLM engine's GPU memory. MUST precede group teardown.
+
+    ``destroy_model_parallel()`` / ``destroy_distributed_environment()`` clear the
+    *process groups*; they do not free a single byte of the engine's weights or KV
+    cache. Those live behind ``GRPOTrainer.llm`` (``trl/trainer/grpo_trainer.py:657``
+    assigns it in the constructor), and ``trainer`` stays referenced by this
+    function's frame -- and by the callbacks ``_install_nonfinite_grad_guard`` /
+    ``_install_phase_timers`` attach -- for the rest of the round. So the engine
+    survives its own teardown, and with ``sft_then_native_grpo`` running every round
+    in ONE process it survives into the next round too. Measured on run
+    20260907_131715, free memory on the trainer card at the settle immediately
+    before each engine was built:
+
+        r5  64.09 GiB   (policy only, ~15 GiB resident)
+        r6  29.47 GiB   (+34.6 GiB: r5's engine never went away)
+        r7  ---         OOM in Trainer._move_model_to_device, 67.88 MiB free,
+                        before the engine was even reached
+
+    i.e. ~20 GiB leaked per colocate round, fatal on the third. The offline
+    three-engine gate had already shown it -- free memory before each engine fell
+    70.57 -> 52.79 -> 35.09 -> 17.39 GiB -- and it was wrongly dismissed as
+    pre-settle measurement noise. A FOURTH engine would have failed there.
+
+    vLLM's own ``parallel_state.cleanup_dist_env_and_memory`` (line 1905) is the
+    same sequence minus this step, because its callers are tests that let the
+    ``LLM`` local go out of scope first. Nothing here does, so the reference has to
+    be dropped by hand. ``gc.collect()`` is required rather than optional: the
+    engine is reachable through cycles, so ``del`` alone does not free it -- and
+    the collect only works after ``gc.unfreeze()``, see
+    ``_collect_and_empty_cache``.
+    """
+    if trainer is None:
+        # Reached from the trainer-ctor error path, where the half-built object is
+        # already unreachable. No handle to drop, but the collect still matters --
+        # the ctor may have created the engine before raising.
+        _clear_vllm_signature_cache()
+        _collect_and_empty_cache()
+        return
+    engine = getattr(trainer, "llm", None)
+    if engine is None:
+        return
+
+    free_before = _cuda_free_gib()
+    try:
+        trainer.llm = None
+    except Exception as exc:                                                # noqa: BLE001
+        logger.warning("[native_grpo] could not clear trainer.llm: %s", exc)
+        return
+    del engine
+    _clear_vllm_signature_cache()
+    _collect_and_empty_cache()
+    free_after = _cuda_free_gib()
+    if free_before is not None and free_after is not None:
+        logger.info("[native_grpo] released colocate vLLM engine: free %.2f -> "
+                    "%.2f GiB (+%.2f GiB reclaimed)",
+                    free_before, free_after, free_after - free_before)
+    else:
+        logger.info("[native_grpo] released colocate vLLM engine "
+                    "(free-memory readback unavailable)")
+
+
+def _clear_vllm_signature_cache() -> None:
+    """Evict the ONE reference that outlives everything else: an lru_cache key.
+
+    ``vllm.utils.func_utils.supports_kw`` is ``@lru_cache``-decorated and takes the
+    callable as its first argument (``func_utils.py:47-54``). vLLM's model-protocol
+    checks call it with **bound methods of the model instance**:
+    ``_check_vllm_model_init`` passes ``model.__init__``
+    (``model_executor/models/interfaces_base.py:60-61``) and
+    ``_check_vllm_model_forward`` passes ``model.forward`` once per keyword in
+    ``("input_ids", "positions")`` (``:76-82``). A bound method holds a strong ref
+    to ``__self__``, so those three cache keys pin the entire
+    ``Qwen2ForCausalLM`` -- 14.19 GiB of weights -- for the lifetime of the
+    process, no matter what happens to the engine that built it.
+
+    ``ia_leak_trace`` stage 2 measured exactly this: after release the whole chain
+    down to ``GPUModelRunner`` was freed and ONLY the model survived, referred to
+    by ``method[Qwen2ForCausalLM.__init__]`` (1 key tuple) and
+    ``method[Qwen2ForCausalLM.forward]`` (2 key tuples), every one of them held by
+    a ``functools._lru_cache_wrapper``. 1 + 2 keys is the exact call pattern above.
+
+    This is why ``gc.unfreeze()`` + ``gc.collect()`` reclaimed only 2.40 of 20.09
+    GiB: the retention is not a cycle, it is a live strong reference from a
+    module-level memo table.
+
+    Clearing it is cheap and safe -- the cache memoises ``inspect.signature``
+    lookups, so the cost is a handful of introspection calls the next time an
+    engine is built.
+    """
+    try:
+        from vllm.utils.func_utils import supports_kw
+
+        supports_kw.cache_clear()
+    except Exception as exc:                                                # noqa: BLE001
+        logger.warning("[native_grpo] could not clear vllm supports_kw cache "
+                       "(colocate engine weights may stay resident): %s", exc)
+
+
+def _collect_and_empty_cache() -> None:
+    """``gc.unfreeze()`` -> ``gc.collect()`` -> ``torch.cuda.empty_cache()``.
+
+    The ``unfreeze()`` is the load-bearing line, not defensive tidying.
+    ``EngineCore.__init__`` ends with ``freeze_gc_heap()``
+    (``v1/engine/core.py:221`` -> ``utils/gc_utils.py:96``), which does
+    ``gc.collect(0/1/2)`` then ``gc.freeze()``: every gc-tracked object alive at
+    that instant -- i.e. the whole engine graph, weights included -- is moved to
+    the permanent generation. Frozen objects are never scanned by ``gc.collect()``
+    and never reported by ``gc.get_referrers()``. So dropping ``trainer.llm`` and
+    collecting cannot break the engine's reference cycles, and the ~17.7 GiB
+    stays resident.
+
+    Measured by ``ia_leak_trace``: after release, ``LLM`` and ``LLMEngine`` were
+    freed but ``EngineCore`` -> ``ExecutorWithExternalLauncher`` ->
+    ``WorkerWrapperBase`` -> ``GPUModelRunner`` -> ``Qwen2ForCausalLM`` were all
+    still ALIVE, and ``gc.get_referrers(EngineCore)`` returned NOTHING at all --
+    not even this module's own globals dict, which is the fingerprint of a frozen
+    heap rather than of a locatable holder. Only 2.30 GiB came back, the part
+    allocated after the freeze.
+
+    This is why vLLM's own ``cleanup_dist_env_and_memory`` opens with
+    ``gc.unfreeze()`` (``distributed/parallel_state.py:1920``).
+
+    Unfreezing is safe here: the freeze is purely a GC-pause optimisation for
+    long-lived serving processes, and this process is about to build a fresh
+    engine that will freeze again.
+    """
+    import gc
+
+    gc.unfreeze()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:                                                # noqa: BLE001
+        logger.warning("[native_grpo] empty_cache() after engine release failed: %s",
+                       exc)
+
+
+def _cuda_free_gib() -> Optional[float]:
+    """Free GiB on the current device, or ``None`` if CUDA is not usable."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.mem_get_info()[0] / 2**30
+    except Exception:                                                       # noqa: BLE001
+        return None
+
+
+def _teardown_colocate_process_group() -> None:
+    """Tear down ALL distributed state vLLM's colocate executor left behind.
+
+    Two layers, and clearing only one is worse than clearing neither. A THIRD
+    concern -- the engine's ~20 GiB of weights and KV cache -- is NOT handled here;
+    see ``_release_colocate_engine``, which must run BEFORE this.
+
+    Layer 1 -- torch's process group. Restoring ``RANK``/``WORLD_SIZE`` is NOT
+    enough: ``ExecutorWithExternalLauncher`` calls ``init_process_group("env://")``
+    inside the ``LLM`` constructor, and that group outlives both the engine and the
+    env vars. It stays initialised for the remainder of the process, which breaks
+    the NEXT round rather than this one:
+
+        peft/utils/save_and_load.py:813
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                _maybe_shard_state_dict_for_tp(...)
+
+    That branch does ``from transformers.integrations.tensor_parallel import
+    ... EmbeddingParallel ...``, a name transformers 4.57.6 does not export (the
+    other three in the same import DO exist), so every warm-start after the first
+    colocate round dies with ``ImportError: cannot import name 'EmbeddingParallel'``.
+    Measured on run 20260907_012023: r0 SFT and r1 GRPO trained, then r2-r8 each
+    raised at ``PeftModel.from_pretrained(grpo_native/r1/adapter_weights)``, wrote
+    no weights, and left every val replaying the frozen r1 adapter -- 7 rounds of
+    silent no-op whose only symptom was an unchanged ``adapter=`` in the val line.
+    A 2-round A/B cannot see this; it needs a SECOND GRPO round.
+
+    Layer 2 -- vLLM's own cached ``GroupCoordinator``s, which live in module
+    globals (``parallel_state._WORLD/_TP/_PP/_DP/_EP/...``) and do NOT notice
+    torch's group going away. Destroying layer 1 alone is what killed the first
+    attempt at this fix (run 20260907_102325): r2 trained, tore down torch's PG,
+    and r3's ``LLM(...)`` then died in ``ensure_model_parallel_initialized`` ->
+    ``get_backend`` with ``ValueError: Process group <...> is not initialized in
+    the world group map`` -- it re-used the stale cached coordinator. So vLLM's
+    state must go FIRST; ``destroy_distributed_environment()`` also calls
+    ``torch.distributed.destroy_process_group()`` itself, and the raw call below
+    is only a fallback for the case where vLLM is not importable or left the
+    group up anyway.
+
+    Torn down per round rather than once at exit because
+    ``sft_then_native_grpo`` runs every round in the same process. Also silences
+    the ``destroy_process_group() was not called before program exit`` warning.
+    """
+    try:
+        from vllm.distributed.parallel_state import (
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+    except Exception as exc:                                            # noqa: BLE001
+        logger.warning("[native_grpo] could not import vLLM teardown helpers "
+                       "(next colocate round may fail): %s", exc)
+    else:
+        try:
+            destroy_model_parallel()
+            destroy_distributed_environment()
+            logger.info("[native_grpo] destroyed vLLM colocate distributed state "
+                        "(model-parallel groups + world group)")
+        except Exception as exc:                                        # noqa: BLE001
+            logger.warning("[native_grpo] vLLM distributed teardown failed: %s", exc)
+
+    try:
+        import torch.distributed as dist
+    except Exception:                                                   # noqa: BLE001
+        return
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    try:
+        dist.destroy_process_group()
+        logger.info("[native_grpo] destroyed colocate torch.distributed group "
+                    "(keeps peft's TP-shard branch out of the next warm-start)")
+    except Exception as exc:                                            # noqa: BLE001
+        # Non-fatal: worst case the next warm-start hits the ImportError above,
+        # which is loud. Never let cleanup mask the round's real outcome.
+        logger.warning("[native_grpo] destroy_process_group() failed: %s", exc)
+
+
+def _trainer_seed(round_label: str) -> int:
+    """Seed handed to ``GRPOConfig``.
+
+    Default mixes the wall clock in, so two runs of the same round explore
+    differently. ``EVOGUARD_GRPO_SEED`` pins it instead, which is what makes a
+    generation-backend A/B readable: with the clock in the seed, the two arms
+    differ in prompt ORDER and sampling stream as well as in backend, and any
+    reward gap is unattributable. Pinning does NOT make the arms bit-identical --
+    vLLM and HF ``generate`` do not share a sampler implementation -- so the
+    comparison is between reward MEANS, and a large systematic gap means the
+    per-step weight resync is not landing, not that colocate is "different".
+
+    The parenthesisation is load-bearing: ``^`` binds LOOSER than ``&``, so
+    without it ``abs(hash(...))`` survives the mask and ``GRPOConfig`` rejects
+    the value with "Seed must be between 0 and 2**32 - 1".
+    """
+    pinned = os.environ.get("EVOGUARD_GRPO_SEED")
+    if pinned:
+        try:
+            return int(pinned) & 0xFFFFFFFF
+        except ValueError:
+            logger.warning("[native_grpo] EVOGUARD_GRPO_SEED=%r is not an int; ignoring.",
+                           pinned)
+    return (abs(hash(round_label)) ^ int(time.time())) & 0xFFFFFFFF
+
+
 # --------------------------------------------------------------------------- #
 # Outcome container                                                            #
 # --------------------------------------------------------------------------- #
@@ -688,6 +1042,13 @@ def build_evoguard_reward_callable(
     outage does not bias ``r_safety`` -- it deletes the safety gradient while the
     reward mean, the loss and the gradient norm all keep looking healthy. A round
     whose tally is dominated by ``fallback`` trained progress only.
+    The returned function also carries ``reward_seconds``: a ONE-ELEMENT LIST
+    accumulating the wall-clock seconds spent inside the reward function over the
+    whole round. A list rather than a float because the caller holds the reference
+    before the first call and floats are immutable. This is the only way to split
+    ``fit_seconds`` into "the generator is slow" vs "the judges are slow": both
+    judges are BLOCKING HTTP called from here, so this counter is the
+    judge-attributable share of training time.
     """
 
     import threading
@@ -697,6 +1058,11 @@ def build_evoguard_reward_callable(
     #: ``"{safety_source}:{safety_label}"`` -> count, over the whole round.
     safety_tally: dict[str, int] = {}
     _tally_lock = threading.Lock()
+
+    #: Accumulated seconds inside ``_evoguard_reward_func``. Mutated from the
+    #: main thread only (TRL calls reward funcs serially per generation batch),
+    #: so it needs no lock even though scoring fans out internally.
+    _reward_seconds: list[float] = [0.0]
 
     # Lazy-init judge once across all invocations within this round to amortize
     # tokenizer/client construction cost over potentially hundreds of inner steps.
@@ -773,6 +1139,7 @@ def build_evoguard_reward_callable(
             return None
 
     def _evoguard_reward_func(prompts, completions, **kwargs):
+        _t_rf0 = time.perf_counter()
         # Recover parallel-aligned row indices supplied via dataset column.
         raw_row_idx = kwargs.get("row_idx", [])
         try:
@@ -880,10 +1247,12 @@ def build_evoguard_reward_callable(
                     reward_trace_sink.append(trace)
             except Exception:                                          # noqa: BLE001
                 pass
+        _reward_seconds[0] += time.perf_counter() - _t_rf0
         return results_floats
 
     _evoguard_reward_func.__name__ = "evoguard_defense_rl_reward"
     _evoguard_reward_func.safety_tally = safety_tally     # type: ignore[attr-defined]
+    _evoguard_reward_func.reward_seconds = _reward_seconds  # type: ignore[attr-defined]
     return _evoguard_reward_func
 
 
@@ -1037,7 +1406,19 @@ def train_native_grpo(
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
 
         from evoguard.training._trl_compat import patch_trl_probes
-        patch_trl_probes()
+        # Shim 3 decides what ``trl.trainer.grpo_trainer`` imports at MODULE scope,
+        # so the colocate flag has to be known here -- before the ``from trl``
+        # below -- not down at B3 where the rest of the GRPOConfig knobs are read.
+        # A False return means the vLLM aliases could not be installed; B3 honours
+        # it and stays on HF ``generate`` rather than letting GRPOTrainer.__init__
+        # raise ImportError.
+        want_vllm_colocate = bool(getattr(training_cfg, "grpo_use_vllm_colocate", False))
+        vllm_backend_live = patch_trl_probes(enable_vllm=want_vllm_colocate)
+        if want_vllm_colocate and not vllm_backend_live:
+            logger.warning(
+                "[native_grpo] grpo_use_vllm_colocate=True but TRL's vLLM backend "
+                "could not be bridged onto this vLLM; generating with HF generate."
+            )
         from trl import GRPOConfig, GRPOTrainer                      # type: ignore
 
         # -------------------------------------------------------------- #
@@ -1120,6 +1501,8 @@ def train_native_grpo(
         eps_clip=float(getattr(training_cfg,"grpo_clip_epsilon",0.20))
         beta_kl=float(getattr(training_cfg,"grpo_beta",0.04))
         temp_roll=float(getattr(training_cfg,"grpo_rollout_temperature",0.90))
+        use_vllm_colocate=want_vllm_colocate and vllm_backend_live
+        vllm_mem_util=float(getattr(training_cfg,"grpo_vllm_gpu_memory_utilization",0.25) or 0.25)
 
         st_args=dict(
             output_dir=os.path.join(out_root,"trl_state"),
@@ -1140,8 +1523,16 @@ def train_native_grpo(
             max_completion_length=512,
             max_prompt_length=2048,
             beta=beta_kl,
-            use_vllm=False,             # local inference-only rollouts initially safer than external server wiring complexity;
-                                        # flip to True+vllm_mode='server' later when wall-clock matters most.
+            # Generation backend. False = HF `generate`, one unbatched decode per
+            # completion, which is what made a round cost ~13 s/prompt. True +
+            # colocate = an in-process vllm.LLM on the trainer's own device with a
+            # per-step weight resync (GRPO must stay on-policy, so the long-lived
+            # :8000 server -- adapter reloaded once per ROUND -- cannot serve it).
+            # vllm_mode="server" is unavailable on vllm 0.19.1: importing
+            # trl.scripts.vllm_serve raises ImportError on GuidedDecodingParams.
+            use_vllm=use_vllm_colocate,
+            vllm_mode="colocate",
+            vllm_gpu_memory_utilization=vllm_mem_util,
             # 轨C.3: K>1 makes ONE generation batch cover exactly one trajectory
             # (G siblings x K steps). Pinned together with shuffle_dataset=False
             # because TRL's RepeatSampler with shuffle=False walks range(N) in
@@ -1164,7 +1555,7 @@ def train_native_grpo(
             report_to=[],
             disable_tqdm=True,
             dataloader_num_workers=0,
-            seed=(abs(hash(round_label))^int(time.time())) & 0xFFFFFFFF,  # parens required: ^ has LOWER precedence than &, otherwise abs(hash()) can exceed uint32 -> GRPOConfig rejects "Seed must be between 0 and 2**32 - 1"
+            seed=_trainer_seed(round_label),
             remove_unused_columns=False,
             logging_first_step=True,
             logging_steps=1,
@@ -1186,6 +1577,33 @@ def train_native_grpo(
         except Exception:                                                 # noqa: BLE001
             sig_params=set()
         cleaned_st_args={k:v for k,v in st_args.items() if not sig_params or k in sig_params}
+        # Name the dropped keys. This filter is silent by construction, so a kwarg
+        # that TRL renamed or never had (e.g. vllm_gpu_memory_utilization) simply
+        # vanishes and the run looks configured when it is not.
+        dropped_keys=sorted(set(st_args) - set(cleaned_st_args))
+        if dropped_keys:
+            logger.warning(
+                "[native_grpo] GRPOConfig does NOT accept %d kwarg(s), DROPPED: %s "
+                "-- whatever they were meant to switch on is OFF this round.",
+                len(dropped_keys), dropped_keys,
+            )
+        if use_vllm_colocate:
+            missing=[k for k in ("use_vllm","vllm_mode","vllm_gpu_memory_utilization")
+                     if k not in cleaned_st_args]
+            if missing:
+                raise RuntimeError(
+                    "grpo_use_vllm_colocate=True but this TRL build does not accept "
+                    f"{missing}; refusing to run, because the round would silently "
+                    "fall back to HF generate and its timings would be reported as "
+                    "the colocate numbers."
+                )
+            logger.info(
+                "[native_grpo] vLLM COLOCATE generation ENABLED "
+                "(vllm_gpu_memory_utilization=%.2f of the whole trainer card). "
+                "Weights resync into the engine every optimizer step; advantage "
+                "maths is untouched, so a change in mean_reward vs use_vllm=False "
+                "is a bug, not a speedup.", vllm_mem_util,
+            )
 
         cap_ms=int(getattr(training_cfg,"native_max_steps_per_round",0))
         if cap_ms>0:
@@ -1206,6 +1624,8 @@ def train_native_grpo(
         )
 
         diag_state={"step_counter":0,"first_rewards":[],"last_rewards":[],"kl_trace":[],
+                    "reward_std_trace":[],"frac_reward_zero_std_trace":[],
+                    "gen_score_seconds":0.0,"gen_score_calls":0,
                     "delta_shaping_applied_count": 0,
                     "delta_shaping_mean_scale": []}
         # CRITICAL: inherit from transformers.TrainerCallback so all lifecycle hooks
@@ -1215,17 +1635,51 @@ def train_native_grpo(
         #   AttributeError: '_DiagCallback' object has no attribute 'on_init_end'
         from transformers import TrainerCallback as _BaseCb  # local import keeps module-level deps lazy.
         class _DiagCallback(_BaseCb):
-            """Lightweight hook capturing diagnostics needed by outcome reporting."""
+            """Lightweight hook capturing diagnostics needed by outcome reporting.
+
+            Reward/KL collection lives in ``on_log``, NOT ``on_step_end``. Two bugs
+            were stacked here before (2026-09-07): ``Trainer`` invokes
+            ``on_step_end(args, state, control)`` WITHOUT a ``logs`` kwarg -- ``logs``
+            is only ever passed to ``on_log`` -- so the whole body was unreachable and
+            every ``mean_reward_before`` / ``mean_reward_after`` / ``kl_estimate_avg``
+            in the plan JSON came out ``null``; and the keys it looked for
+            (``rewards/mean``) are not the ones TRL emits. ``GRPOTrainer.log()``
+            merges ``self._metrics[mode]`` into ``logs`` before delegating to
+            ``Trainer.log`` (grpo_trainer.py ~:1446-1458), so the real key names are
+            ``reward`` / ``reward_std`` / ``frac_reward_zero_std`` / ``kl``.
+
+            ``frac_reward_zero_std`` is the saturation observable: it is the share of
+            prompt groups whose G siblings all scored identically, i.e. rows that
+            contribute exactly zero gradient. Historically 62-73%; the temperature
+            knob is only worth touching when this stays above ~0.5.
+            """
             def __init__(self,state): super().__init__() ; self._st=state
-            def on_step_end(self,args=None,state=None,control=None,model=None,logs=None,**kw):  # noqa: ARG002,D401
+            def on_step_end(self,args=None,state=None,control=None,model=None,**kw):  # noqa: ARG002,D401
                 self._st["step_counter"]+=1
-                if logs is not None:
-                    if self._st["step_counter"]==1 and "rewards/mean" in logs:
-                        self._st["first_rewards"].append(float(logs.get("rewards/mean")))
-                    if "rewards/mean" in logs:
-                        self._st["last_rewards"].append(float(logs.get("rewards/mean")))
-                    if "kl" in logs:
-                        self._st["kl_trace"].append(float(logs.get("kl")))
+
+            def on_log(self,args=None,state=None,control=None,logs=None,**kw):  # noqa: ARG002,D401
+                if not logs:
+                    return
+                def _f(key):
+                    try:
+                        return float(logs[key])
+                    except (KeyError, TypeError, ValueError):
+                        return None
+                r=_f("reward")
+                if r is not None:
+                    # "before" is the FIRST logged step (logging_first_step=True,
+                    # logging_steps=1), "after" is every step -- kept as a running
+                    # list so the reported mean is over the round, matching the
+                    # pre-existing field semantics.
+                    if not self._st["first_rewards"]:
+                        self._st["first_rewards"].append(r)
+                    self._st["last_rewards"].append(r)
+                for key,slot in (("reward_std","reward_std_trace"),
+                                 ("frac_reward_zero_std","frac_reward_zero_std_trace"),
+                                 ("kl","kl_trace")):
+                    v=_f(key)
+                    if v is not None:
+                        self._st[slot].append(v)
 
         cb=_DiagCallback(diag_state)
         lam_curriculum = float(getattr(training_cfg, "grpo_advantage_curriculum_lambda", 0.0) or 0.0)
@@ -1447,6 +1901,15 @@ def train_native_grpo(
             ctor_kwargs["_evoguard_gdpo"]=use_gdpo
             ctor_kwargs["_evoguard_diag"]=diag_state
 
+        # The colocated vLLM engine is built INSIDE GRPOTrainer.__init__ --
+        # trl/trainer/grpo_trainer.py does `self.llm = LLM(..., distributed_executor_backend
+        # ="external_launcher")` there, not lazily at first generation. So the env has to be
+        # live before the CONSTRUCTOR, not merely before train(); and it has to stay live
+        # through train(), because ExecutorWithExternalLauncher keeps using the
+        # torch.distributed group it initialised from `env://`. Restored afterwards so
+        # RANK/WORLD_SIZE cannot leak into the next round's SFT/accelerate path.
+        colocate_env_prev=_enter_colocate_env() if use_vllm_colocate else None
+
         try:
             if use_adv_hook:
                 trainer=_DeltaShapedGRPOTrainer(**ctor_kwargs)               # type: ignore[arg-type,misc]
@@ -1457,10 +1920,16 @@ def train_native_grpo(
         except Exception as ctor_exc:                                       # noqa: BLE001
             logger.exception("[native_grpo] GRPOTrainer instantiation raised:%s",ctor_exc)
             _append_plan_json(plan_log_path,{"phase":"trainer_ctor_error","err":str(ctor_exc)})
+            if colocate_env_prev is not None:
+                _restore_env(colocate_env_prev)
+                # locals() because the ctor is what raised: `trainer` may not exist.
+                _release_colocate_engine(locals().get("trainer"))
+                _teardown_colocate_process_group()
             # Re-raise for the same fail-fast reason as the fit() crash above.
             raise
 
         _install_nonfinite_grad_guard(trainer, diag_state)
+        _install_phase_timers(trainer, diag_state)
 
         # -------------------------------------------------------------- #
         # B5 Launch fit                                                   #
@@ -1483,6 +1952,13 @@ def train_native_grpo(
             # continue for 11 more rounds against a frozen defender (silent
             # per-round OOMs, observed 2026-08-16).
             raise
+        finally:
+            if colocate_env_prev is not None:
+                _restore_env(colocate_env_prev)
+                # Engine memory FIRST: destroying the process groups frees no bytes,
+                # and the next round loads its policy before it builds its engine.
+                _release_colocate_engine(trainer)
+                _teardown_colocate_process_group()
 
         # Capture diagnostic aggregates reported-back via callback hooks above.
         mr_before=(
@@ -1494,6 +1970,44 @@ def train_native_grpo(
         kl_est=(
             sum(diag_state["kl_trace"]) / max(1,len(diag_state["kl_trace"]))
             ) if diag_state["kl_trace"] else None
+
+        def _mean(trace_key):
+            vals = diag_state.get(trace_key) or []
+            return (sum(vals)/len(vals)) if vals else None
+
+        reward_std_avg = _mean("reward_std_trace")
+        frac_zero_std_avg = _mean("frac_reward_zero_std_trace")
+
+        # Phase attribution. reward_seconds is judge HTTP + reward arithmetic;
+        # gen_score_seconds is that PLUS generation and the policy/reference
+        # logprob forwards; whatever fit_seconds has left over is
+        # backward+optimizer. See _install_phase_timers.
+        reward_secs = float((getattr(reward_fn_closure, "reward_seconds", [0.0]) or [0.0])[0])
+        gen_score_secs = float(diag_state.get("gen_score_seconds", 0.0) or 0.0)
+        timing = {
+            "fit_seconds": round(fit_secs, 2),
+            "seconds_per_prompt": round(fit_secs/max(1,n_samples), 3),
+            "gen_score_seconds": round(gen_score_secs, 2),
+            "reward_judge_seconds": round(reward_secs, 2),
+            "generate_and_logprob_seconds": round(max(0.0, gen_score_secs - reward_secs), 2),
+            "backward_seconds": round(max(0.0, fit_secs - gen_score_secs), 2),
+            "gen_score_calls": int(diag_state.get("gen_score_calls", 0) or 0),
+        }
+        logger.info(
+            "[native_grpo] phase split over %.1fs: generate+logprobs %.1fs | "
+            "judge+reward %.1fs | backward+optim %.1fs (%.2fs/prompt)",
+            fit_secs, timing["generate_and_logprob_seconds"],
+            timing["reward_judge_seconds"], timing["backward_seconds"],
+            timing["seconds_per_prompt"],
+        )
+        if frac_zero_std_avg is not None:
+            logger.info(
+                "[native_grpo] reward_std=%.4f frac_reward_zero_std=%.3f -- the "
+                "latter is the share of prompt groups contributing ZERO gradient; "
+                "above ~0.5 the rollout temperature is the knob to reach for, not "
+                "the reward.", reward_std_avg if reward_std_avg is not None else float("nan"),
+                frac_zero_std_avg,
+            )
         n_pool_batches=int(diag_state.get("traj_pool_batches",0) or 0)
         n_pool_slots=int(diag_state.get("traj_pool_slots",0) or 0)
         if use_traj_pool:
@@ -1551,10 +2065,12 @@ def train_native_grpo(
 
         _append_plan_json(plan_log_path,{
             "phase":"success",
-            "fit_seconds":round(fit_secs,2),
+            **timing,
             "adapter_saved_at":os.path.abspath(saved_adapters_dir),
             "mean_reward_before":mr_before,
             "mean_reward_after":mr_after,
+            "reward_std_avg":reward_std_avg,
+            "frac_reward_zero_std_avg":frac_zero_std_avg,
             "kl_estimate_avg":kl_est,
             "steps_executed":diag_state["step_counter"],
             "traj_group_size_k":k_traj_steps,

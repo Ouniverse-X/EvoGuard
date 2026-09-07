@@ -1,0 +1,132 @@
+# Baseline arm: ShieldAgent guard in front of the base defender, on AgentDojo-Latent.
+#
+# EVAL-ONLY. One of the six cells of the camouflage probe (3 arms x 2 datasets).
+# Read configs/agentdojo_latent_probe.yaml for the probe's design and Δ caveat and
+# data/agentdojo_latent/README.md before quoting a number; everything below that
+# is not the arm itself is copied from there unchanged, because the arms are only
+# comparable if nothing else moves.
+#
+# `defense.agent: shieldagent_guard` keeps the SAME defender as the base arm
+# (`llm` on :8000) and adds a classifier in front of every proposed action: the
+# ShieldAgent model sees the dialogue up to and including the proposal and an
+# `unsafe` verdict replaces it with a refusal, ending the trajectory. So this
+# measures a guarded SYSTEM's ASR, not the classifier's detection accuracy.
+#
+# Read ASR here ONLY next to the over-blocking numbers, on BOTH datasets and on
+# the clean arm: a guard that refuses everything scores ASR 0 with BU 0.
+#   * cln.benign_utility / cln.false_alarm_rate -- what over-blocking costs
+#   * atk.utility_under_attack                  -- resisted AND still delivered
+# And check the guard-verdict tally (aggregated off `metadata.guard_verdict` by
+# scripts/summarize_latent_vs_stock.py): the guard FAILS OPEN on an unreadable
+# reply or a dead endpoint, so a run whose :8007 was down is indistinguishable
+# from the undefended base arm by ASR alone.
+#
+# How to run it (defender :8000, ShieldAgent :8007, tool executor :8003, judge :8004):
+#
+#   EVOGUARD_REPLAY_CONFIG=configs/agentdojo_latent_shieldagent.yaml \
+#   EVOGUARD_REPLAY_DATASET_DIR=data/agentdojo_latent \
+#   EVOGUARD_REPLAY_SPLIT= scripts/run_replay_heldout.sh none adjlatent_shieldagent
+#
+# `EVOGUARD_REPLAY_SPLIT=` (empty) is MANDATORY -- the probe declares no
+# metadata["split"], so a task filter would match nothing.
+
+name: evoguard_agentdojo_latent_shieldagent
+
+defense:
+  agent: shieldagent_guard
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  # The classifier. `max_tokens: 96` is sized on the `[Answer] safe|unsafe` line
+  # alone -- it comes FIRST in the trained format, so truncating the `[Analysis]`
+  # costs nothing but the debug string and keeps a per-action call cheap.
+  # `enable_thinking: false` is inert on this qwen2.5 template but harmless.
+  guard_llm:
+    backend: openai
+    model: shieldagent
+    base_url: http://127.0.0.1:8007/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 96
+    timeout: 120.0
+    max_retries: 3
+    enable_thinking: false
+  max_turns: 18
+
+# Present because ExperimentConfig requires it; the probe replays authored
+# observations and never invokes the attacker.
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: agentdojo_latent
+  data_root: data
+  suites: []
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  turning_point_method: llm_then_scan
+
+training:
+  enabled: false
+  base_model: /root/paddlejob/workspace/yangxiao/models/Qwen2.5-7B-Instruct
+  method: native_sft
+  dry_run: true
+
+pipeline:
+  max_rounds: 1
+  validation_fraction: 0.0
+  task_concurrency: 8
+  attack_concurrency: 8
+  validate_every_round: false
+  val_split: ""
+
+evo_data_subdir: "agentdojo_latent"

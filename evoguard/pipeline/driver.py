@@ -511,7 +511,7 @@ class Pipeline:
                         leaf_name = str(outcome.new_lora_adapter_name).split("::")[-1]
                         link_path = _os2.path.join(saves_root, f"{leaf_name}.adapter")
                         target_abs = _os2.path.abspath(lora_path)
-                        if _os2.islink(link_path) or _os2.path.exists(link_path):
+                        if _os2.path.islink(link_path) or _os2.path.exists(link_path):
                             _os2.remove(link_path)
                         try:
                             _os2.symlink(target_abs, link_path)
@@ -522,7 +522,7 @@ class Pipeline:
                         except OSError as sym_exc:
                             # Filesystem without symlink support -> copy directory tree as fallback.
                             import shutil as _shutil
-                            if _os2.isdir(link_path):
+                            if _os2.path.isdir(link_path):
                                 _shutil.rmtree(link_path)
                             _shutil.copytree(target_abs, link_path)
                             logger.info(
@@ -624,11 +624,26 @@ class Pipeline:
             os.path.join(self.exp_dir, "val_metrics.jsonl"),
             json_dump(summary),
         )
+        # BU/UA go on the same line as ASR because the three are only
+        # interpretable together, and each carries the count it was divided by:
+        # this replay emits one clean record per TASK but one attacked record per
+        # SCENARIO, so bu is a per-task rate and asr/ua are per-scenario. Either
+        # rate is None when its arm had nothing scorable (the utility judge fails
+        # CLOSED at 0.0, so "unscored" must stay distinguishable from "failed").
+        def _fmt(key: str) -> str:
+            val = summary.get(key)
+            return "n/a" if val is None else f"{float(val):.4f}"
+
         logger.info(
-            "[val] %s adapter=%s asr=%.4f f1=%.4f recall=%.4f precision=%.4f "
+            "[val] %s adapter=%s asr=%.4f bu=%s ua=%s "
+            "n_clean_eval=%d n_atk_eval=%d "
+            "f1=%.4f recall=%.4f precision=%.4f "
             "acc=%.4f cf=(tp=%d fn=%d fp=%d tn=%d) scenarios=%d tasks=%d",
             round_label, summary.get("adapter"),
             summary.get("attack_success_rate", float("nan")),
+            _fmt("benign_utility"), _fmt("utility_under_attack"),
+            summary.get("n_clean_evaluable", -1),
+            summary.get("n_attacked_evaluable", -1),
             summary.get("cf_f1", float("nan")), summary.get("cf_recall", float("nan")),
             summary.get("cf_precision", float("nan")), summary.get("cf_acc", float("nan")),
             summary.get("cf_tp", -1), summary.get("cf_fn", -1),
@@ -694,7 +709,7 @@ class Pipeline:
         term_reason = ""
         terminated = False
 
-        for rid in range(0, self.cfg.pipeline.max_rounds):
+        for rid in range(self.cfg.pipeline.start_round, self.cfg.pipeline.max_rounds):
             rr = self.run_one(
                 env=env, judge=judge, attackers=attackers, round_id=rid,
             )

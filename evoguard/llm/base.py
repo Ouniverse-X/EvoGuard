@@ -65,3 +65,39 @@ class LLMClient(abc.ABC):
         from evoguard.core.types import Role
 
         return self.chat([Message(role=Role.USER, content=prompt)], **kwargs).text
+
+    def text_completion(
+        self,
+        prompt: str,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+    ) -> LLMResponse:
+        """Complete a RAW prompt string, bypassing any chat template.
+
+        Needed by defenses whose protection *is* a text format that the served
+        model's chat template does not emit.
+        :class:`~evoguard.agents.struq_agent.StruQDefenseAgent` is the motivating
+        case: StruQ's trained delimiters (``[MARK] [INST] [COLN]`` / ``[INPT]`` /
+        ``[RESP]``) appear nowhere in the generic Llama-2 ``chat_template``
+        shipped inside its own checkpoint, so routing that arm through
+        :meth:`chat` would measure the base model under a mismatched format and
+        the defense would never engage. See ``docs/struq_arm_blockers.md``.
+
+        The default implementation degrades to :meth:`chat` with the prompt as a
+        single USER message, which keeps
+        :class:`~evoguard.llm.mock_client.MockClient` usable offline. Backends
+        with a real text-completion route should override it;
+        :class:`~evoguard.llm.openai_client.OpenAIClient` maps it onto
+        ``POST /v1/completions``.
+        """
+
+        from evoguard.core.types import Role
+
+        return self.chat(
+            [Message(role=Role.USER, content=prompt)],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=stop,
+        )

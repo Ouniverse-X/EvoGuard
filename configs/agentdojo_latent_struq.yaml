@@ -1,0 +1,118 @@
+# Baseline arm: StruQ (llama-7b_Spcl) on AgentDojo-Latent, the treatment cell.
+#
+# EVAL-ONLY. Twin of configs/agentdojo_stock_struq.yaml -- read THAT file's header
+# first: it carries the full rationale for this arm (why the wire route bypasses
+# /v1/chat/completions, why `env.suites` is cut to two, why the checkpoint is
+# served with RoPE interpolation, and why BU is not optional here). Only four
+# lines differ between the two configs: `name`, `env.dataset`, `evo_data_subdir`,
+# and the run command below. Everything else is byte-identical on purpose --
+# ASR(latent) - ASR(stock) is only the camouflage effect if nothing else moves.
+#
+# `env.suites: [banking, slack]` MUST stay identical to the stock cell. It is not
+# a tuning knob: travel and workspace overflow StruQ's 2048-token window on the
+# trusted channel alone, and if the two cells disagreed on the suite list the
+# pairing would be broken silently -- both replays would still finish and both
+# would still report an ASR.
+#
+# How to run it (StruQ :8005, tool executor :8003, judge :8004):
+#
+#   EVOGUARD_REPLAY_CONFIG=configs/agentdojo_latent_struq.yaml \
+#   EVOGUARD_REPLAY_DATASET_DIR=data/agentdojo_latent \
+#   EVOGUARD_REPLAY_SPLIT= scripts/run_replay_heldout.sh none adjlatent_struq
+#
+# `none` as the adapter: this arm has no LoRA, the weights themselves are the
+# defense. `EVOGUARD_REPLAY_SPLIT=` (empty) is MANDATORY -- the probe declares no
+# metadata["split"], so a task filter would match nothing.
+
+name: evoguard_agentdojo_latent_struq
+
+defense:
+  agent: struq
+  llm:
+    backend: openai
+    model: struq-llama7b
+    base_url: http://127.0.0.1:8005/v1
+    api_key: EMPTY
+    lora_adapter: null
+    temperature: 0.2
+    # 256, not the 1024 the other arms use -- see the stock cell's header: with a
+    # 4096 window, prompt+max_tokens>4096 is a 400 before the model runs.
+    max_tokens: 256
+    timeout: 120.0
+    max_retries: 3
+    enable_thinking: false
+  max_turns: 18
+
+# Present because ExperimentConfig requires it; the probe replays authored
+# observations and never invokes the attacker.
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: agentdojo_latent
+  data_root: data
+  # See the header: travel and workspace overflow StruQ's window on the trusted
+  # channel alone. Must match the stock cell exactly or the pairing is broken.
+  suites: [banking, slack]
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  turning_point_method: llm_then_scan
+
+training:
+  enabled: false
+  base_model: /root/paddlejob/workspace/yangxiao/models/struQ/llama-7b_Spcl
+  method: native_sft
+  dry_run: true
+
+pipeline:
+  max_rounds: 1
+  validation_fraction: 0.0
+  task_concurrency: 8
+  attack_concurrency: 8
+  validate_every_round: false
+  val_split: ""
+
+evo_data_subdir: "agentdojo_latent"

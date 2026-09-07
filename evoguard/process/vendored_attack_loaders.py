@@ -3,9 +3,9 @@
 ``eval/vendored_replay.py`` used to call
 :func:`~evoguard.process.vendored_attack_parser.load_all_vendored_attacks`
 directly, which hardcodes AgentDojo's ``data/toolsafe/<...>/*.json`` layout and
-its ``<INFORMATION>`` transcript scraping. ASB-OPI, InjecAgent and
-AgentDojo-Latent store their injections as first-class JSONL fields instead, so
-the replay entry point dispatches through this table.
+its ``<INFORMATION>`` transcript scraping. ASB-OPI, InjecAgent, AgentDojo-Latent
+and its AgentDojo-Stock control twin store their injections as first-class JSONL
+fields instead, so the replay entry point dispatches through this table.
 
 Every loader takes the same keyword-compatible signature
 ``(data_root, suites, dataset_dir, dataset) -> list[VendoredAttack]`` and is
@@ -19,9 +19,11 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from evoguard.envs.agentdojo_latent import DATASET_NAME as AGENTDOJO_LATENT_DATASET
+from evoguard.envs.agentdojo_stock import DATASET_NAME as AGENTDOJO_STOCK_DATASET
 from evoguard.envs.asb import DATASET_NAME as ASB_DATASET
 from evoguard.envs.injecagent import DATASET_NAME as INJECAGENT_DATASET
 from evoguard.process.agentdojo_latent_loader import load_agentdojo_latent_attacks
+from evoguard.process.agentdojo_stock_loader import load_agentdojo_stock_attacks
 from evoguard.process.asb_attack_loader import load_asb_attacks
 from evoguard.process.injecagent_attack_loader import load_injecagent_attacks
 from evoguard.process.vendored_attack_parser import (
@@ -33,6 +35,7 @@ VendoredAttackLoader = Callable[..., list[VendoredAttack]]
 
 _LOADERS: dict[str, VendoredAttackLoader] = {
     AGENTDOJO_LATENT_DATASET: load_agentdojo_latent_attacks,
+    AGENTDOJO_STOCK_DATASET: load_agentdojo_stock_attacks,
     ASB_DATASET: load_asb_attacks,
     INJECAGENT_DATASET: load_injecagent_attacks,
 }

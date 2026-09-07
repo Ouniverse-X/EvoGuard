@@ -24,6 +24,13 @@ and reject the request with a pydantic ``literal_error`` on
 ``body.response_format.type``. The rejection was indistinguishable from "this
 endpoint has no structured output", so rung 3 absorbed it and EVERY structured
 call in the project decoded unconstrained.
+
+``LLMConfig.enable_thinking=False`` is honoured here as
+``extra_body.chat_template_kwargs.enable_thinking=False`` -- a template variable,
+not a request field. It composes with rung 2 because that rung merges into any
+pre-existing ``extra_body`` rather than replacing it. It was a documented no-op
+until 2026-09-07, which is why the ~30 configs declaring it had no effect on any
+vLLM-served role.
 """
 
 from __future__ import annotations
@@ -125,7 +132,7 @@ class OpenAIClient(LLMClient):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         response_format: Optional[dict] = None,
-        enable_thinking: Optional[bool] = None,  # noqa: ARG002 - ignored on OpenAI-compatible
+        enable_thinking: Optional[bool] = None,
     ) -> LLMResponse:
         payload_messages = [m.to_dict() for m in messages]
         kwargs = {
@@ -140,6 +147,30 @@ class OpenAIClient(LLMClient):
         if self.config.extra:
             kwargs.update(self._merge_extra(self.config.extra))
 
+        # Thinking is turned off SERVER-SIDE, via the chat template. Qwen3.5's
+        # template emits `<think>\n\n</think>\n\n` when the variable is defined
+        # and false and a bare `<think>\n` otherwise, so this is the only lever a
+        # wire client has -- there is no OpenAI request field for it. Applied
+        # only for an explicit False (the dataclass default is True) so no
+        # existing call site's behaviour changes, and merged rather than assigned
+        # so a hand-written `extra.extra_body` (guided_json rung included) and a
+        # hand-written `chat_template_kwargs` both survive and win.
+        #
+        # Measured on Qwen3.5-9B with STEP_SAFETY_SCHEMA: 1.63 s thinking-on vs
+        # 0.35 s off, and the preamble spends the max_tokens budget before the
+        # constrained object closes. Grammar-constrained calls suppress the
+        # preamble on their own, so for the JSON judges this is a cost fix; for
+        # UNCONSTRAINED short-answer callers it is a correctness fix. Inert on
+        # non-thinking templates (qwen2.5 never reads the variable).
+        want_thinking = (self.config.enable_thinking if enable_thinking is None
+                         else bool(enable_thinking))
+        if want_thinking is False:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+            template_kwargs.setdefault("enable_thinking", False)
+            extra_body["chat_template_kwargs"] = template_kwargs
+            kwargs["extra_body"] = extra_body
+
         use_strict_mode = response_format is not None and not (
             self._schema_supported is False and self._guided_supported is False
         )
@@ -148,6 +179,61 @@ class OpenAIClient(LLMClient):
     # ------------------------------------------------------------------ #
     # Internal helpers                                                   #
     # ------------------------------------------------------------------ #
+    def text_completion(
+        self,
+        prompt: str,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+    ) -> LLMResponse:
+        """``POST /v1/completions`` -- the raw prompt reaches the model verbatim.
+
+        Deliberately does NOT walk the structured-output ladder that :meth:`chat`
+        walks. The one caller is the StruQ arm, whose model is Alpaca
+        instruction-tuned with no tool-call training; constraining it to
+        ``DEFENSE_ACTION_SCHEMA`` would manufacture syntactically valid JSON from
+        a model that cannot choose an action, converting incapacity into what
+        looks like resistance. Its malformed replies are meant to be visible, and
+        ``LLMDefenseAgent._parse_action`` already degrades them to a terminal
+        action.
+        """
+
+        kwargs = {
+            "model": self._model,
+            "prompt": prompt,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
+        }
+        if stop:
+            kwargs["stop"] = list(stop)
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
+            try:
+                resp = self._client.completions.create(**kwargs)
+                usage = getattr(resp, "usage", None)
+                return LLMResponse(
+                    text=resp.choices[0].text or "",
+                    prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                    completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                    model=resp.model,
+                    raw=resp.model_dump() if hasattr(resp, "model_dump") else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - retried below
+                last_exc = exc
+                backoff = min(2.0 ** attempt, 30.0)
+                logger.warning(
+                    "text_completion failed (attempt %d/%d): %s; retrying in %.1fs",
+                    attempt, self.config.max_retries, exc, backoff,
+                )
+                time.sleep(backoff)
+        assert last_exc is not None
+        raise RuntimeError(
+            f"text_completion failed after {self.config.max_retries} retries"
+        ) from last_exc
+
     def _merge_extra(self, extra: dict) -> dict:
         """Apply ``LLMConfig.extra`` onto request kwargs.
 

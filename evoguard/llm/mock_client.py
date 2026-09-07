@@ -100,6 +100,32 @@ def _event_signature(ev: dict) -> str:
     return f"{ev.get('tool') or ''}({json.dumps(args, sort_keys=True, ensure_ascii=False)})"
 
 
+def _visible_transcript(messages: Sequence[Message]) -> str:
+    """The text the mock defense treats as "what the agent can see".
+
+    Two prompt shapes reach this client. :class:`~evoguard.agents.llm_agent.
+    LLMDefenseAgent` flattens the whole transcript into the last USER message
+    (``prompts.render_history``), so that message alone IS the transcript.
+    :class:`~evoguard.agents.secalign_agent.SecAlignDefenseAgent` instead puts
+    each raw observation in its own ``Role.INPUT`` message with no prefix and no
+    delimiters -- that absence is precisely its defense -- so the mock re-attaches
+    the ``[turn N] tool result:`` anchors that :meth:`MockClient._defense` counts
+    steps and marker latency on. The re-attachment happens inside the mock only;
+    nothing is sent anywhere. With no INPUT message present the return value is
+    byte-identical to reading the last USER message directly.
+    """
+
+    inputs = [m for m in messages if m.role is Role.INPUT]
+    if not inputs:
+        for m in reversed(messages):
+            if m.role is Role.USER:
+                return m.content
+        return ""
+    return "\n".join(
+        f"[turn {i}] tool result: {m.content}" for i, m in enumerate(inputs)
+    )
+
+
 def _parse_mock_step(raw: str) -> tuple[str, dict[str, Any], str]:
     """Best-effort ``(tool, args, final_answer)`` from one sampled completion.
 
@@ -187,6 +213,33 @@ class MockClient(LLMClient):
 
         return LLMResponse(text=text, model="mock", prompt_tokens=0, completion_tokens=0)
 
+    def text_completion(
+        self,
+        prompt: str,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,  # noqa: ARG002 - mock never overruns
+    ) -> LLMResponse:
+        """Route a RAW prompt by treating it as both the system and user text.
+
+        :class:`~evoguard.agents.struq_agent.StruQDefenseAgent` renders its
+        delimiter format into one string and sends it down the text-completion
+        route, so there are no chat roles to route on. Everything the mock reads
+        is in that string: the role marker and ``AVAILABLE_TOOLS_JSON`` (which it
+        looks for in the SYSTEM message) and the ``[turn N] tool result:`` anchors
+        it counts steps and marker latency on (which it looks for in the USER
+        message). Passing the prompt as both is therefore exact rather than
+        approximate, and keeps this arm drivable offline.
+        """
+
+        return self.chat(
+            [Message(role=Role.SYSTEM, content=prompt),
+             Message(role=Role.USER, content=prompt)],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     # ---- defense agent ---------------------------------------------------- #
     def _defense(self, messages: Sequence[Message], system: str) -> str:
         tools = _extract_json_block(system, "AVAILABLE_TOOLS_JSON") or []
@@ -197,12 +250,9 @@ class MockClient(LLMClient):
         # completed turn contributes a ``[turn N] you called ...`` line and a
         # ``[turn N] tool result: ...`` line. We therefore anchor on those lines
         # rather than on dedicated ``tool`` chat-role messages, which the live
-        # system never emits.
-        user_text = ""
-        for m in reversed(messages):
-            if m.role is Role.USER:
-                user_text = m.content
-                break
+        # system never emits -- except for the SecAlign agent's ``input`` role,
+        # which ``_visible_transcript`` normalises to the same anchors.
+        user_text = _visible_transcript(messages)
 
         result_anchors = list(_TOOL_RESULT_RE.finditer(user_text))
         step = len(result_anchors)

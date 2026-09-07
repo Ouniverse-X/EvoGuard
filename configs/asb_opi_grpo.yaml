@@ -46,13 +46,22 @@
 # Every one of these is a correction to a stale value, not a new hypothesis; the
 # knob settings are lifted from configs/agentdojo_sinkdivert_v11.yaml so the two
 # datasets stay comparable at the trainer level.
-#   * training.base_model  /root/yangxiao/models/... -> /ssd1/yx/models/qwen2.5-7b-it
-#     (the old path does not exist on this box).
+#   * training.base_model  ->
+#     /root/paddlejob/workspace/yangxiao/models/Qwen2.5-7B-Instruct (every older
+#     path in this file's history -- /root/yangxiao/..., /ssd1/yx/... -- belonged
+#     to a previous box and does not exist here).
 #   * judge_llm + utility_judge_llm  llama3-8b-judge @ :8002 -> qwen3.5-9b @ :8004,
 #     max_tokens 256/512 -> 640/768. :8002 is a 16-day-old wedged server that
 #     LISTENS but never answers (180 s timeouts, 0 MiB GPU), so this file could
-#     not have produced a single verdict as written. The 9B also scores 12/12 on
-#     the labelled verdict set vs the 7B's 10/12 (2 FALSE successes).
+#     not have produced a single verdict as written.
+#     CAVEAT, measured 2026-09-06: through the asb_opi_v1 run :8004's
+#     served-model-name was `qwen3.5-9b` but its `root` was
+#     .../Qwen2.5-7B-Instruct and its log said
+#     `Resolved architecture: Qwen2ForCausalLM` -- the name was right and the
+#     weights were wrong, so the "9B scores 12/12 on the labelled verdict set vs
+#     the 7B's 10/12" argument never actually held in a real run. Real weights
+#     live at /root/paddlejob/workspace/yangxiao/models/Qwen3.5-9B. Verify the
+#     `root` field of GET /v1/models, not just `id`.
 #   * tool_executor_llm  -> qwen2.5-7b-it @ :8003 (the live executor endpoint).
 #   * attacker.llm  local qwen2.5-7b-it @ :8000 -> qianfan glm-5.2. The defender
 #     port is LoRA-hot-loaded every round, so an attacker sharing :8000 would be
@@ -73,10 +82,18 @@
 #     tasks x (6 clean rollouts + up to 15 attacks) produce far more than 400
 #     candidate steps, so 200 was leaving half the gradient on the floor. 400 also
 #     matches v11, whose train split is 37 tasks.
-#   * cuda_visible_devices "1" -> "6" (GPU 1 is foreign-occupied).
-#   * max_rounds 12 -> 15, patience_rounds 5 -> 999 (early stopping OFF, val eval
-#     stays on -- the val curve selects the best round).
+#   * cuda_visible_devices -> "7" (the trainer card in the layout below; also
+#     run_grpo_experiment.sh's own default, so TRAINER_CUDA_VISIBLE_DEVICES no
+#     longer has to be exported).
+#   * max_rounds 12 -> 15 -> 9, patience_rounds 5 -> 999 (early stopping OFF, val
+#     eval stays on -- the val curve selects the best round). 9 rather than 15
+#     because the useful signal is early: asb_opi_v1 peaked at r5 and
+#     agentdojo_sinkdivert_v11 at r4/r7, while v11's r9 carried ~69% judge false
+#     positives (11/16). Rounds past ~9 buy noise at ~2.5 h each.
 #   * task_concurrency 8 -> 12, attack_concurrency 8 -> 16, val_concurrency 4 -> 8.
+#     Do NOT raise attack_concurrency further: the attack phase is bounded by the
+#     QianFan gateway's measured 60 rpm quota, which QianFanClient's process-wide
+#     pacer holds at EVOGUARD_QIANFAN_MAX_RPM=55. 16 is already past it.
 #   * defense.max_turns 8 -> 6. THE ONE dataset-specific change. An ASB agent
 #     exposes exactly TWO benign tools, so a completed episode is 2-3 tool calls;
 #     mct_searcher._inject_turn_ceiling == defense.max_turns pre-creates one L1
@@ -86,11 +103,14 @@
 #
 # LAUNCH CONTRACT -- env vars this file cannot express
 # ---------------------------------------------------
-#   EVOGUARD_PY_BIN=/ssd1/conda_envs/evoguard/bin/python
-#       The ONLY working env on this box (py3.12, torch 2.6.0+cu124,
-#       transformers 4.51.3, trl 0.19.1, peft 0.19.1, vllm 0.8.5.post1).
-#       CentOS 7 / glibc 2.17 rules out the manylinux_2_28 wheels that newer
-#       vllm/torch ship, so `evoguard2` cannot be built here.
+#   EVOGUARD_PY_BIN=/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python
+#       Ubuntu 24.04.3 / glibc 2.39 / 8x H800 80GB. ONE conda env both trains and
+#       serves: vllm 0.19.1 + torch 2.10.0+cu128 + transformers 4.57.6 +
+#       trl 0.19.0 + peft 0.19.0. It registers
+#       Qwen3_5ForConditionalGeneration, so Qwen3.5-9B serves natively -- the old
+#       "CentOS 7 / glibc 2.17, Qwen3.5 only via Docker" constraint belonged to
+#       the previous box and no longer applies. Do not bump past vllm 0.19.1
+#       (0.20+ needs driver >= 580) and do not bump trl (1.x is a code migration).
 #   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds_v3
 #       Read as a FIXED directory by mct_searcher._load_prewarm_skeletons_all(),
 #       not off env.data_root. universal_seeds.json parses to suite key
@@ -99,7 +119,7 @@
 #       harmful_catalog.resolve_placeholders() -- on ASB that resolves to a train
 #       split attacker tool. `total=0 entries` means the run degraded to NOSEED.
 #   EVOGUARD_JUDGE_LLM_BASE_URL=http://127.0.0.1:8004/v1
-#   EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8004/v1
+#   EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8006/v1
 #   EVOGUARD_JUDGE_LLM_MODEL=qwen3.5-9b
 #       MANDATORY. The reward-path judges are OPT-IN and resolve their model name
 #       from this ONE var (native_grpo_runner._judge_model_name(), used by both the
@@ -109,23 +129,45 @@
 #       DELETES the safety gradient under group-relative advantages, invisibly in
 #       loss / reward-mean / grad-norm. Confirm `progress judge active` in the log
 #       and watch `safety_source_tally` in the plan JSON.
-#   TRAINER_CUDA_VISIBLE_DEVICES=6
-#       run_grpo_experiment.sh otherwise defaults the ambient value to 7, which
-#       hosts the tool executor. Must match training.cuda_visible_devices below.
+#       Splitting PROGRESS onto :8006 is the ONLY way the second judge card sees
+#       traffic: each builder holds ONE client on ONE base_url and
+#       EVOGUARD_REWARD_JUDGE_WORKERS just fans threads out across it, so a
+#       replica behind the same URL is dead weight. This split is exactly what the
+#       separate env var exists for. Both roles must be the same model, since they
+#       share EVOGUARD_JUDGE_LLM_MODEL.
+#   EVOGUARD_REWARD_JUDGE_WORKERS=32
+#       Reward-path judge fan-out (clamped to 64 in native_grpo_runner). The old
+#       16 was sized for a judge endpoint SHARED with other roles; here safety owns
+#       :8004 (GPU 6) and progress owns :8006 (GPU 5). Not the bottleneck either
+#       way: G=8 completions x 2 judges x ~0.4 s, fully parallel, is ~1 s against
+#       the ~13 s/prompt that GENERATION costs -- see grpo_use_vllm_colocate.
+#   EVOGUARD_TRAINER_MIN_FREE_MIB=40960
+#       Read AT IMPORT TIME by training/native_runner.py, so it must be exported
+#       before python starts. Only r0 SFT consults it (_wait_for_free_gpu_memory
+#       is never called on the GRPO path); at the stale 73728 it burned ~30 min
+#       reserving memory in 1 GiB blocks. A 7B LoRA SFT does not need 72 GB.
 #
-# GPU layout for this run  (8x40GB, NOT 80GB)
-# -------------------------------------------
-#   GPU 4 -> primary defender vLLM :8000, --enable-lora  qwen2.5-7b-it
-#   GPU 6 -> native SFT/GRPO trainer (single card; native_runner has no DDP)
-#   GPU 5 -> qwen3.5-9b judge, docker `qwen35-judge` -> :8004
+# GPU layout for this run  (8x H800 80GB)
+# ---------------------------------------
+#   GPU 0 -> primary defender vLLM :8000, --enable-lora  qwen2.5-7b-it
+#            (needs VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 at LAUNCH time)
+#   GPU 1 -> qwen2.5-7b-it -> :8003, the tool_executor
+#   GPU 6 -> qwen3.5-9b -> :8004, trajectory judge + utility_judge + reward-path
+#            SAFETY judge
 #            (--gdn-prefill-backend triton is MANDATORY; flashinfer's sm90a
 #             gated-delta-rule prefill aborts AFTER /v1/models reports healthy)
-#   GPU 7 -> qwen2.5-7b-it -> :8003, the tool_executor
-#   GPU 0/1/3 -> foreign processes. GPU 2 is idle but a docker container claims
-#                device 2, so it may allocate at any time -- prefer 4 and 6.
-#   :8002 holds a wedged 16-day-old llama3-8b server (listens, never answers).
-#   Do NOT run scripts/stop_vllm.sh to clean it: that script always stops the
-#   primary too, even when given only helper ports.
+#   GPU 5 -> qwen3.5-9b -> :8006, reward-path PROGRESS judge (see the
+#            EVOGUARD_PROGRESS_LLM_BASE_URL note: this split, not a replica behind
+#            one URL, is what puts the second card to work)
+#   GPU 7 -> native SFT/GRPO trainer (single card; native_runner has no DDP, and
+#            multi-process DDP would split a G=8 sibling group across ranks and
+#            silently break GDPO / trajectory pooling / Delta shaping, all of
+#            which index LOCAL advantage tensors)
+#   GPU 2/3/4 -> spare / oversubscription filler. Nothing may sit on GPU 7 if
+#            grpo_use_vllm_colocate is on: vLLM profiles WHOLE-CARD free memory.
+#   Do NOT run scripts/stop_vllm.sh to clean a helper port: that script always
+#   stops the primary too, even when given only helper ports. Kill the pid in
+#   rounds/vllm_helper_<port>.pid instead.
 
 name: evoguard_asb_opi_v1
 
@@ -199,9 +241,11 @@ env:
     temperature: 0.0
     max_tokens: 512
     enable_thinking: false
-  # Judges on Qwen3.5-9B, served by DOCKER on :8004 (GPU 5), not by a conda env.
+  # Judges on Qwen3.5-9B, served natively by the conda env on :8004 (GPU 5).
   # max_tokens 640/768 because the verdict is grammar-constrained JSON: hitting
-  # the cap yields an UNPARSEABLE truncated object, not a short one.
+  # the cap yields an UNPARSEABLE truncated object, not a short one. Verify the
+  # `root` field of GET :8004/v1/models really points at .../Qwen3.5-9B -- a
+  # `served-model-name` alone proves nothing (see the header caveat).
   judge_llm:
     backend: openai
     model: qwen3.5-9b
@@ -231,7 +275,7 @@ process:
 
 training:
   enabled: true
-  base_model: /ssd1/yx/models/qwen2.5-7b-it
+  base_model: /root/paddlejob/workspace/yangxiao/models/Qwen2.5-7B-Instruct
 
   method: sft_then_native_grpo        # r0 -> cold-start LoRA-SFT; >=r1 -> incremental
                                       # native GRPO (needs <exp>/latest_adapter_dir.txt;
@@ -296,15 +340,68 @@ training:
 
   dry_run: false
   use_native_trainer: true
-  cuda_visible_devices: "6"           # dedicated trainer card; native_runner has no
+  cuda_visible_devices: "7"           # dedicated trainer card; native_runner has no
                                       # DDP/sharding so exactly one device may be listed.
   native_max_steps_per_round: 400     # BINDING cap on prompt coverage at K=1.
+
+  # ---- GRPO generation backend --------------------------------------- #
+  # false = HF `generate` inside the trainer process (bs=1, serialized with the
+  # blocking judge HTTP): measured 13.37 s/prompt at G=4 on this box, and
+  # production runs G=8. true = TRL's colocate mode, an in-process vllm.LLM on
+  # the SAME card as the trainer, weights resynced every optimizer step via
+  # _move_model_to_vllm (GRPO needs on-policy samples, so pointing generation at
+  # the long-lived :8000 server is not an option -- its adapter would be stale
+  # after step 1). vllm_mode="server" is unusable here: `import
+  # trl.scripts.vllm_serve` dies with ImportError on GuidedDecodingParams under
+  # vllm 0.19.1.
+  #
+  # Colocate needs TWO shims, installed by _trl_compat.patch_trl_probes(
+  # enable_vllm=True): vllm 0.19 renamed GuidedDecodingParams ->
+  # StructuredOutputsParams (TRL imports the old name at module scope) and dropped
+  # SamplingParams' `guided_decoding` kwarg, which TRL's colocate branch passes
+  # unconditionally. That shim is a ONE-SHOT, PROCESS-WIDE decision, so
+  # native_runner (r0 SFT) reads this same flag -- otherwise r0 would latch the
+  # backend off for every later round in a `sft_then_native_grpo` run.
+  #
+  # Advantage maths is untouched either way: _DeltaShapedGRPOTrainer overrides
+  # only _generate_and_score_completions' return dict.
+
+  # A/B'd 2026-09-07 by replaying rounds/box_validation/round_1/records.jsonl
+  # (8 prompt rows, G=4, same warm-start adapter, EVOGUARD_GRPO_SEED pinned)
+  # through train_native_grpo once per arm:
+  #
+  #   arm   s/prompt  generate+logprobs  judge  backward  mean_reward_after
+  #   off    12.31       82.4 s          6.6 s   9.5 s      0.350
+  #   on      3.20       13.9 s          6.1 s   5.5 s      0.902
+  #   on'     3.06       13.5 s          5.8 s   5.2 s      1.330   (2nd seed)
+  #
+  # 3.9x end-to-end, 6x on generation alone; judge+reward is untouched, as
+  # expected. The reward gap between arms (0.55) is SMALLER than the gap between
+  # two seeds of the SAME arm (0.43 -> same order), 4 of 8 steps were bit-identical
+  # across arms, and reward_std/frac_reward_zero_std/safety_source_tally all match
+  # -- so this is sampler variance on 8 groups, not a maths change. Pinning the
+  # seed cannot make the arms identical: vLLM and HF `generate` do not share a
+  # sampler. What WOULD indicate a broken weight resync is a flat or stale reward
+  # trace; instead every step logs `Successfully reset prefix cache`, the tail of
+  # _move_model_to_vllm.
+  grpo_use_vllm_colocate: true
+  # Whole-card fraction the colocated engine reserves, and it profiles free VRAM
+  # at construction, so NOTHING else may sit on the trainer card. Budget on the
+  # 80 GB H800: policy 14 + reference 14 (grpo_beta=0.01>0 loads a ref) + engine
+  # ~20 + activations ~15 ~= 63 GB. On OOM lower this to 0.18 before reaching for
+  # gradient_checkpointing. Must be an unquoted float -- _dataclass_from_dict
+  # does no type coercion, so "0.25" would arrive as a str.
+  grpo_vllm_gpu_memory_utilization: 0.25
 
   lora_probe_enabled: false
 
 pipeline:
-  max_rounds: 15
-  # EARLY STOPPING DISABLED: run all 15 rounds unconditionally. Both exits are
+  # 9, not 15. The useful signal is early -- asb_opi_v1 peaked at r5,
+  # agentdojo_sinkdivert_v11 at r4/r7, and v11's r9 carried ~69% judge false
+  # positives (11/16). At ~2.5 h/round the tail bought noise. This is the single
+  # largest wall-clock saving in the config and it costs nothing measurable.
+  max_rounds: 9
+  # EARLY STOPPING DISABLED: run all rounds unconditionally. Both exits are
   # neutralised, not the validation itself --
   #   stop_on_zero_success: false  kills the "no B trajectories" exit;
   #   patience_rounds > max_rounds  makes the streak unreachable

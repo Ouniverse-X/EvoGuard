@@ -43,7 +43,7 @@ CONFIG="${EVOGUARD_REPLAY_CONFIG:-configs/agentdojo_full_last_traj.yaml}"
 DATASET_DIR="${EVOGUARD_REPLAY_DATASET_DIR:-data/toolsafe/agentdojo-tragjnew/test}"
 # ${VAR-default}, not ${VAR:-default}: an explicitly empty value must survive.
 SPLIT="${EVOGUARD_REPLAY_SPLIT-test}"
-PY="${EVOGUARD_PYTHON:-/root/yangxiao/envs/train/bin/python}"
+PY="${EVOGUARD_PYTHON:-${EVOGUARD_PY_BIN:-/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python}}"
 OUT="rounds/replay_test_${TAG}"
 
 SPLIT_ARGS=()

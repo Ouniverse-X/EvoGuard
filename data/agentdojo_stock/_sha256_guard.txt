@@ -1,0 +1,8 @@
+# sha256 guard for data/agentdojo_stock/
+# generated-by: scripts/build_agentdojo_stock.py
+# n-injected: 48
+sha256(manifest.json)=bb8487c858c0e954f44d840232d81b2665530dbc1117ef326810352340239010
+sha256(scenarios/banking.jsonl)=d97bea0cbfd52c14b5f9f3a4ec4502eb1d457e7f975adc9ec89fbc6766d26ac8
+sha256(scenarios/slack.jsonl)=b8415209af381bae81a97c53a7345983c90f7c7b1b75e6d9d15dd82b82fd2bba
+sha256(scenarios/travel.jsonl)=ae2a9467a5f41d8b90caf9a70a86a87d986a8031809d5fe99e51b4d0c4405dc9
+sha256(scenarios/workspace.jsonl)=ca55e52ad9d22105213bd20aa1dc2a7b64bf7e32991e6f0d072ffc983f9ee0fb
