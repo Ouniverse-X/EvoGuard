@@ -73,19 +73,31 @@ class DefenseConfig:
     system_prompt: Optional[str] = None
     #: Which defense implementation :func:`evoguard.agents.build_defense_agent`
     #: constructs. ``"llm"`` is the co-evolution defender and the only value the
-    #: training path supports; the other two are *baselines* for the AgentDojo-
+    #: training path supports; the rest are *baselines* for the AgentDojo-
     #: Latent vs -Stock probe and are eval-only:
     #:
     #: * ``"shieldagent_guard"`` -- the ``llm`` agent with a ShieldAgent
     #:   classifier in front of every action; an ``unsafe`` verdict replaces the
     #:   action with a refusal, which terminates the trajectory. Needs
     #:   :attr:`guard_llm`.
+    #: * ``"tsguard_guard"``     -- the ``llm`` agent with ToolSafe's TS-Guard in
+    #:   front of every *tool call*; a risk rating ``>= 0.5`` withholds execution
+    #:   and hands the verdict back as an observation so the agent re-proposes
+    #:   (ToolSafe's block-and-feedback loop). Needs :attr:`guard_llm`, served on
+    #:   vLLM with ``max_tokens`` raised to 2048.
+    #: * ``"piguard_filter"``    -- the ``llm`` agent with PIGuard filtering the
+    #:   untrusted channel: an observation classified ``injection`` is replaced by
+    #:   a withheld-notice and the trajectory continues. No endpoint -- the
+    #:   classifier runs in-process, so :attr:`guard_llm`'s ``model`` is read as a
+    #:   filesystem PATH and its ``extra`` dict carries ``device`` /
+    #:   ``window_tokens`` / ``window_stride``.
     #: * ``"secalign"``          -- the ``llm`` agent rebuilt as a multi-message
     #:   conversation that puts each raw observation in Meta-SecAlign's ``input``
     #:   role instead of flattening it into the user turn.
     agent: str = "llm"
-    #: Endpoint of the ShieldAgent classifier. Read only when
-    #: ``agent == "shieldagent_guard"``. Declared non-Optional on purpose:
+    #: Endpoint of the guard model, read only by the guard-wrapped agents above
+    #: (``shieldagent_guard`` / ``tsguard_guard``), or the local model path for
+    #: ``piguard_filter``. Declared non-Optional on purpose:
     #: ``_dataclass_from_dict`` only recurses into a field whose resolved type
     #: ``is_dataclass``, and ``Optional[LLMConfig]`` is not, so a YAML block under
     #: an Optional field would land as a raw dict.

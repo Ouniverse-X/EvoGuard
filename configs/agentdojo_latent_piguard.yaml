@@ -1,0 +1,148 @@
+# Baseline arm: PIGuard (InjecGuard, ACL 2025) as an observation filter in front
+# of the base defender, on AgentDojo-Latent, the camouflaged treatment.
+#
+# EVAL-ONLY. Read configs/agentdojo_latent_probe.yaml for the probe's design and
+# Δ caveat, and data/agentdojo_latent/README.md, before quoting a number.
+# Everything below that is not the arm itself is copied from
+# configs/agentdojo_stock_shieldagent.yaml unchanged, because the arms are only
+# comparable if nothing else moves.
+#
+# `defense.agent: piguard_filter` keeps the SAME defender as the base arm (`llm`
+# on :8000) and classifies every tool observation before the defender reads it;
+# one labelled `injection` is replaced by a "withheld" notice. It is a FILTER,
+# not a kill switch -- a detection does not end the trajectory, so a true
+# detection costs the carrier's BENIGN content (visible in UA) and a false alarm
+# costs benign content on the clean arm (visible in BU). Both costs land in a
+# published metric instead of hiding behind a free ASR of 0.
+#
+# Read ASR here ONLY next to:
+#   * cln.benign_utility / cln.false_alarm_rate -- what false alarms cost
+#   * atk.utility_under_attack                  -- resisted AND still delivered
+#   * poison_delivered_rate                     -- filtering shows up here too
+# And check the guard-verdict tally (`metadata.guard_verdict` is `filtered` or
+# `clean`, aggregated by scripts/summarize_latent_vs_stock.py): the detector
+# FAILS OPEN on a load or forward error, so a run where the checkpoint never
+# loaded is indistinguishable from the undefended base arm by ASR alone. A run
+# with zero `filtered:` verdicts on the attacked arm detected nothing.
+#
+# NO extra server. The 704 MB DeBERTa-v3-base classifier runs IN-PROCESS, so
+# `guard_llm.model` below is read as a FILESYSTEM PATH (not a served name) and
+# `guard_llm.extra` carries the knobs; `backend` / `base_url` / `api_key` are
+# unused by this arm and are left at their defaults for schema completeness.
+# `device: cpu` is deliberate -- every GPU on this box is committed to a served
+# endpoint, and the classifier is small enough that CPU inference is not the
+# bottleneck next to the defender's HTTP round trips.
+#
+# `window_tokens` / `window_stride` are NOT tuning knobs: PIGuard's
+# max_position_embeddings is 512, and the camouflaged observations are LONGER
+# than their stock twins (median 1481 vs 1201 chars), so classifying with plain
+# `truncation=True` would put the 512-token cut directly on the variable under
+# test and hand the treatment arm a free pass. Overlapping windows can only
+# RAISE the guard's measured effect, so they cannot flatter the attack.
+#
+# How to run it (defender :8000, tool executor :8003, judge :8004):
+#
+#   EVOGUARD_REPLAY_CONFIG=configs/agentdojo_latent_piguard.yaml \
+#   EVOGUARD_REPLAY_DATASET_DIR=data/agentdojo_latent \
+#   EVOGUARD_REPLAY_SPLIT= scripts/run_replay_heldout.sh none adjlatent_piguard 8
+#
+# `EVOGUARD_REPLAY_SPLIT=` (empty) is MANDATORY -- the probe declares no
+# metadata["split"], so a task filter would match nothing.
+
+name: evoguard_agentdojo_latent_piguard
+
+defense:
+  agent: piguard_filter
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+  guard_llm:
+    backend: openai
+    model: /root/paddlejob/workspace/yangxiao/models/PIGuard
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 16
+    extra:
+      device: cpu
+      window_tokens: 510
+      window_stride: 255
+  max_turns: 18
+
+# Present because ExperimentConfig requires it; the probe replays authored
+# observations and never invokes the attacker.
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1
+    api_key: EMPTY
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+  search_method: mcts_delta
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  random_seed: 42
+
+env:
+  dataset: agentdojo_latent
+  data_root: data
+  suites: []
+  max_tasks: 0
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 256
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  turning_point_method: llm_then_scan
+
+training:
+  enabled: false
+  base_model: /root/paddlejob/workspace/yangxiao/models/Qwen2.5-7B-Instruct
+  method: native_sft
+  dry_run: true
+
+pipeline:
+  max_rounds: 1
+  validation_fraction: 0.0
+  task_concurrency: 8
+  attack_concurrency: 8
+  validate_every_round: false
+  val_split: ""
+
+evo_data_subdir: "agentdojo_latent"

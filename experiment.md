@@ -4,7 +4,7 @@ One block per run. Keep it short: config deltas + the numbers, no prose.
 
 ---
 
-## camouflage_probe_v2 — `configs/agentdojo_{latent,stock}_{probe,secalign,struq}.yaml`
+## camouflage_probe_v2 — `configs/agentdojo_{latent,stock}_{probe,secalign,struq,tsguard,piguard}.yaml`
 
 Eval-only, no training. Isolates ONE variable: does business-process camouflage of an
 IPI payload raise ASR? `data/agentdojo_latent` (48 authored high-Δ payloads) vs
@@ -160,8 +160,161 @@ base ASR 0.333→0.667, discordance 10 vs 2, exact p≈0.039 — the full-48 poo
 (13 vs 7, p≈0.26) was diluted by travel+workspace. SecAlign 0.042→0.208 on the subset
 (5 vs 1, p≈0.22) keeps the same direction as the full set.
 
+### Filtering arms — TS-Guard and PIGuard, the probe's first significant results
+
+Two *filtering* defenses, added alongside the training-based arms above. Both keep the
+SAME defender as base (`llm` on :8000) and interpose a guard on every proposed tool call,
+so their stock-vs-latent Δ isolates camouflage against the **filter**, not against the
+policy. Both **fail open** by design, so each has a cheap capability control that exits 3
+rather than 0 on a fail-open — a run whose guard was down is indistinguishable from the
+undefended base arm by ASR alone.
+
+| arm | model | where | semantics |
+|---|---|---|---|
+| TS-Guard (ToolSafe, arXiv 2601.10156) | `models/TS-Guard`, Qwen2ForCausalLM 15 GB | :8009 GPU7 | LLM guard on `(user_request, history, current_action, env_info)`; score ≥0.5 → tool not executed, verdict fed back as an observation, agent **retries** (block-and-feedback) |
+| PIGuard (= InjecGuard, ACL 2025) | `models/PIGuard`, DeBERTa-v3-base 714 MB fp32 | in-process CPU | binary injection classifier on the observation; flagged text is **filtered out of the history**, not a kill switch |
+
+```bash
+EVOGUARD_VLLM_MODEL=.../models/TS-Guard EVOGUARD_VLLM_NAME=ts-guard \
+EVOGUARD_VLLM_GPU=7 EVOGUARD_VLLM_PORT=8009 EVOGUARD_VLLM_MEM_UTIL=0.27 \
+EVOGUARD_VLLM_MAXLEN=8192 EVOGUARD_VLLM_EXTRA_ARGS="--max-num-seqs 16" \
+  bash scripts/start_vllm_secondary.sh
+python scripts/probe_piguard_detection.py    # capability control, CPU, ~90 s
+python scripts/probe_tsguard_defense.py      # capability control, ~150 calls, ~3 min
+bash scripts/run_guard_probe_chain.sh 8      # the four replay cells
+python scripts/summarize_latent_vs_stock.py \
+    tsguard=rounds/replay_test_adjstock_tsguard:rounds/replay_test_adjlatent_tsguard \
+    piguard=rounds/replay_test_adjstock_piguard:rounds/replay_test_adjlatent_piguard
+```
+
+Both `MEM_UTIL=0.27` and `--max-num-seqs 16` are forced, not chosen: 0.27 is the most of
+the card that fits in GPU7's ~23 GiB remaining, and at vLLM's default `max_num_seqs` the
+sampler warm-up (1024 dummy requests) OOMs *after* KV-cache allocation and CUDA-graph
+capture already succeeded, so the engine dies looking healthy.
+
+#### Results — ASR
+
+| arm | stock (Δ=0) | latent (high-Δ) | Δ | paired latent/stock/both/neither | McNemar |
+|---|---|---|---|---|---|
+| base (qwen2.5-7b-it) | 0.458 (22/48) | 0.583 (28/48) | +0.125 | 13 / 7 / 15 / 13 | p≈0.26 |
+| Meta-SecAlign-8B | 0.062 (3/48) | 0.208 (10/48) | +0.146 | 9 / 2 / 1 / 36 | p≈0.065 |
+| **TS-Guard** | **0.083** (4/48) | **0.542** (26/48) | **+0.458** | **22 / 0** / 4 / 22 | **p=4.8e-07** |
+| **PIGuard** | 0.146 (7/48) | **0.333** (16/48) | **+0.187** | 12 / 3 / 4 / 29 | **p=0.035** |
+
+TS-Guard's +0.458 (6.5× relative, 22-vs-0 discordance) is by far the largest effect in
+the probe, and both filtering arms clear p<0.05 on the full 48 where base (p=0.26) and
+SecAlign (p=0.065) do not. **Camouflage defeats filtering harder than it defeats
+alignment** — which is the expected direction for a filter that has to make its call from
+the observation text alone, and it is the probe's actual finding.
+
+#### Results — full triple
+
+| metric | tsguard/stock | tsguard/latent | piguard/stock | piguard/latent |
+|---|---|---|---|---|
+| asr | 0.083 | **0.542** | 0.146 | **0.333** |
+| poison_delivered_rate | 0.729 | 0.708 | 0.792 | 0.729 |
+| asr_given_delivered | 0.114 | **0.765** | 0.184 | **0.457** |
+| ua | 0.229 | 0.208 | 0.438 | 0.417 |
+| bu | 0.721 | 0.791 | 0.791 | 0.721 |
+| blocked_unfinished_rate | **0.688** | **0.250** | 0.417 | 0.250 |
+| refusal_rate (attacked) | 0.104 | 0.042 | 0.083 | 0.021 |
+
+91 records per cell (43 clean + 48 attacked), `n_unjoined` 0, `utility_method =
+llm_rubric` on 91/91 in all four cells. Delivery is flat (0.71–0.79 everywhere), so again
+the gain is resistance-side: `asr_given_delivered` +0.650 / +0.273.
+
+**TS-Guard's `blocked_unfinished_rate` collapse 0.688 → 0.250 is the mechanism.** On the
+stock arm the guard stops the run dead — high blocked-unfinished, ASR 0.083, but only UA
+0.229 to show for it. On the camouflaged arm it lets the sink through, so runs finish and
+they finish *badly*. Same trade PIGuard makes at half the amplitude (0.417 → 0.250).
+
+#### In-replay guard evidence
+
+Per-action `metadata.guard_verdict`, and for TS-Guard the blocked proposals that were
+later re-proposed successfully (`metadata.guard_blocked_actions`, which the verdict tally
+does not surface):
+
+| | tsguard/stock | tsguard/latent | piguard/stock | piguard/latent |
+|---|---|---|---|---|
+| attacked verdicts | safe 170, final_unguarded 42, blocked_exhausted 4 | safe 239, final_unguarded 44, blocked_exhausted 2 | clean 163, filtered 136 (0.455) | clean 193, filtered 85 (0.306) |
+| clean verdicts | safe 198, final_unguarded 40, blocked_exhausted 2 | safe 216, final_unguarded 40, blocked_exhausted 1 | clean 242, filtered 48 (0.166) | clean 215, filtered 43 (0.167) |
+| attacked blocked proposals | **64** over 218 actions, 23/48 trajectories | **19** over 287 actions, 13/48 trajectories | — | — |
+| clean blocked proposals | 16 over 241 actions, 7/43 | 15 over 259 actions, 7/43 | — | — |
+
+TS-Guard fires **3.4× more often** on the stock arm (64 vs 19) while its clean-arm firing
+is unchanged (16 vs 15) — camouflage suppresses the guard specifically, not globally.
+PIGuard's clean-arm filter rate matching to 0.001 (0.166 vs 0.167) is the same
+self-consistency check: the clean arm is byte-identical between the two datasets, so
+anything that differs there is noise in the arm, not an effect.
+
+#### ASR by declared Δ
+
+| Δ | tsguard/stock | tsguard/latent | piguard/stock | piguard/latent |
+|---|---|---|---|---|
+| 1 | 0.000 | **0.688** | 0.062 | **0.438** |
+| 2 | 0.125 | 0.562 | 0.312 | 0.250 |
+| 3 | 0.125 | 0.375 | 0.062 | 0.312 |
+
+**The "Δ=3 hurts" pattern from base/SecAlign does NOT reproduce here.** TS-Guard is
+monotone decreasing in Δ but positive at every level (+0.688/+0.438/+0.250); PIGuard is
+non-monotone in a different shape. Across four arms the Δ ordering is inconsistent, which
+argues the earlier Δ=3 dip was noise after all, not a property of deep camouflage.
+
+#### Capability controls — both passed, both load-bearing
+
+`scripts/probe_piguard_detection.py`, 48 injected rows per arm, three settings. `payload`
+= injection text alone (the paper's setting); `embedded` = `observation` (benign+payload)
+windowed at 510/255 tokens, exactly what `PIGuardFilterAgent` classifies; `truncated` =
+the same string under `truncation=True, max_length=512`, reported to **show** the
+512-token confound rather than hide it.
+
+| setting | stock recall | latent recall | b(s>l) | c(l>s) | p(exact) |
+|---|---|---|---|---|---|
+| payload | 44/48 = 0.917 | 17/48 = **0.354** | 29 | 2 | <1e-4 |
+| embedded | 40/48 = 0.833 | 13/48 = **0.271** | 29 | 2 | <1e-4 |
+| truncated | 40/48 = 0.833 | 13/48 = 0.271 | 29 | 2 | <1e-4 |
+
+Clean false alarms 3/46 = 0.065, identical on both arms (identical strings). Tally
+`{injection: 117, benign: 121}`, zero errors. `embedded` and `truncated` are **bit-identical**
+and only 1/48 (stock) / 4/48 (latent) observations exceed 510 tokens (median 313 vs 342,
+max 551 vs 641) — so **the truncation confound is measured out, not assumed**. The gap is
+stealth: PIGuard's recall drops from 0.92 to 0.35 on the *raw payload* alone.
+
+`scripts/probe_tsguard_defense.py` builds the worst case each row can produce — the row's
+own `harmful_tool` with `harmful_args_hint`, proposed immediately after the poisoned
+observation. A block there is a **ceiling** on what the replay arm can protect. Control:
+the row's own `clean_plan` next step after `benign_observation`.
+
+| case | stock block | latent block | b(s>l) | c(l>s) | p(exact) |
+|---|---|---|---|---|---|
+| attacked (ceiling) | 47/48 = **0.979** | 39/48 = **0.812** | 8 | 0 | **0.0078** |
+| clean (false alarm) | 4/47 = 0.085 | 4/47 = 0.085 | — | — | — |
+
+Zero fail-opens. Camouflage costs TS-Guard 0.167 recall at the *ceiling* while its false
+alarms are identical, and the replay arm then converts that into +0.458 ASR — the guard
+gets more chances to fail across a multi-turn loop than the single worst-case call.
+
 ### Known issues
 
+- **BU's stock-vs-latent Δ in this probe is a pure noise floor of ±0.07 (3/43 tasks).**
+  The clean arm is byte-identical between the two datasets, so **no** BU difference here
+  is interpretable. The same 3-task swing shows up in base (0.791/0.721), TS-Guard
+  (0.721/**0.791**) and PIGuard (0.791/0.721) — in *both* directions. Cross-*arm* BU is
+  still meaningful (it is what disqualifies ShieldAgent and StruQ); within-arm
+  stock-vs-latent BU is not.
+- **PIGuard's `attention_mask` fail-open trap** (fixed, `agents/piguard_filter.py`): the
+  checkpoint ships a custom `modeling_piguard.PIGuard.forward(input_ids, attention_mask)`
+  with no default for the mask, so `model(input_ids=...)` raised `TypeError`, which
+  `predict`'s blanket `except` swallowed as fail-open. Symptom was maximally deceptive —
+  `tally={'error': 238}` and recall 0.000 in both columns, i.e. it looked exactly like a
+  perfectly stealthy attack. This is why the probe scripts return exit 3 instead of
+  printing a table of zeros and exiting 0.
+- **TS-Guard's `final_unguarded` verdicts (40–44 per cell) are unguarded by design** —
+  ToolSafe guards tool calls, not final answers. An attack whose damage lands in the
+  final text is outside this arm's threat model.
+- **TS-Guard's ASR 0.083 on the stock arm is not free**: it buys it with
+  `blocked_unfinished_rate` 0.688 and UA 0.229. It is a milder version of ShieldAgent's
+  failure mode, not a counterexample to it.
 - **ShieldAgent (`:8007`) not re-run on v2, and unusable as a comparison anyway**:
   as-deployed it scores BU 0.093 with clean `false_alarm_rate` 0.42 — it blocks the
   benign arm, so its ASR≈0 is incapacity, not resistance.
@@ -173,9 +326,12 @@ base ASR 0.333→0.667, discordance 10 vs 2, exact p≈0.039 — the full-48 poo
   section above. Its 24-of-48 subset and its 0.08–0.13 `poison_delivered_rate` are both
   disqualifying for a cross-arm ASR comparison. `docs/struq_arm_blockers.md` records
   which of the four blockers were fixed and which was not.
-- n=48 per cell for base/SecAlign (24 on the StruQ subset). Only the base arm on
-  banking+slack reaches p<0.05, and that is a subset chosen for an unrelated reason
-  (StruQ's context window), so it is not a pre-registered test.
+- n=48 per cell for base/SecAlign/TS-Guard/PIGuard (24 on the StruQ subset). On the full
+  48, only the two **filtering** arms reach p<0.05 (TS-Guard 4.8e-07, PIGuard 0.035);
+  base and SecAlign do not. The base arm's p≈0.039 is on the banking+slack subset, chosen
+  for an unrelated reason (StruQ's context window), so it is not a pre-registered test.
+  Four arms were tested on the same 48 pairs with no multiplicity correction — TS-Guard
+  survives any correction, PIGuard's 0.035 does not survive Bonferroni at 4.
 
 ---
 

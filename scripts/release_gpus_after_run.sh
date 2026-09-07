@@ -26,7 +26,13 @@ EXP_PID="${1:?usage: release_gpus_after_run.sh <experiment_pid> [gpu_list] [help
 GPUS="${2:-2,3,4}"
 shift 2 2>/dev/null || shift $#
 HELPER_PORTS=("$@")
-REPO_ROOT="/root/yangxiao/EvoGuard"
+# Both of these were stale until 2026-09-07: REPO_ROOT pointed at a PREVIOUS
+# BOX's checkout and the keeper was expected at /root/gpu_keeper.sh -- neither
+# path exists here, so every invocation logged nothing and resumed nothing. The
+# keeper now lives in this repo (scripts/gpu_keeper.sh), and REPO_ROOT is derived
+# instead of hard-coded so a future move cannot re-break it.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KEEPER="$REPO_ROOT/scripts/gpu_keeper.sh"
 LOG="$REPO_ROOT/rounds/gpu_release_watch.log"
 
 log() { printf '%s %s\n' "[$(date '+%F %T')]" "$*" >>"$LOG"; }
@@ -40,6 +46,6 @@ log "experiment pid=$EXP_PID has exited"
 bash "$REPO_ROOT/scripts/stop_vllm.sh" ${HELPER_PORTS[@]+"${HELPER_PORTS[@]}"} >>"$LOG" 2>&1 \
     || log "stop_vllm.sh returned nonzero"
 sleep 10
-/root/gpu_keeper.sh resume -g "$GPUS" >>"$LOG" 2>&1 || log "gpu_keeper resume returned nonzero"
+bash "$KEEPER" resume -g "$GPUS" >>"$LOG" 2>&1 || log "gpu_keeper resume returned nonzero"
 log "released GPUs $GPUS back to gpu_keeper"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader >>"$LOG" 2>&1 || true

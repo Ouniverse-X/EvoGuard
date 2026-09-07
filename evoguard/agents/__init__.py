@@ -12,15 +12,19 @@ from __future__ import annotations
 
 from evoguard.agents.base import DefenseAgent
 from evoguard.agents.llm_agent import LLMDefenseAgent
+from evoguard.agents.piguard_filter import PIGuardFilterAgent
 from evoguard.agents.secalign_agent import SecAlignDefenseAgent
 from evoguard.agents.shieldagent_guard import ShieldAgentGuardAgent
 from evoguard.agents.struq_agent import StruQDefenseAgent
+from evoguard.agents.tsguard_guard import TSGuardGuardAgent
 from evoguard.config import DefenseConfig
 from evoguard.llm.base import LLMClient
 
 _AGENTS: dict[str, type[DefenseAgent]] = {
     "llm": LLMDefenseAgent,
     ShieldAgentGuardAgent.name: ShieldAgentGuardAgent,
+    TSGuardGuardAgent.name: TSGuardGuardAgent,
+    PIGuardFilterAgent.name: PIGuardFilterAgent,
     "secalign": SecAlignDefenseAgent,
     "struq": StruQDefenseAgent,
 }
@@ -45,8 +49,10 @@ def build_defense_agent(
 __all__ = [
     "DefenseAgent",
     "LLMDefenseAgent",
+    "PIGuardFilterAgent",
     "SecAlignDefenseAgent",
     "ShieldAgentGuardAgent",
     "StruQDefenseAgent",
+    "TSGuardGuardAgent",
     "build_defense_agent",
 ]
