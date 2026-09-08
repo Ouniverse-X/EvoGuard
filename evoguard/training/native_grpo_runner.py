@@ -604,7 +604,10 @@ def _release_colocate_engine(trainer) -> None:
         # Reached from the trainer-ctor error path, where the half-built object is
         # already unreachable. No handle to drop, but the collect still matters --
         # the ctor may have created the engine before raising.
+        # The ctor may have captured CUDA graphs before raising, so the pool id
+        # must be retired here too or the NEXT build inherits the same fault.
         _clear_vllm_signature_cache()
+        _reset_vllm_global_graph_pool()
         _collect_and_empty_cache()
         return
     engine = getattr(trainer, "llm", None)
@@ -619,6 +622,7 @@ def _release_colocate_engine(trainer) -> None:
         return
     del engine
     _clear_vllm_signature_cache()
+    _reset_vllm_global_graph_pool()
     _collect_and_empty_cache()
     free_after = _cuda_free_gib()
     if free_before is not None and free_after is not None:
@@ -665,6 +669,65 @@ def _clear_vllm_signature_cache() -> None:
     except Exception as exc:                                                # noqa: BLE001
         logger.warning("[native_grpo] could not clear vllm supports_kw cache "
                        "(colocate engine weights may stay resident): %s", exc)
+
+
+def _reset_vllm_global_graph_pool() -> None:
+    """Retire the CUDA-graph mempool id so the NEXT engine captures into a fresh one.
+
+    This is what killed r2 of run 20260907_220147 and r3 of 20260908_000734, both
+    with::
+
+        RuntimeError: it->second->use_count > 0 INTERNAL ASSERT FAILED at
+        "/pytorch/c10/cuda/CUDACachingAllocator.cpp":2731
+
+    raised from ``torch/cuda/graphs.py:119 capture_begin`` inside
+    ``GRPOTrainer.__init__``. It was first misread as out-of-memory (a foreign vLLM
+    server was indeed sitting on the trainer card at the time) -- but after that
+    server was stopped the second build failed again with **44.45 GiB free**, more
+    than twice what the engine asks for. Free memory is not the variable.
+
+    The assert is ``CUDACachingAllocator::beginAllocateToPool`` finding an existing
+    entry in ``graph_pools`` whose ``use_count`` is already 0. torch keeps such an
+    entry until every block inside it is freed (``releasePool`` only moves it to
+    ``graph_pools_freeable``), so one surviving tensor allocated during the first
+    capture pins it indefinitely. A second capture that asks for the SAME
+    ``mempool_id`` then trips the assert -- reproducible in five seconds with no
+    vLLM and no model at all, see ``tests/test_colocate_graph_pool.py``.
+
+    vLLM asks for the same id every time: ``Platform.get_global_graph_pool()``
+    (``platforms/interface.py:664``) memoises the handle on ``self.__class__`` and
+    nothing in vLLM ever clears it, so every engine in the process shares one
+    mempool_id. ``CUDAGraphWrapper.graph_pool`` (``compilation/cuda_graph.py:200``)
+    reads it once per wrapper.
+
+    Note what this does and does not buy. It removes the crash, so a second engine
+    builds; it does NOT reclaim the first engine's private pool, which is part of
+    the ~19 GiB/round that stays resident. Free-at-settle therefore still walks
+    down and a long colocate run still has to be restarted eventually.
+    """
+    import sys
+
+    mod = sys.modules.get("vllm.platforms")
+    if mod is None:                     # engine never built in this process
+        return
+    plat = getattr(mod, "_current_platform", None)
+    targets = []
+    if plat is not None:
+        targets.append(type(plat))
+    base = getattr(mod, "Platform", None)
+    if base is not None and base not in targets:
+        targets.append(base)
+    for cls in targets:
+        try:
+            if getattr(cls, "_global_graph_pool", None) is not None:
+                cls._global_graph_pool = None
+                logger.info("[native_grpo] retired vLLM global CUDA-graph pool id "
+                            "on %s; the next colocate engine will capture into a "
+                            "fresh mempool", cls.__name__)
+        except Exception as exc:                                            # noqa: BLE001
+            logger.warning("[native_grpo] could not reset _global_graph_pool on "
+                           "%s (a second colocate engine will hit the "
+                           "use_count assert): %s", cls, exc)
 
 
 def _collect_and_empty_cache() -> None:

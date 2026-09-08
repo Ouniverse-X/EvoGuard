@@ -137,8 +137,12 @@ defense:
     max_tokens: 1024
     timeout: 120.0
     max_retries: 3
-    lora_adapter: null                  # from-scratch r0; the driver assigns the
-                                        # composite name itself from r1 on.
+    # RESUME FROM r5 (2026-09-08, leg 3). r0 SFT + r1..r4 GRPO have landed; r5 was
+    # STARTED in leg 2 and lost to an OOM before it saved weights, so it is redone
+    # here. See the RESUME block under `pipeline` for why this field must be set BY
+    # HAND. Composite name verified registered on :8010 (`GET /v1/models` shows
+    # root=.../grpo_native/r4/adapter_weights).
+    lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights
   max_turns: 8                          # v11's value, unchanged.
 
 attacker:
@@ -327,8 +331,47 @@ training:
   lora_probe_enabled: false
 
 pipeline:
-  max_rounds: 9                        # see delta 6.
-  start_round: 0                       # from scratch: r0 = cold-start LoRA SFT.
+  # RESUME, LEG 3 -- runs r5 and r6. r0 (SFT) and r1..r4 (GRPO) are done and their
+  # val rows are already in val_metrics.jsonl. r5 has to be REDONE: leg 2 started it,
+  # the engine built, and then trainer.train() OOMed before any weights were saved,
+  # so grpo_native/r5/ holds plan_and_logs.jsonl + trl_state/ but no adapter_weights
+  # and latest_adapter_dir.txt still points at r4.
+  #
+  # Why the run is split into legs of TWO rounds. The colocate engine leaks ~19-21
+  # GiB of the trainer card per round. MEASURED in leg 2: free-at-settle 62.59 ->
+  # 43.71 -> 25.09 GiB, and the third engine BUILDS at 25.09 and then training dies
+  # on a genuine 88 MiB `_VF.dropout` torch.OutOfMemoryError -- ~5 GiB of headroom is
+  # not enough to train in. scripts/gate_colocate_sequential_engines.py reports FOUR
+  # buildable engines (77.88 / 59.11 / 42.06 / 24.99 GiB), but it builds BARE engines
+  # with no policy, optimizer state, gradients or activations resident, so subtract
+  # one for production. Do not raise this back to three rounds without re-measuring.
+  #
+  # NOT the same failure as the r2/r3 crash. That one was `use_count > 0 INTERNAL
+  # ASSERT` in CUDACachingAllocator during CUDA-graph capture, and it was mempool-id
+  # reuse, not memory pressure -- vLLM memoises one CUDA-graph pool id on its
+  # platform class and every engine in the process asked for the retired one. Fixed
+  # by native_grpo_runner._reset_vllm_global_graph_pool (locked by
+  # tests/test_colocate_graph_pool.py) and CONFIRMED in leg 2, which released two
+  # engines and built three with no assert. Do NOT re-file either crash as the other.
+  #
+  # Two things the resume path does NOT restore by itself: the attacker population
+  # (rebuilt from the prewarm seeds) and the termination streak (inert here,
+  # patience_rounds > max_rounds). And `defense.llm.lora_adapter` above MUST be set
+  # by hand -- the driver only assigns it inside maybe_train_defender, so a resume
+  # left at `null` would collect rollouts against the BASE model while GRPO
+  # warm-starts from trained weights, with no visible symptom.
+  # metrics.jsonl / val_metrics.jsonl / results/safety_metrics.jsonl are APPENDED so
+  # earlier rounds survive; the CSVs and the summary block are rebuilt from
+  # in-memory history and therefore lose the rounds before start_round.
+  #
+  # scripts/run_legged_experiment.py derives both fields below from the artifacts on
+  # disk and rewrites them per leg, so prefer it over editing this by hand.
+  start_round: 5
+  max_rounds: 7                        # exclusive upper bound; the leg trains
+                                       # r{start_round}..r{max_rounds - 1}. Both
+                                       # numbers are REWRITTEN IN PLACE by
+                                       # scripts/run_legged_experiment.py, so do not
+                                       # describe a specific leg on this line.
   # EARLY STOPPING DISABLED: run all rounds unconditionally, and select the best
   # round from the val curve afterwards. Both exits are neutralised, not the
   # validation itself -- stop_on_zero_success: false kills the "no B trajectories"
