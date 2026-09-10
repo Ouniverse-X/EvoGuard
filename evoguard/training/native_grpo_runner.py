@@ -1069,6 +1069,7 @@ def _build_progress_callable(progress_endpoint_url: Optional[str]) -> Optional[C
 def build_evoguard_reward_callable(
     metas_by_prompt_idx: dict[int, Any],
     reward_trace_sink: Optional[list] = None,
+    disable_safety: bool = False,
 ):
     """Create the actual function handed to TRL.GRPOTrainer.reward_funcs.
 
@@ -1210,11 +1211,15 @@ def build_evoguard_reward_callable(
         except TypeError:
             idxs_iter = iter([raw_row_idx])
 
-        judge_cb_ref = _get_or_init_judge()
+        # Ablation arm (`grpo_disable_safety_term`): r_safety is pinned to 0.0
+        # inside the reward, so a verdict would be discarded. Skip CONSTRUCTING
+        # the judge, not just calling it -- otherwise the round pays the client
+        # setup and, when the endpoint env var is unset, logs the "SAFETY term is
+        # DEAD" warning that exists to catch accidents, which here would be noise.
+        judge_cb_ref = None if disable_safety else _get_or_init_judge()
         progress_cb_ref = _get_or_init_progress()
         effective_jcb = judge_cb_ref if callable(judge_cb_ref) else None
         effective_pcb = progress_cb_ref if callable(progress_cb_ref) else None
-
         # prompts may be List[str] OR List[List[{role,content}]] depending on whether caller
         # serialized via apply_chat_template beforehand. We rely solely on metas indexed by
         # position rather than parsing prompt content again -> agnostic handling.
@@ -1266,12 +1271,20 @@ def build_evoguard_reward_callable(
             if meta is None:
                 # Unknown row: the historical neutral default. Expressed as a
                 # single-term-carrying tuple so the sum invariant still holds.
+                # Under the safety ablation the same -0.5 rides in the PROGRESS
+                # slot instead, so the safety slot stays identically 0.0 across
+                # the batch and GDPO's zero-std branch keeps skipping it -- a
+                # -0.5 leaking into that slot would make the "deleted" term
+                # non-unanimous and hand it a gradient again.
+                if disable_safety:
+                    return (-0.5, (0.0, -0.5, 0.0))
                 return (-0.5, (-0.5, 0.0, 0.0))
             bd = compute_evoguard_reward(
                 completion_text=comp_txt,
                 meta=meta,
                 judge_call=effective_jcb,
                 progress_call=effective_pcb,
+                disable_safety=disable_safety,
             )
             # Scoring is fanned out across threads, so the tally needs the lock;
             # it is contended for nanoseconds against an HTTP round-trip.
@@ -1682,8 +1695,20 @@ def train_native_grpo(
         # B4 Instantiate trainer                                          #
         # -------------------------------------------------------------- #
         reward_trace_sink: list = []
+        disable_safety_term = bool(
+            getattr(training_cfg, "grpo_disable_safety_term", False)
+        )
+        if disable_safety_term:
+            logger.warning(
+                "[native_grpo] ABLATION grpo_disable_safety_term=True: r_safety is "
+                "pinned to 0.0 on BOTH arms and the step-safety judge is never "
+                "called, so the trained reward is R = r_progress - p_drift. Expect "
+                "safety_source_tally == {'disabled:disabled': N}; a 'fallback:' "
+                "tally instead would mean the flag did not reach the reward."
+            )
         reward_fn_closure=build_evoguard_reward_callable(
-            metas_lookup_table, reward_trace_sink=reward_trace_sink
+            metas_lookup_table, reward_trace_sink=reward_trace_sink,
+            disable_safety=disable_safety_term,
         )
 
         diag_state={"step_counter":0,"first_rewards":[],"last_rewards":[],"kl_trace":[],

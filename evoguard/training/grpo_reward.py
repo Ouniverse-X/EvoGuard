@@ -658,6 +658,7 @@ def compute_evoguard_reward(
     meta: PromptMeta,
     judge_call: Optional[JudgeCallable] = None,
     progress_call: Optional[ProgressCallable] = None,
+    disable_safety: bool = False,
 ) -> RewardBreakdown:
     """Score one sampled completion against its prompt-context metadata.
 
@@ -757,6 +758,24 @@ def compute_evoguard_reward(
             bd.r_progress = R_PROGRESS_NEUTRAL
         else:
             bd.r_progress = progress_scored
+
+    # ------------------------------------------------------------------ #
+    # Safety-term ablation (config ``grpo_disable_safety_term``).          #
+    #                                                                     #
+    # Placed AFTER r_progress and p_drift are settled and BEFORE the clean #
+    # short circuit, so it covers both arms with one branch and cannot be  #
+    # bypassed by the ``meta.is_clean`` return below. Pinned to exactly    #
+    # 0.0 rather than left at its default so ``total`` is unambiguously    #
+    # ``r_progress - p_drift``, and labelled "disabled" rather than reusing #
+    # "fallback"/"unclear" so the round tally tells an ABLATION apart from  #
+    # a judge outage. No judge call is made on this path.                  #
+    # ------------------------------------------------------------------ #
+    if disable_safety:
+        bd.r_safety = 0.0
+        bd.safety_label = "disabled"
+        bd.safety_source = "disabled"
+        bd.total = bd.r_safety + bd.r_progress - bd.p_drift
+        return bd
 
     # ------------------------------------------------------------------ #
     # Clean-prompt short circuit: benign prefix, nothing to withstand.    #

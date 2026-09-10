@@ -1,0 +1,474 @@
+# ABLATION ARM 5 (2026-09-10): DROP THE SAFETY TERM FROM THE REWARD.
+# =============================================================================
+# This file is `configs/agentdojo_llama31_grpo.yaml` (the GDPO-ON reference arm)
+# with ONE knob flipped: `training.grpo_disable_safety_term: true`. The trained
+# reward becomes
+#
+#       R = r_progress - p_drift          (was: r_safety + r_progress - p_drift)
+#
+# GDPO stays ON, advantage shaping stays at lambda 1.5, both judges keep their
+# endpoints, K stays 1, the base model / LoRA geometry / max_turns / dataset are
+# untouched. Non-comment diff vs the reference arm is FIVE lines: name,
+# lora_adapter, grpo_disable_safety_term, start_round, max_rounds.
+#
+# WHAT THIS IS AND IS NOT
+# -----------------------
+#  * It DELETES the term, it does not unplug the judge. Those differ: with the
+#    judge merely absent, `_safety_from_structure` still settles a large minority
+#    of rows at `held` (+2.00) while the rest fall back to `unclear` (-0.50), so
+#    r_safety would be a NOISY two-valued signal, not an absent one -- and the
+#    arm would be measuring judge outage, which the pipeline already warns about.
+#    Under this flag r_safety is pinned to exactly 0.0 on BOTH arms, the judge is
+#    never constructed, and safety_source/safety_label read "disabled" so the
+#    per-round safety_source_tally tells the ablation apart from an accident.
+#    Check the log for `ABLATION grpo_disable_safety_term=True` and the tally
+#    reading `disabled:disabled`; a `fallback:` tally means the flag did not
+#    reach the reward and the run is measuring the wrong thing.
+#  * GDPO remains coherent: the zeroed term is unanimous inside every group, so
+#    `_gdpo_advantages`'s `sd <= zero_std_tol` branch contributes exactly nothing
+#    for it and GDPO degrades to a clean 2-term normalisation. Locked by
+#    evoguard/tests/test_safety_term_ablation.py::test_gdpo_ignores_the_zeroed_term.
+#  * The CLEAN arm loses nothing it had: R_SAFETY_CLEAN_SERVED is a per-prompt
+#    constant, hence zero gradient under group-relative advantages already. This
+#    ablation removes signal from the ATTACKED arm only, which is the intent.
+#  * The PROGRESS judge is still required. It is the only surviving source of
+#    signal, so a progress-judge outage here does not degrade the arm, it EMPTIES
+#    it (structural progress can then only tell waste from neutral, never
+#    advance). Confirm `progress judge active` appears with no WARNING naming
+#    EVOGUARD_PROGRESS_LLM_BASE_URL before trusting a single round.
+#
+# PRE-DECLARED READING: r_progress alone rewards taking the clean twin's next
+# action and punishes stalling, and the twin's plan never contains the bait, so
+# some anti-injection pressure survives INDIRECTLY. The question this arm answers
+# is how much of the reference arm's UA/blocked_unfinished gain was that indirect
+# pressure versus the explicit -8.00 on `baited`. Do NOT read a low ASR here as
+# "the safety term is unnecessary": test ASR is on the floor for three of the
+# four existing arms, so ASR cannot separate them -- UA, blocked_unfinished_rate
+# and the attacked-arm refusal_rate are the readable channels.
+#
+# =============================================================================
+#
+# EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew) with
+# **Meta-Llama-3.1-8B-Instruct** as the defender base, native SFT -> GRPO path.
+#
+# WHY THIS FILE EXISTS: every prior AgentDojo result on this dataset was trained
+# on Qwen2.5-7B-Instruct. This is the BASE-MODEL SWAP ARM -- the one variable
+# that changes is `training.base_model` (and the endpoint serving it). Everything
+# else is copied from configs/agentdojo_sinkdivert_v11.yaml on purpose, including
+# knobs I would otherwise have re-tuned, because a hyperparameter changed at the
+# same time as the base model makes the comparison unreadable.
+#
+# DELTAS vs configs/agentdojo_sinkdivert_v11.yaml (the Qwen arm on this dataset)
+# -----------------------------------------------------------------------------
+#  1. training.base_model  /ssd1/yx/models/qwen2.5-7b-it ->
+#     /root/paddlejob/workspace/yangxiao/models/Meta-Llama-3.1-8B-Instruct.
+#     (v11's path is from a PREVIOUS BOX; /ssd1 does not exist here.)
+#  2. defense.llm  qwen2.5-7b-it @ :8000 -> llama3.1-8b-it @ **:8010** (GPU 6,
+#     --enable-lora --max-lora-rank 64 --max-loras 4). A non-8000 defender port is
+#     supported end to end: pipeline/driver.py derives the per-round hot-load port
+#     from THIS base_url, and run_grpo_experiment.sh's primary probe is overridden
+#     by EVOGUARD_PRIMARY_VLLM (see the launch contract below). :8000 could not be
+#     reused -- it serves Qwen weights, and the adapter trained here is Llama's.
+#  3. attacker.llm  qianfan glm-5.2 -> local qwen2.5-7b-it @ **:8000**. No QianFan
+#     credentials exist on this box ($HOME/.evoguard_qianfan.env is absent), so the
+#     attacker is local and WEAKER than v11's. That asymmetry belongs to this run,
+#     not to the base model: read ASR against injecagent/asb (also local attacker),
+#     and against v11 only with the caveat stated.
+#     Reusing :8000 as the attacker is safe HERE precisely because it is no longer
+#     the defender port -- nothing hot-loads an adapter onto it this run, so the
+#     attacker cannot end up mutating payloads with the adapter it is attacking.
+#  4. training.cuda_visible_devices  "6" -> "7". GPU 6 now serves the defender.
+#  5. grpo_use_vllm_colocate: true (+ grpo_vllm_gpu_memory_utilization: 0.25).
+#     v11 predates it; measured 3.9x end-to-end. See the field comment.
+#  6. pipeline.max_rounds  15 -> 9. The useful signal is early (asb_opi_v1 peaked
+#     at r5, v11 at r4/r7, and v11's r9 carried ~69% judge false positives).
+#  7. judge_llm / utility_judge_llm already point at the real Qwen3.5-9B on :8004;
+#     kept as-is. Verified today that GET :8004/v1/models has
+#     root=.../models/Qwen3.5-9B -- a served-model-name is independent of the
+#     weights behind it, and an :8004 announcing `qwen3.5-9b` served Qwen2.5-7B
+#     for the whole asb_opi_v1 run.
+#
+# LLAMA-3.1 SPECIFICS THAT WERE CHECKED BEFORE LAUNCH (all clear, no code change)
+# ------------------------------------------------------------------------------
+#   * Llama-3.1 ships no pad token. Both trainer paths already fall back to
+#     `tok.pad_token = tok.eos_token` (native_runner.py, and native_grpo_runner.py
+#     with padding_side="left"), so no tokenizer patch is needed.
+#   * lora_target_modules below are the same seven names in Llama as in Qwen
+#     (q/k/v/o_proj, gate/up/down_proj) -- the list transfers verbatim.
+#   * The SFT corpus emits only system/user/assistant messages (no `tool` role),
+#     which Llama-3.1's chat template renders without special-casing.
+#   * :8010 must be the model's OWN tokenizer. Do NOT point it at
+#     models/metasecalign the way the :8008 SecAlign baseline arm does -- that is a
+#     different vocabulary and template, and it is a separate experiment.
+#
+# LAUNCH CONTRACT -- env vars this file cannot express
+# ---------------------------------------------------
+# Canonical set: scripts/launch_agentdojo_llama31.sh. Do not launch by hand.
+#   EVOGUARD_PRIMARY_VLLM=http://127.0.0.1:8010/v1
+#       NEW vs every other config here. run_grpo_experiment.sh defaults its primary
+#       probe (and its /load_lora_adapter route check) to :8000; without this it
+#       would clear a Qwen server and never test whether the LLAMA defender can
+#       take a hot-loaded adapter. The helper ports it probes are DERIVED by
+#       grepping this file for 127.0.0.1:<port>/v1, so :8000/:8003/:8004 are
+#       covered automatically.
+#   EVOGUARD_PY_BIN=/root/paddlejob/workspace/yangxiao/miniconda3/envs/evoguard/bin/python
+#       ONE conda env both trains and serves: vllm 0.19.1 + torch 2.10.0+cu128 +
+#       transformers 4.57.6 + trl 0.19.0 + peft 0.19.0. Do not bump past vllm
+#       0.19.1 (0.20+ needs driver >= 580) and do not bump trl (1.x is a code
+#       migration -- _DeltaShapedGRPOTrainer overrides a private TRL method).
+#   EVOGUARD_PREWARM_SEEDS_DIR=data/seeds_v3
+#       Read as a FIXED directory by mct_searcher._load_prewarm_skeletons_all(),
+#       not off env.data_root. `total=0 entries` means the run degraded to NOSEED.
+#   EVOGUARD_JUDGE_LLM_BASE_URL=http://127.0.0.1:8004/v1
+#   EVOGUARD_PROGRESS_LLM_BASE_URL=http://127.0.0.1:8006/v1
+#   EVOGUARD_JUDGE_LLM_MODEL=qwen3.5-9b
+#       MANDATORY. The reward-path judges are OPT-IN and resolve their model name
+#       from this ONE var (both the safety and the progress builder), defaulting to
+#       `qwen2.5-7b-it`, which :8004 does not host. An unset BASE_URL is worse than
+#       wrong: the constant `unclear` fallback DELETES the safety gradient under
+#       group-relative advantages, invisibly in loss / reward-mean / grad-norm.
+#       Confirm `progress judge active at http://127.0.0.1:8006/v1` in the log and
+#       watch safety_source_tally / n_safety_fallback in each round's plan JSON.
+#       Splitting PROGRESS onto :8006 is the only way the second judge card sees
+#       traffic -- each builder holds ONE client on ONE base_url.
+#   EVOGUARD_REWARD_JUDGE_WORKERS=32   (clamped to 64 in native_grpo_runner)
+#   EVOGUARD_TRAINER_MIN_FREE_MIB=40960
+#       Read AT IMPORT TIME by training/native_runner.py, so it must be exported
+#       before python starts. r0 SFT only; at the stale 73728 it burned ~30 min
+#       reserving memory in 1 GiB blocks.
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   TRAINER_CUDA_VISIBLE_DEVICES=7     (ambient value for non-trainer subprocesses)
+#
+# GPU layout for this run -- MEASURED 2026-09-07, not aspirational
+# ---------------------------------------------------------------
+#   GPU 0 -> :8000  qwen2.5-7b-it        the ATTACKER (see delta 3)
+#   GPU 1 -> :8003  qwen2.5-7b-it        tool_executor
+#   GPU 2 -> :8004  qwen3.5-9b           trajectory judge + utility_judge +
+#                                        reward-path SAFETY judge
+#                                        (--gdn-prefill-backend triton is
+#                                        MANDATORY for Qwen3.5: flashinfer's sm90a
+#                                        gated-delta-rule prefill aborts AFTER
+#                                        /v1/models already reports healthy)
+#   GPU 3 -> :8005  struq-llama7b        UNRELATED leftover of the ruled-out StruQ
+#                                        arm (docs/struq_arm_blockers.md). Not used
+#                                        by this run. Stop it to give the GPU
+#                                        keeper a card back.
+#   GPU 4 -> :8008  Llama-3.1 + metasecalign tokenizer   SecAlign baseline arm,
+#                                        a DIFFERENT experiment (see the note above)
+#   GPU 5 -> :8006  qwen3.5-9b           reward-path PROGRESS judge
+#   GPU 6 -> :8010  llama3.1-8b-it       THE DEFENDER, --enable-lora
+#                                        --max-lora-rank 64 --max-loras 4 and
+#                                        VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 at
+#                                        LAUNCH time (the env var, not the flag, is
+#                                        what registers POST /v1/load_lora_adapter;
+#                                        without it the route 404s with the short
+#                                        {"detail":"Not Found"} envelope every round)
+#   GPU 7 -> the native SFT/GRPO trainer. NOTHING else may sit here while
+#            grpo_use_vllm_colocate is on -- the colocated vLLM profiles
+#            WHOLE-CARD free memory and grpo_vllm_gpu_memory_utilization is a
+#            whole-card fraction. scripts/gpu_keeper.sh excludes 7 by default;
+#            `gpu_keeper.sh pause -g N` BLOCKS until the ballast is really gone,
+#            which is the only safe way to hand a held card to a real tenant.
+#   Never run multi-process/DDP GRPO: TRL splits the batch per rank while GDPO,
+#   trajectory pooling and Delta shaping all index the LOCAL advantage tensor and
+#   assume the whole G=8 sibling group is present.
+#   Do NOT run scripts/stop_vllm.sh to clean a helper port -- it always stops the
+#   primary too. Kill the pid in rounds/vllm_helper_<port>.pid instead.
+
+name: evoguard_agentdojo_llama31_nosafety_v1
+
+defense:
+  llm:
+    backend: openai
+    model: llama3.1-8b-it
+    base_url: http://127.0.0.1:8010/v1
+    api_key: EMPTY
+    temperature: 0.2
+    max_tokens: 1024
+    timeout: 120.0
+    max_retries: 3
+    # FRESH EXPERIMENT -- no resume. The reference arm's copy of this field named
+    # its r6 composite adapter; carrying that over would have warm-started this
+    # ablation from a policy trained WITH the safety term, which is the one thing
+    # the arm must not do. r0 is a cold-start SFT and driver.py hot-registers each
+    # round's adapter onto :8010 from here on.
+    lora_adapter: null
+  max_turns: 8                          # v11's value, unchanged.
+
+attacker:
+  llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8000/v1  # see delta 3 -- local, and safe to share
+    api_key: EMPTY                      # because :8000 is not the defender here.
+    temperature: 1.05
+    top_p: 0.95
+    max_tokens: 2048
+    timeout: 180.0
+    max_retries: 3
+    lora_adapter: null
+    enable_thinking: false
+
+  population_size: 15
+  offspring_size: 10
+  elite_size: 3
+  tournament_k: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.5
+  diversity_penalty: 0.4
+  diversity_position_window: 1
+  crowding_factor: 2
+  immigrant_injection_rate: 0.20
+  fitness_drop_threshold: 0.50
+  random_seed: 42
+
+  search_method: mcts_delta
+  mcts_ucb_c: 1.414
+  mcts_lambda_delta: 0.6               # Delta-guided UCB. 0.0 turns mcts_delta into
+                                       # plain MCTS without saying so.
+
+env:
+  dataset: agentdojo_split             # -> data/toolsafe/agentdojo-tragjnew/{train,val,test}
+  data_root: data
+  inject_harmful_tools: true           # append the out-of-scope decoy sinks to BOTH
+                                       # arms, so an attacker target exists that the
+                                       # benign plan never needs.
+  suites:
+    - banking
+    - slack
+    - travel
+    - workspace
+  max_tasks: 100                       # not binding; 58 distinct instructions.
+  tool_executor_llm:
+    backend: openai
+    model: qwen2.5-7b-it
+    base_url: http://127.0.0.1:8003/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 512
+    enable_thinking: false
+  # max_tokens 640/768 because the verdict is grammar-constrained JSON: hitting the
+  # cap yields an UNPARSEABLE truncated object, not a short one.
+  judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 640
+    enable_thinking: false
+  utility_judge_llm:
+    backend: openai
+    model: qwen3.5-9b
+    base_url: http://127.0.0.1:8004/v1
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 768
+    enable_thinking: false
+
+process:
+  divergence_threshold: 0.5
+  normalize_by: clean_length
+  # `llm_then_scan`, not `llm`: an unattributable verdict (turning_turn=-1) would
+  # otherwise yield turning_point=None -> delta=None -> delta_normalized=0.0,
+  # silently dropping that success out of the advantage-shaping curriculum.
+  turning_point_method: llm_then_scan
+
+training:
+  enabled: true
+  base_model: /root/paddlejob/workspace/yangxiao/models/Meta-Llama-3.1-8B-Instruct
+
+  method: sft_then_native_grpo         # r0 -> cold-start LoRA-SFT; >=r1 -> incremental
+                                       # native GRPO (needs <exp>/latest_adapter_dir.txt;
+                                       # hard-errors rather than silently falling back).
+
+  lora_rank: 32                        # <= :8010's --max-lora-rank 64, so the
+                                       # per-round hot-load is accepted.
+  lora_alpha: 64
+  lora_dropout: 0.10
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  llamafactory_root: ""
+  verl_root: ""
+
+  # ---- Cold-start SFT (r0 only) -------------------------------------- #
+  sft_epochs: 2.0
+  sft_learning_rate: 5.0e-5
+  sft_max_records_per_task: 6          # per-task PER-CLASS cap (clean /
+                                       # attack_fail / attack_success). Must stay
+                                       # >= pipeline.clean_rollouts_per_task or the
+                                       # extra clean samples are bought and dropped.
+
+  # ---- Native GRPO --------------------------------------------------- #
+  grpo_learning_rate: 2.0e-6
+  grpo_beta: 0.01                      # loose KL leash -- lets the LoRA leave the SFT
+                                       # warm start. Corollary: per-task forgetting is
+                                       # real, so evaluate the BEST round, not the last.
+  grpo_group_size_g: 8
+  grpo_clip_epsilon: 0.20
+  # 0.90 = v11's value, deliberately NOT injecagent's 1.15. Temperature is the only
+  # exploration lever left at K=1 (the trajectory-pooling half of the saturation fix
+  # is a bit-for-bit no-op there), so raising it is the obvious tuning move -- but
+  # this run exists to isolate the base model, and a hotter policy would confound
+  # it. If frac_reward_zero_std_avg in the plan JSON comes out > 0.5, raise this in
+  # a FOLLOW-UP run rather than mid-experiment. The answer is never reward surgery.
+  grpo_rollout_temperature: 0.90
+  grpo_max_prompts_per_round: 400      # ROW budget over STEPS, not tasks. At K=1 rows
+                                       # == trajectories == optimizer steps.
+  grpo_min_new_successes: 3            # skip the incremental retrain below this many
+                                       # fresh B trajectories.
+
+  # ---- Advantage normalisation --------------------------------------- #
+  grpo_gdpo: true                      # per-term group standardisation, then batch
+                                       # rescale. A NORMALISATION change, kept ON for
+                                       # this arm so the ONE variable is the reward.
+                                       # With the safety slot pinned to 0.0 it is
+                                       # unanimous in every group, so GDPO's
+                                       # zero-std branch skips it and this becomes a
+                                       # clean 2-term normalisation -- no division by
+                                       # a zero std, no NaN.
+  # ==== THE ABLATION (2026-09-10) ==================================== #
+  # Drops r_safety: R = r_progress - p_drift. Pinned to exactly 0.0 on BOTH
+  # arms, the step-safety judge is never constructed, and safety_source /
+  # safety_label read "disabled" so the round tally distinguishes this from a
+  # judge OUTAGE (same reward shape, but an accident). Verify in the log:
+  #   "ABLATION grpo_disable_safety_term=True"
+  #   safety_source_tally == {"disabled:disabled": N}
+  # A tally showing "fallback:" instead means the flag did not reach the
+  # reward and the round trained the WRONG thing -- stop and fix it.
+  grpo_disable_safety_term: true
+  # =================================================================== #
+  grpo_traj_group_size: 1              # K=1: the trajectory-pooled baseline fallback is
+                                       # a bit-for-bit no-op.
+
+  # Delta's ONLY path into training: A~ = (1 + lambda*delta_p)*A. lambda=0.0 silently
+  # discards Delta altogether. Never re-add an inline Delta reward term.
+  grpo_advantage_curriculum_lambda: 1.5
+  grpo_clean_prompt_ratio: 0.25        # 100 BENIGN rows of 400. Their signal is entirely
+                                       # the judged r_progress term; without them every
+                                       # prompt pays for blocking, all G siblings converge
+                                       # on blocking, reward std collapses and nothing
+                                       # separates "blocked and still served the user"
+                                       # from "blocked and gave up".
+
+  # ---- Trainer infrastructure ---------------------------------------- #
+  # Keep bs=1/accum=8 even on 80GB cards. TRL's GRPO counts
+  # per_device_train_batch_size in *completions*, and the per-forward logits tensor
+  # is bs x (2048 prompt + 512 completion) x vocab x 2 B held live several times over
+  # (policy / ref / old logprobs) on top of LoRA backward activations. Llama-3.1's
+  # 128256-token vocab is smaller than Qwen's 152064, so this is if anything looser
+  # here -- not a reason to raise it, since the comparison arm ran at 1/8.
+  per_device_batch_size: 1
+  gradient_accumulation: 8
+
+  dry_run: false
+  use_native_trainer: true
+  cuda_visible_devices: "7"            # dedicated trainer card; native_runner has no
+                                       # DDP/sharding so exactly one device may be listed.
+  native_max_steps_per_round: 400      # BINDING cap on prompt coverage at K=1.
+
+  # ---- GRPO generation backend --------------------------------------- #
+  # true = TRL's colocate mode: an in-process vllm.LLM on the SAME card as the
+  # trainer, weights resynced every optimizer step via _move_model_to_vllm (GRPO
+  # needs on-policy samples, so pointing generation at the long-lived :8010 server
+  # is not an option -- its adapter would be stale after step 1). Measured 3.9x
+  # end-to-end on this box. vllm_mode="server" is unusable on vllm 0.19.1 (`import
+  # trl.scripts.vllm_serve` dies with ImportError on GuidedDecodingParams).
+  #
+  # FIVE colocate-lifecycle bugs are already fixed in native_grpo_runner /
+  # _trl_compat; the full forensics live in configs/injecagent_grpo.yaml's header.
+  # The two that change what you should EXPECT in this log:
+  #   * `vLLM memory profiling raced on attempt 1/3` WARNINGs are benign -- the
+  #     engine re-settles and builds on the retry. Only an uncaught AssertionError
+  #     containing "Error in memory profiling" is a failure.
+  #   * The per-round engine teardown must keep free-VRAM-before-build FLAT across
+  #     rounds. A `+2.4 GiB` style reclaim means the leak is back. The residual is
+  #     not fully traced: production reclaims ~11 GiB/round against the offline
+  #     gate's ~0, so free-at-settle still drifts down ~19 GiB/round. At 9 rounds
+  #     with 0.25 utilisation that has held, but do not extend this run past r8
+  #     without re-reading the numbers.
+  grpo_use_vllm_colocate: true
+  # Whole-card fraction the colocated engine reserves, profiled at construction, so
+  # nothing else may sit on GPU 7. On OOM lower to 0.18 before reaching for
+  # gradient_checkpointing. Must be an unquoted float -- _dataclass_from_dict does
+  # no type coercion, so "0.25" would arrive as a str.
+  grpo_vllm_gpu_memory_utilization: 0.25
+
+  lora_probe_enabled: false
+
+pipeline:
+  # RESUME, LEG 3 -- runs r5 and r6. r0 (SFT) and r1..r4 (GRPO) are done and their
+  # val rows are already in val_metrics.jsonl. r5 has to be REDONE: leg 2 started it,
+  # the engine built, and then trainer.train() OOMed before any weights were saved,
+  # so grpo_native/r5/ holds plan_and_logs.jsonl + trl_state/ but no adapter_weights
+  # and latest_adapter_dir.txt still points at r4.
+  #
+  # Why the run is split into legs of TWO rounds. The colocate engine leaks ~19-21
+  # GiB of the trainer card per round. MEASURED in leg 2: free-at-settle 62.59 ->
+  # 43.71 -> 25.09 GiB, and the third engine BUILDS at 25.09 and then training dies
+  # on a genuine 88 MiB `_VF.dropout` torch.OutOfMemoryError -- ~5 GiB of headroom is
+  # not enough to train in. scripts/gate_colocate_sequential_engines.py reports FOUR
+  # buildable engines (77.88 / 59.11 / 42.06 / 24.99 GiB), but it builds BARE engines
+  # with no policy, optimizer state, gradients or activations resident, so subtract
+  # one for production. Do not raise this back to three rounds without re-measuring.
+  #
+  # NOT the same failure as the r2/r3 crash. That one was `use_count > 0 INTERNAL
+  # ASSERT` in CUDACachingAllocator during CUDA-graph capture, and it was mempool-id
+  # reuse, not memory pressure -- vLLM memoises one CUDA-graph pool id on its
+  # platform class and every engine in the process asked for the retired one. Fixed
+  # by native_grpo_runner._reset_vllm_global_graph_pool (locked by
+  # tests/test_colocate_graph_pool.py) and CONFIRMED in leg 2, which released two
+  # engines and built three with no assert. Do NOT re-file either crash as the other.
+  #
+  # Two things the resume path does NOT restore by itself: the attacker population
+  # (rebuilt from the prewarm seeds) and the termination streak (inert here,
+  # patience_rounds > max_rounds). And `defense.llm.lora_adapter` above MUST be set
+  # by hand -- the driver only assigns it inside maybe_train_defender, so a resume
+  # left at `null` would collect rollouts against the BASE model while GRPO
+  # warm-starts from trained weights, with no visible symptom.
+  # metrics.jsonl / val_metrics.jsonl / results/safety_metrics.jsonl are APPENDED so
+  # earlier rounds survive; the CSVs and the summary block are rebuilt from
+  # in-memory history and therefore lose the rounds before start_round.
+  #
+  # scripts/run_legged_experiment.py derives both fields below from the artifacts on
+  # disk and rewrites them per leg, so prefer it over editing this by hand.
+  start_round: 0                       # fresh experiment.
+  max_rounds: 2                        # LEG 0 ONLY (r0 SFT + r1 GRPO). The chainer
+                                       # cannot bootstrap a fresh experiment --
+                                       # latest_trained_round() reads
+                                       # <exp>/latest_adapter_dir.txt and raises
+                                       # FileNotFoundError -- so leg 0 is launched by
+                                       # hand at 2, then run_legged_experiment.py
+                                       # rewrites both fields per leg up to 9.
+                                       # exclusive upper bound; the leg trains
+                                       # r{start_round}..r{max_rounds - 1}. Both
+                                       # numbers are REWRITTEN IN PLACE by
+                                       # scripts/run_legged_experiment.py, so do not
+                                       # describe a specific leg on this line.
+  # EARLY STOPPING DISABLED: run all rounds unconditionally, and select the best
+  # round from the val curve afterwards. Both exits are neutralised, not the
+  # validation itself -- stop_on_zero_success: false kills the "no B trajectories"
+  # exit, and patience_rounds > max_rounds makes the streak unreachable.
+  patience_rounds: 999
+  asr_threshold: 0.05                  # inert while patience_rounds > max_rounds;
+                                       # kept so val_metrics.jsonl rows stay readable
+                                       # against earlier runs.
+  stop_on_zero_success: false
+  validation_fraction: 0.15            # inert: this env declares metadata["split"].
+  task_concurrency: 12
+  attack_concurrency: 16
+  # All 6 samples are persisted as CLEAN records; the TWIN is the highest-utility
+  # one with `None` sorting as 1.0, and the three sites that pick one
+  # (collect_tri_rollouts, build_sft, extract_grpo_prompts) agree on that rule.
+  clean_rollouts_per_task: 6
+  # Per-round held-out validation via eval/vendored_replay.py -- the only harness in
+  # the repo that actually EXECUTES tools, so its ASR means what the termination
+  # check assumes. ~2-3 min/round. Verify a "[val] rN adapter=... asr=..." line per
+  # round and a growing val_metrics.jsonl; failures are swallowed and degrade to
+  # TRAINING ASR, which tracks the co-evolving attacker rather than the defender.
+  validate_every_round: true
+  val_dataset_dir: "data/toolsafe/agentdojo-tragjnew/val"   # LEAF split dir
+  val_split: "val"
+  val_concurrency: 8
+
+evo_data_subdir: "agentdojo"

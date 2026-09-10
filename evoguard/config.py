@@ -160,7 +160,18 @@ class AttackerConfig:
     # Selects which attacker backend to instantiate via build_attacker():
     #   "ga"         -> GeneticAttacker (legacy, default for backward compat)
     #   "mcts_delta" -> DeltaGuidedMCTSAttacker
+    #   "vendored"   -> VendoredAttacker: the ATTACKER-ABLATION backend. No search,
+    #                   no attacker LLM call, no evolution -- the population IS the
+    #                   set of injections already shipped in the dataset split named
+    #                   by ``vendored_dataset_dir``, and is byte-identical every
+    #                   round. population_size / offspring_size / every mutation and
+    #                   mcts_* knob below is INERT under it.
     search_method: str = "ga"
+    # Read ONLY when search_method == "vendored". A LEAF split dir, e.g.
+    # "data/toolsafe/agentdojo-tragjnew/train". Empty raises rather than falling
+    # back: the default AgentDojo lookup is the UNSPLIT tree, so a silent fallback
+    # would train on val/test attacks with no visible symptom.
+    vendored_dataset_dir: str = ""
     mcts_ucb_c: float = 1.414           # classic UCB exploration coefficient (= sqrt(2))
     mcts_lambda_delta: float = 0.6      # weight of the delta-potential term in selection score
     # NOTE (2026-09-01): ``mcts_failure_credit_eps`` / ``mcts_tau_window_size``
@@ -346,6 +357,34 @@ class TrainingConfig:
     # normalization to preserve a stable numerical range independent of reward
     # count".
     grpo_gdpo: bool = False
+
+    # ---- Safety-term ablation (2026-09-10) -------------------------------- #
+    # True DELETES ``r_safety`` from the reward, leaving ``R = r_progress −
+    # p_drift``. This is an ABLATION KNOB, not a tuning knob: the shipped reward
+    # is and stays the three-term ``R = r_safety + r_progress − p_drift``, and
+    # ``False`` is bit-for-bit the historical path (no branch is taken, no field
+    # changes value, the judge is still constructed and called).
+    #
+    # It is implemented as "drop the term", NOT as "unplug the safety judge".
+    # Those differ and the difference matters: with the judge gone,
+    # ``_safety_from_structure`` still settles a large minority of rows at
+    # ``held`` (+2.00) while the rest fall back to ``unclear`` (−0.50), so
+    # ``r_safety`` becomes a NOISY two-valued signal rather than an absent one.
+    # Under this flag the term is pinned to exactly 0.0 on BOTH arms, the judge
+    # is never called, and ``safety_source``/``safety_label`` both read
+    # ``"disabled"`` so the per-round ``safety_source_tally`` distinguishes the
+    # ablation from a judge OUTAGE (which is the same reward shape but an
+    # accident, and is what the once-per-process WARNING exists to catch).
+    #
+    # Interaction with GDPO, which is deliberately left ON for this arm: the
+    # zero term is unanimous inside every group, so ``_gdpo_advantages``'s
+    # ``sd <= zero_std_tol`` branch contributes exactly nothing for it. GDPO
+    # therefore degrades cleanly to a 2-term normalisation rather than dividing
+    # by a zero std. Nothing else in the pipeline changes: the CLEAN arm never
+    # had a safety gradient anyway (``R_SAFETY_CLEAN_SERVED`` is a per-prompt
+    # constant, zero under group-relative advantages), so this ablation removes
+    # signal from the ATTACKED arm only -- which is precisely the intent.
+    grpo_disable_safety_term: bool = False
 
     # ---- GRPO rollout backend (2026-09-07) -------------------------------- #
     # False (default, legacy) = TRL generates the G siblings with HF
