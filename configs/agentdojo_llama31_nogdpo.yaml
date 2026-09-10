@@ -1,3 +1,34 @@
+# EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew), GDPO ABLATION.
+#
+# WHY THIS FILE EXISTS: this is the GDPO-OFF arm of
+# configs/agentdojo_llama31_grpo.yaml (run `evoguard_agentdojo_llama31_v1`, r0-r8,
+# already complete). Exactly ONE knob differs -- `training.grpo_gdpo: true ->
+# false` -- so the pair isolates the advantage-normalisation scheme:
+#   GDPO ON : each of the three reward terms (r_safety, r_progress, -p_drift) is
+#             standardised inside its own group of G=8 siblings, the per-term
+#             advantages summed, then rescaled batch-wise.
+#   GDPO OFF: TRL's stock GRPO -- sum the terms into one scalar reward FIRST, then
+#             standardise once per group.
+# The reward itself is untouched in both arms (R = r_safety + r_progress - p_drift),
+# and Delta shaping stays on (grpo_advantage_curriculum_lambda: 1.5), so the
+# advantage hook still installs -- only step 0 of the three interventions is
+# skipped. Intervention order in _DeltaShapedGRPOTrainer is GDPO -> trajectory
+# pooling -> Delta shaping; pooling is a bit-for-bit no-op at K=1 in both arms.
+#
+# Everything else is byte-identical to the GDPO-ON arm. Do NOT re-tune anything
+# here: a second changed knob makes the ablation unreadable.
+#
+# NOTE ON ADAPTER NAMES: the per-round LoRA names the driver registers
+# (`evoguard_r0_sft_weights`, `evoguard_r0_sft_weights::evoguard_r1_grpo_weights`,
+# ...) are derived from the ROUND, not the experiment, so they collide with the
+# GDPO-ON arm's registrations still live on :8010. scripts/register_vllm_lora.sh
+# unloads the stale name and re-registers, which is correct for THIS run but means
+# the GDPO-ON adapters must be re-registered from
+# rounds/evoguard_agentdojo_llama31_v1/{sft_native,grpo_native}/r*/adapter_weights
+# before that arm can be re-evaluated. The weights on disk are untouched.
+#
+# The original header of the base-model-swap arm follows.
+# -----------------------------------------------------------------------------
 # EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew) with
 # **Meta-Llama-3.1-8B-Instruct** as the defender base, native SFT -> GRPO path.
 #
@@ -125,7 +156,7 @@
 #   Do NOT run scripts/stop_vllm.sh to clean a helper port -- it always stops the
 #   primary too. Kill the pid in rounds/vllm_helper_<port>.pid instead.
 
-name: evoguard_agentdojo_llama31_v1
+name: evoguard_agentdojo_llama31_nogdpo_v1
 
 defense:
   llm:
@@ -137,11 +168,11 @@ defense:
     max_tokens: 1024
     timeout: 120.0
     max_retries: 3
-    # RESUME FROM r5 (2026-09-08, leg 3). r0 SFT + r1..r4 GRPO have landed; r5 was
-    # STARTED in leg 2 and lost to an OOM before it saved weights, so it is redone
-    # here. See the RESUME block under `pipeline` for why this field must be set BY
-    # HAND. Composite name verified registered on :8010 (`GET /v1/models` shows
-    # root=.../grpo_native/r4/adapter_weights).
+    # FRESH RUN from r0 -- no warm start. The GDPO-ON arm's copy of this field
+    # carried a leg-3 resume composite; this ablation retrains every round itself,
+    # so it MUST be null or r0 would collect rollouts against the other arm's
+    # adapter. The driver assigns this field from r0 onward inside
+    # maybe_train_defender.
     lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights::evoguard_r6_grpo_weights
   max_turns: 8                          # v11's value, unchanged.
 
@@ -269,9 +300,14 @@ training:
                                        # fresh B trajectories.
 
   # ---- Advantage normalisation --------------------------------------- #
-  grpo_gdpo: true                      # per-term group standardisation, then batch
-                                       # rescale. A NORMALISATION change: the reward is
-                                       # still exactly R = r_safety + r_progress - p_drift.
+  grpo_gdpo: false                     # THE ABLATION. false = TRL's stock GRPO
+                                       # normalisation: the three reward terms are
+                                       # summed into one scalar FIRST and
+                                       # standardised once per group of G=8. The
+                                       # GDPO-ON arm standardises each term inside
+                                       # its own group and then sums. The reward is
+                                       # identical in both arms:
+                                       # R = r_safety + r_progress - p_drift.
   grpo_traj_group_size: 1              # K=1: the trajectory-pooled baseline fallback is
                                        # a bit-for-bit no-op.
 
@@ -331,11 +367,10 @@ training:
   lora_probe_enabled: false
 
 pipeline:
-  # RESUME, LEG 3 -- runs r5 and r6. r0 (SFT) and r1..r4 (GRPO) are done and their
-  # val rows are already in val_metrics.jsonl. r5 has to be REDONE: leg 2 started it,
-  # the engine built, and then trainer.train() OOMed before any weights were saved,
-  # so grpo_native/r5/ holds plan_and_logs.jsonl + trl_state/ but no adapter_weights
-  # and latest_adapter_dir.txt still points at r4.
+  # FRESH RUN, LEG 1 -- start_round 0 trains r0 (SFT) and r1 (GRPO). Nine rounds at
+  # two-GRPO-rounds-per-process means five legs; drive them with
+  # scripts/run_legged_experiment.py, which rewrites start_round / max_rounds /
+  # defense.llm.lora_adapter per leg from the artifacts on disk.
   #
   # Why the run is split into legs of TWO rounds. The colocate engine leaks ~19-21
   # GiB of the trainer card per round. MEASURED in leg 2: free-at-settle 62.59 ->

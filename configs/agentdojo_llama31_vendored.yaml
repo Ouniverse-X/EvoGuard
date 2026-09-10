@@ -1,3 +1,68 @@
+# EvoGuard ATTACKER ABLATION: the attack generator does not participate.
+# AgentDojo (data/toolsafe/agentdojo-tragjnew), Meta-Llama-3.1-8B-Instruct
+# defender, native SFT -> GRPO path. Copied from configs/agentdojo_llama31_grpo.yaml
+# (the GDPO-ON arm) so the two are directly comparable.
+#
+# THE ABLATION, and nothing else
+# ------------------------------
+# The non-comment diff vs configs/agentdojo_llama31_grpo.yaml is FIVE lines:
+#   attacker.search_method       mcts_delta -> vendored       <- THE ABLATION
+#   attacker.vendored_dataset_dir  (new)  data/toolsafe/agentdojo-tragjnew/train
+#   name                         ..._v1 -> ..._vendored_v1    } plumbing for a
+#   defense.llm.lora_adapter     <r6 composite> -> null       } fresh run from r0
+#   pipeline.start_round         7 -> 0                       }
+# GDPO stays true, grpo_advantage_curriculum_lambda stays 1.5, the reward stays
+# R = r_safety + r_progress - p_drift, K stays 1, G stays 8, the base model, LoRA
+# geometry, both judges, max_turns 8 and the val split are untouched. Do NOT
+# re-tune a second knob here.
+#
+# WHAT `search_method: vendored` DOES (evoguard/attacks/vendored.py)
+# -----------------------------------------------------------------
+# Each task's population becomes the set of injections ALREADY SHIPPED in
+# vendored_dataset_dir -- for AgentDojo the <INFORMATION> block scraped out of
+# each transcript by process/vendored_attack_parser.py, i.e. the same corpus
+# eval/vendored_replay.py replays. No attacker LLM call is ever issued (no
+# seeding, crossover, mutation, MCTS expansion or backprop) and evolve() is a
+# no-op, so round 8's population is byte-identical to round 0's. Measured on the
+# train split: 710 records -> 400 injected -> 267 distinct scenarios over 36 of
+# the 37 train tasks (1-13 per task).
+#
+# FIVE CONSEQUENCES, all deliberate
+# ---------------------------------
+#  1. Attack COUNT drops from 37x15 = 555/round to 267/round, and it no longer
+#     grows. That is not a knob left untuned -- it is how many built-in attacks
+#     exist. Do NOT pad the population back to 555 by duplicating rows; the
+#     duplicate rollouts would enter the SFT corpus and the GRPO prompt pool with
+#     the weight of distinct data.
+#  2. The 1 train task with no parseable <INFORMATION> keeps its CLEAN arm and
+#     contributes zero attacked trajectories (rollout.py already treats an empty
+#     population that way). The clean corpus therefore stays at 37 tasks, so BU is
+#     comparable to the reference arm.
+#  3. target_turn is the ONLY field not dataset-shipped. Training injects by turn
+#     INDEX (Controller._run) while replay substitutes on TOOL IDENTITY
+#     (Controller.run_replay), so a turn has to come from somewhere: it is the
+#     carrier action's position in the original transcript
+#     (VendoredAttack.carrier_index, range [0,3] here), clamped to [0, max_turns-1].
+#     Same caveat the searching attackers have -- if the defender's own plan is
+#     shorter or ordered differently the payload may never surface, visible as
+#     injection_visible_turn: null.
+#  4. Every attacker knob below is INERT: population_size, offspring_size,
+#     elite_size, tournament_k, crossover/mutation rates, diversity_*, crowding,
+#     immigrant_*, fitness_drop_threshold, mcts_ucb_c, mcts_lambda_delta. They are
+#     left in place so the diff against the reference arm stays four lines of
+#     signal. attacker.llm is likewise never called -- kept so :8000 stays part of
+#     the documented layout and the health probe still covers it.
+#     EVOGUARD_PREWARM_SEEDS_DIR in the launcher is inert for the same reason.
+#  5. Expect a LOWER training ASR curve than the reference arm and read it as
+#     "the frozen corpus is weaker", not "the defender is stronger". The honest
+#     comparison between the two arms is the HELD-OUT val/test replay, which uses
+#     the same vendored corpus for both.
+#
+# Everything below this line is inherited from the GDPO-ON arm; its own header
+# follows so the launch contract, the GPU layout and the colocate-leak leg rule
+# stay attached to the file that needs them.
+#
+# ---------------------------------------------------------------------------
 # EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew) with
 # **Meta-Llama-3.1-8B-Instruct** as the defender base, native SFT -> GRPO path.
 #
@@ -125,7 +190,7 @@
 #   Do NOT run scripts/stop_vllm.sh to clean a helper port -- it always stops the
 #   primary too. Kill the pid in rounds/vllm_helper_<port>.pid instead.
 
-name: evoguard_agentdojo_llama31_v1
+name: evoguard_agentdojo_llama31_vendored_v1
 
 defense:
   llm:
@@ -137,12 +202,13 @@ defense:
     max_tokens: 1024
     timeout: 120.0
     max_retries: 3
-    # RESUME FROM r5 (2026-09-08, leg 3). r0 SFT + r1..r4 GRPO have landed; r5 was
-    # STARTED in leg 2 and lost to an OOM before it saved weights, so it is redone
-    # here. See the RESUME block under `pipeline` for why this field must be set BY
-    # HAND. Composite name verified registered on :8010 (`GET /v1/models` shows
-    # root=.../grpo_native/r4/adapter_weights).
-    lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights::evoguard_r6_grpo_weights
+    # FRESH RUN FROM r0 -- no warm start. r0 trains the cold-start SFT adapter and
+    # maybe_train_defender assigns the composite name from there on. Leave this
+    # `null` unless you are RESUMING a leg, in which case set the composite by hand
+    # (the driver only assigns it inside maybe_train_defender, so a resume left at
+    # null silently collects rollouts against the BASE model while GRPO warm-starts
+    # from trained weights).
+    lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights::evoguard_r6_grpo_weights::evoguard_r7_grpo_weights
   max_turns: 8                          # v11's value, unchanged.
 
 attacker:
@@ -172,7 +238,14 @@ attacker:
   fitness_drop_threshold: 0.50
   random_seed: 42
 
-  search_method: mcts_delta
+  search_method: vendored              # <- THE ABLATION. No attacker LLM call, no
+                                       # search, no evolution: the population IS the
+                                       # dataset's own <INFORMATION> injections and is
+                                       # byte-identical in every round.
+  vendored_dataset_dir: data/toolsafe/agentdojo-tragjnew/train
+                                       # MUST be the TRAIN leaf. Empty raises rather
+                                       # than falling back to the unsplit tree, which
+                                       # would silently train on val/test attacks.
   mcts_ucb_c: 1.414
   mcts_lambda_delta: 0.6               # Delta-guided UCB. 0.0 turns mcts_delta into
                                        # plain MCTS without saying so.
@@ -366,7 +439,7 @@ pipeline:
   #
   # scripts/run_legged_experiment.py derives both fields below from the artifacts on
   # disk and rewrites them per leg, so prefer it over editing this by hand.
-  start_round: 7
+  start_round: 8
   max_rounds: 9                        # exclusive upper bound; the leg trains
                                        # r{start_round}..r{max_rounds - 1}. Both
                                        # numbers are REWRITTEN IN PLACE by

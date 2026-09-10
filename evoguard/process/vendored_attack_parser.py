@@ -85,6 +85,15 @@ class VendoredAttack:
     goal: str                   # composed goal string for AttackSpec / judge
     ground_truth_score: float   # AgentDojo score (1.0 = succeeded vs reference)
     reference_fooled_action: str
+    # 0-based position of the carrier action in the vendored transcript, i.e. the
+    # turn at which the injection became visible in the ORIGINAL AgentDojo
+    # rollout. Replay does not need it (Controller.run_replay substitutes on tool
+    # identity), but the training loop injects by TURN INDEX, so an attacker that
+    # replays dataset-shipped payloads has to get a turn from somewhere; this is
+    # the only dataset-derived answer. Defaults to 0 so the loaders that ship
+    # first-class injection fields (ASB / InjecAgent / latent / stock) need no
+    # change -- their carrier is turn 0 of a single-carrier scenario anyway.
+    carrier_index: int = 0
 
 
 def _task_uid(suite: str, instruction: str, dataset: str = "agentdojo") -> str:
@@ -114,11 +123,13 @@ def _parse_one(record: dict, suite: str,
     # Find the Action whose Observation contained the injection.
     target_tool = None
     real_observation = None
-    for m in _TRIP_RE.finditer(history):
+    carrier_index = 0
+    for idx, m in enumerate(_TRIP_RE.finditer(history)):
         tool, _args, obs = m.group(1), m.group(2), m.group(3)
         if "<INFORMATION>" in obs:
             target_tool = tool.strip()
             real_observation = obs.strip()
+            carrier_index = idx
             break
     if target_tool is None or real_observation is None:
         return None
@@ -173,6 +184,7 @@ def _parse_one(record: dict, suite: str,
         goal=goal,
         ground_truth_score=float(record.get("score", 0.0) or 0.0),
         reference_fooled_action=record.get("current_action", "") or "",
+        carrier_index=carrier_index,
     )
 
 

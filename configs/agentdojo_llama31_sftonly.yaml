@@ -1,3 +1,48 @@
+# EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew),
+# **NO-RL ABLATION -- every round is LoRA-SFT, no GRPO and therefore no GDPO.**
+#
+# WHY THIS FILE EXISTS: third arm of a three-way ladder on ONE dataset and ONE
+# base model (Meta-Llama-3.1-8B-Instruct), isolating what the RL stage buys:
+#   1. configs/agentdojo_llama31_grpo.yaml    r0 SFT -> r1-r8 GRPO **with GDPO**
+#   2. configs/agentdojo_llama31_nogdpo.yaml  r0 SFT -> r1-r8 GRPO, stock GRPO
+#   3. THIS FILE                              r0-r8 all SFT, no RL at all
+# So 1 vs 2 isolates the advantage-normalisation scheme and 2 vs 3 isolates the
+# policy-gradient stage itself. Everything else in all three files is identical.
+#
+# THE ONE MECHANISM THAT CHANGES: `training.method: sft_then_native_grpo ->
+# native_sft`. In evoguard/training/__init__.py the `native_sft` branch is taken
+# on EVERY round (not just r0), and each round warm-starts from
+# `<exp>/latest_adapter_dir.txt`, i.e. the previous round's adapter -- so this is
+# ITERATED SFT on freshly collected rollouts, not nine independent cold starts.
+# The co-evolution loop is unchanged: the attacker still evolves each round and
+# rollouts are still collected against the current adapter. Only the defender's
+# update rule becomes imitation instead of policy gradient.
+#
+# CONSEQUENCES, all deliberate, none of them a second tuned knob:
+#   * Every `grpo_*` field below is INERT. They are left at the GRPO arms' values
+#     rather than deleted so a diff against those files stays readable. In
+#     particular `grpo_gdpo: false` and `grpo_use_vllm_colocate: true` are never
+#     read on this path -- native_runner.py only forwards the latter to
+#     patch_trl_probes, whose vllm aliases are inert for SFTTrainer.
+#   * **No legs needed.** The 2-rounds-per-process cap on the GRPO arms comes from
+#     the colocate vLLM engine leaking ~19 GiB of the trainer card per round; SFT
+#     never builds an engine, so all nine rounds run in ONE process. Do NOT drive
+#     this file through scripts/run_legged_experiment.py.
+#   * `_wait_for_free_gpu_memory` IS on the SFT path (unlike the GRPO path) and
+#     therefore runs on ALL NINE rounds. GPU7 must stay empty for the whole run:
+#     `bash scripts/gpu_keeper.sh stop -g 7` before launch, and do not resume it
+#     until the run exits. EVOGUARD_TRAINER_MIN_FREE_MIB=40960 is the threshold.
+#   * Per-round adapter names become `evoguard_rN_sft_weights` for every N, so
+#     only r0's name collides with the two GRPO arms (they use `rN_grpo_weights`
+#     for N>=1). register_vllm_lora.sh unloads-and-re-registers, which is correct
+#     for THIS run but means the other arms' adapters must be re-registered from
+#     their own `*/adapter_weights` dirs before those arms can be re-evaluated.
+#     Weights on disk are never touched.
+#   * `grpo_min_new_successes` has no SFT analogue, so unlike the GRPO arms this
+#     run never skips a round's retrain.
+#
+# The original header of the base-model-swap arm follows.
+# -----------------------------------------------------------------------------
 # EvoGuard experiment: AgentDojo (data/toolsafe/agentdojo-tragjnew) with
 # **Meta-Llama-3.1-8B-Instruct** as the defender base, native SFT -> GRPO path.
 #
@@ -125,7 +170,7 @@
 #   Do NOT run scripts/stop_vllm.sh to clean a helper port -- it always stops the
 #   primary too. Kill the pid in rounds/vllm_helper_<port>.pid instead.
 
-name: evoguard_agentdojo_llama31_v1
+name: evoguard_agentdojo_llama31_sftonly_v1
 
 defense:
   llm:
@@ -137,12 +182,12 @@ defense:
     max_tokens: 1024
     timeout: 120.0
     max_retries: 3
-    # RESUME FROM r5 (2026-09-08, leg 3). r0 SFT + r1..r4 GRPO have landed; r5 was
-    # STARTED in leg 2 and lost to an OOM before it saved weights, so it is redone
-    # here. See the RESUME block under `pipeline` for why this field must be set BY
-    # HAND. Composite name verified registered on :8010 (`GET /v1/models` shows
-    # root=.../grpo_native/r4/adapter_weights).
-    lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights::evoguard_r6_grpo_weights
+    # FRESH RUN from r0 -- no warm start. Both GRPO arms' copies of this field end
+    # up carrying a leg-resume composite (run_legged_experiment.py writes it back);
+    # this arm needs it null or r0 would collect its rollouts against ANOTHER arm's
+    # adapter, which is exactly the silent contamination the ladder cannot survive.
+    # The driver assigns this field from r0 onward inside maybe_train_defender.
+    lora_adapter: null
   max_turns: 8                          # v11's value, unchanged.
 
 attacker:
@@ -228,9 +273,13 @@ training:
   enabled: true
   base_model: /root/paddlejob/workspace/yangxiao/models/Meta-Llama-3.1-8B-Instruct
 
-  method: sft_then_native_grpo         # r0 -> cold-start LoRA-SFT; >=r1 -> incremental
-                                       # native GRPO (needs <exp>/latest_adapter_dir.txt;
-                                       # hard-errors rather than silently falling back).
+  method: native_sft                   # THE ABLATION. Taken on EVERY round, not just
+                                       # r0 (training/__init__.py: `native_sft` forces
+                                       # do_coldstart_sft_this_round=True), and each
+                                       # round warm-starts from the previous round's
+                                       # adapter via <exp>/latest_adapter_dir.txt.
+                                       # No GRPO => no GDPO, no advantages, no Delta
+                                       # shaping, no reward function is ever called.
 
   lora_rank: 32                        # <= :8010's --max-lora-rank 64, so the
                                        # per-round hot-load is accepted.
@@ -269,9 +318,14 @@ training:
                                        # fresh B trajectories.
 
   # ---- Advantage normalisation --------------------------------------- #
-  grpo_gdpo: true                      # per-term group standardisation, then batch
-                                       # rescale. A NORMALISATION change: the reward is
-                                       # still exactly R = r_safety + r_progress - p_drift.
+  grpo_gdpo: false                     # THE ABLATION. false = TRL's stock GRPO
+                                       # normalisation: the three reward terms are
+                                       # summed into one scalar FIRST and
+                                       # standardised once per group of G=8. The
+                                       # GDPO-ON arm standardises each term inside
+                                       # its own group and then sums. The reward is
+                                       # identical in both arms:
+                                       # R = r_safety + r_progress - p_drift.
   grpo_traj_group_size: 1              # K=1: the trajectory-pooled baseline fallback is
                                        # a bit-for-bit no-op.
 
@@ -331,11 +385,10 @@ training:
   lora_probe_enabled: false
 
 pipeline:
-  # RESUME, LEG 3 -- runs r5 and r6. r0 (SFT) and r1..r4 (GRPO) are done and their
-  # val rows are already in val_metrics.jsonl. r5 has to be REDONE: leg 2 started it,
-  # the engine built, and then trainer.train() OOMed before any weights were saved,
-  # so grpo_native/r5/ holds plan_and_logs.jsonl + trl_state/ but no adapter_weights
-  # and latest_adapter_dir.txt still points at r4.
+  # FRESH RUN, LEG 1 -- start_round 0 trains r0 (SFT) and r1 (GRPO). Nine rounds at
+  # two-GRPO-rounds-per-process means five legs; drive them with
+  # scripts/run_legged_experiment.py, which rewrites start_round / max_rounds /
+  # defense.llm.lora_adapter per leg from the artifacts on disk.
   #
   # Why the run is split into legs of TWO rounds. The colocate engine leaks ~19-21
   # GiB of the trainer card per round. MEASURED in leg 2: free-at-settle 62.59 ->
@@ -365,13 +418,12 @@ pipeline:
   # in-memory history and therefore lose the rounds before start_round.
   #
   # scripts/run_legged_experiment.py derives both fields below from the artifacts on
-  # disk and rewrites them per leg, so prefer it over editing this by hand.
-  start_round: 7
-  max_rounds: 9                        # exclusive upper bound; the leg trains
-                                       # r{start_round}..r{max_rounds - 1}. Both
-                                       # numbers are REWRITTEN IN PLACE by
-                                       # scripts/run_legged_experiment.py, so do not
-                                       # describe a specific leg on this line.
+  # disk and rewrites them per leg -- but it must NOT be used on this arm (SFT builds
+  # no colocate engine, so all nine rounds fit in one process). These two values are
+  # therefore the real ones for the whole run, hand-set and left alone.
+  start_round: 0
+  max_rounds: 9                        # exclusive upper bound: trains r0..r8, same
+                                       # nine rounds as both GRPO arms.
   # EARLY STOPPING DISABLED: run all rounds unconditionally, and select the best
   # round from the val curve afterwards. Both exits are neutralised, not the
   # validation itself -- stop_on_zero_success: false kills the "no B trajectories"

@@ -1,0 +1,86 @@
+{
+ "schema_version": 1,
+ "dataset": "delta_bench",
+ "built_by": "scripts/build_delta_bench.py",
+ "source": "AgentDojo v1 default suites (vendored at data/agentdojo/) for the task, clean plan and tool inventory; data/agentdojo_latent/authored/ for each case's carrier, benign observation, sink and args",
+ "split_unit": "none -- the whole set is a held-out diagnostic probe",
+ "n_groups": 19,
+ "n_attacked_total": 76,
+ "counts": {
+  "imm": 19,
+  "d1": 19,
+  "d2": 19,
+  "d3": 19,
+  "clean": 18
+ },
+ "per_suite": {
+  "banking": {
+   "n_groups": 3,
+   "n_attacked": 12,
+   "n_clean": 2,
+   "by_technique": {
+    "compliance_deferral": 4,
+    "dependency_chain": 4,
+    "quota_precheck": 4
+   }
+  },
+  "slack": {
+   "n_groups": 6,
+   "n_attacked": 24,
+   "n_clean": 6,
+   "by_technique": {
+    "audit_trail": 4,
+    "compliance_deferral": 4,
+    "dependency_chain": 4,
+    "false_correction": 4,
+    "quota_precheck": 4,
+    "staged_verification": 4
+   }
+  },
+  "travel": {
+   "n_groups": 9,
+   "n_attacked": 36,
+   "n_clean": 9,
+   "by_technique": {
+    "audit_trail": 4,
+    "compliance_deferral": 8,
+    "dependency_chain": 8,
+    "false_correction": 4,
+    "quota_precheck": 4,
+    "staged_verification": 8
+   }
+  },
+  "workspace": {
+   "n_groups": 1,
+   "n_attacked": 4,
+   "n_clean": 1,
+   "by_technique": {
+    "compliance_deferral": 4
+   }
+  }
+ },
+ "tier_semantics": {
+  "imm": {
+   "expected_delta": 1,
+   "interposed_clean_steps": 0
+  },
+  "d1": {
+   "expected_delta": 2,
+   "interposed_clean_steps": 1
+  },
+  "d2": {
+   "expected_delta": 3,
+   "interposed_clean_steps": 2
+  },
+  "d3": {
+   "expected_delta": 4,
+   "interposed_clean_steps": 3
+  }
+ },
+ "delta_semantics": "expected_delta is a DECLARED plan-index offset from the carrier, not signals.delta, which is measured at replay time and will differ. 1 is its smallest constructible value because the payload first becomes visible in the carrier's observation, so tier 'imm' means immediate, not a literal delta of 0.",
+ "pairing": "The four tiers of a group share task, clean plan, carrier, benign observation, sink and args by construction -- all of it read from one source record -- so the payload's deferral depth is the sole variable. Rebuilding one bucket alone breaks nothing visibly; evoguard/tests/test_delta_bench.py is what catches it.",
+ "excluded_sources": {
+  "ASB": "every agent config advertises exactly 2 tools and rows carry no clean plan, so no tier past imm is constructible without fabricating the clean arm",
+  "InjecAgent": "every user case is a single tool call (clean plan length 1, carrier_index 0), so delta 1 is the maximum and the ladder cannot exist"
+ }
+}

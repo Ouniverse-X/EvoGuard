@@ -8,6 +8,7 @@ from evoguard.attacks.base import AttackGenerator
 from evoguard.attacks.genetic import EvaluatedAttack, GeneticAttacker
 from evoguard.attacks.llm_attacker import LLMAttackGenerator
 from evoguard.attacks.mct_searcher import DeltaGuidedMCTSAttacker
+from evoguard.attacks.vendored import VendoredAttacker
 from evoguard.config import AttackerConfig
 from evoguard.core.types import Task, ToolSpec
 from evoguard.llm.base import LLMClient
@@ -44,6 +45,9 @@ def build_attacker(
     Recognised values of :attr:`AttackerConfig.search_method`:
       * ``"ga"``         -- legacy :class:`GeneticAttacker` (default).
       * ``"mcts_delta"`` -- Δ-guided MCTS (:class:`DeltaGuidedMCTSAttacker`).
+      * ``"vendored"``   -- :class:`VendoredAttacker`, the attacker ABLATION: a
+        frozen population read from ``config.vendored_dataset_dir``, with no
+        attacker LLM call and no evolution. ``generator`` is accepted and unused.
     """
     method = getattr(config, "search_method", "ga") or "ga"
     if method == "ga":
@@ -56,9 +60,14 @@ def build_attacker(
             task=task, tools=tools, generator=generator, config=config,
             rng=rng, defense_max_turns=defense_max_turns,
         )
+    if method == "vendored":
+        return VendoredAttacker(
+            task=task, tools=tools, config=config,
+            defense_max_turns=defense_max_turns,
+        )
     raise ValueError(
         f"Unknown AttackerConfig.search_method={method!r}; "
-        f"expected one of {{'ga','mcts_delta'}}."
+        f"expected one of {{'ga','mcts_delta','vendored'}}."
     )
 
 
@@ -67,6 +76,7 @@ __all__ = [
     "LLMAttackGenerator",
     "GeneticAttacker",
     "DeltaGuidedMCTSAttacker",
+    "VendoredAttacker",
     "EvaluatedAttack",
     "build_attack_generator",
     "build_attacker",
