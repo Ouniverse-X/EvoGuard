@@ -14,6 +14,7 @@ from evoguard.envs.agentdojo_latent import AgentDojoLatentEnv
 from evoguard.envs.agentdojo_stock import AgentDojoStockEnv
 from evoguard.envs.asb import ASBOPIEnv
 from evoguard.envs.base import SimulatedToolEnv, ToolEnv
+from evoguard.envs.delta_bench import DeltaBenchEnv
 from evoguard.envs.injecagent import InjecAgentEnv
 from evoguard.envs.toolsafe import AgentDojoEnv, AgentDojoSplitEnv, AgentHarmEnv
 from evoguard.llm import build_client
@@ -26,6 +27,7 @@ _REGISTRY: dict[str, Callable[..., ToolEnv]] = {
     AgentDojoLatentEnv.name: AgentDojoLatentEnv,
     AgentDojoStockEnv.name: AgentDojoStockEnv,
     ASBOPIEnv.name: ASBOPIEnv,
+    DeltaBenchEnv.name: DeltaBenchEnv,
     InjecAgentEnv.name: InjecAgentEnv,
 }
 
@@ -102,6 +104,7 @@ __all__ = [
     "AgentDojoStockEnv",
     "AgentHarmEnv",
     "ASBOPIEnv",
+    "DeltaBenchEnv",
     "InjecAgentEnv",
     "build_env",
     "register_env",

@@ -100,11 +100,15 @@ def verify_guard(root: str) -> None:
     only if the probe itself is immutable. Rebuild with
     ``python scripts/build_agentdojo_latent.py`` (which rewrites the guard)
     rather than editing a scenario file by hand.
+
+    Generic in ``root`` so the derived arms (``agentdojo_stock``,
+    ``delta_bench``) reuse it; the failure message names the directory that
+    actually drifted rather than the latent one.
     """
 
     path = os.path.join(root, _GUARD_FILE)
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"agentdojo_latent guard not found: {path}")
+        raise FileNotFoundError(f"sha256 guard not found: {path}")
     bad: list[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -122,8 +126,8 @@ def verify_guard(root: str) -> None:
                 bad.append(f"{rel}: sha256 {actual[:12]} != {expected[:12]}")
     if bad:
         raise SystemExit(
-            "data/agentdojo_latent has been modified:\n  " + "\n  ".join(bad)
-            + "\nRe-run scripts/build_agentdojo_latent.py to regenerate."
+            f"{root} has been modified:\n  " + "\n  ".join(bad)
+            + "\nRe-run the matching scripts/build_*.py to regenerate."
         )
 
 
@@ -207,12 +211,25 @@ class AgentDojoLatentEnv(SimulatedToolEnv):
         return super().execute(task, tool_call, history)
 
     # ---- loading ---------------------------------------------------------- #
+    def _iter_rows(self) -> Iterator[dict]:
+        """Scenario rows for this arm, in file order.
+
+        Overridden by :class:`evoguard.envs.delta_bench.DeltaBenchEnv`, whose
+        scenarios are sharded by Δ tier rather than by suite. Everything below
+        this hook -- task de-duplication, the per-carrier benign map, tool
+        parsing -- is shape-identical across the arms and must stay shared, or
+        the arms stop being comparable for reasons that have nothing to do with
+        the payload.
+        """
+
+        return iter_scenario_rows(self._root, self._suite_filter)
+
     def _load(self) -> None:
         seen: "OrderedDict[str, Task]" = OrderedDict()
         n_attacks: dict[str, int] = {}
         benign: dict[str, dict[str, str]] = {}
 
-        for rec in iter_scenario_rows(self._root, self._suite_filter):
+        for rec in self._iter_rows():
             uid = str(rec.get("task_id", ""))
             instruction = str(rec.get("task_instruction", "")).strip()
             if not uid or not instruction:

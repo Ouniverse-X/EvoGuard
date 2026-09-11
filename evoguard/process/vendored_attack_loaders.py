@@ -21,10 +21,12 @@ from typing import Callable, Optional
 from evoguard.envs.agentdojo_latent import DATASET_NAME as AGENTDOJO_LATENT_DATASET
 from evoguard.envs.agentdojo_stock import DATASET_NAME as AGENTDOJO_STOCK_DATASET
 from evoguard.envs.asb import DATASET_NAME as ASB_DATASET
+from evoguard.envs.delta_bench import DATASET_NAME as DELTA_BENCH_DATASET
 from evoguard.envs.injecagent import DATASET_NAME as INJECAGENT_DATASET
 from evoguard.process.agentdojo_latent_loader import load_agentdojo_latent_attacks
 from evoguard.process.agentdojo_stock_loader import load_agentdojo_stock_attacks
 from evoguard.process.asb_attack_loader import load_asb_attacks
+from evoguard.process.delta_bench_loader import load_delta_bench_attacks
 from evoguard.process.injecagent_attack_loader import load_injecagent_attacks
 from evoguard.process.vendored_attack_parser import (
     VendoredAttack,
@@ -37,6 +39,7 @@ _LOADERS: dict[str, VendoredAttackLoader] = {
     AGENTDOJO_LATENT_DATASET: load_agentdojo_latent_attacks,
     AGENTDOJO_STOCK_DATASET: load_agentdojo_stock_attacks,
     ASB_DATASET: load_asb_attacks,
+    DELTA_BENCH_DATASET: load_delta_bench_attacks,
     INJECAGENT_DATASET: load_injecagent_attacks,
 }
 

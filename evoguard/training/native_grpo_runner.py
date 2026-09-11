@@ -1070,6 +1070,7 @@ def build_evoguard_reward_callable(
     metas_by_prompt_idx: dict[int, Any],
     reward_trace_sink: Optional[list] = None,
     disable_safety: bool = False,
+    disable_progress: bool = False,
 ):
     """Create the actual function handed to TRL.GRPOTrainer.reward_funcs.
 
@@ -1106,6 +1107,11 @@ def build_evoguard_reward_callable(
     outage does not bias ``r_safety`` -- it deletes the safety gradient while the
     reward mean, the loss and the gradient norm all keep looking healthy. A round
     whose tally is dominated by ``fallback`` trained progress only.
+    A second attribute ``progress_tally`` counts ``progress_source`` the same
+    way, for the same reason: ``used_progress_fallback`` is True both when a step
+    was settled structurally (healthy) and when the judge was unreachable
+    (degraded), so it cannot report a progress outage. ``disabled`` in either
+    tally means the corresponding ablation flag was honoured.
     The returned function also carries ``reward_seconds``: a ONE-ELEMENT LIST
     accumulating the wall-clock seconds spent inside the reward function over the
     whole round. A list rather than a float because the caller holds the reference
@@ -1121,6 +1127,8 @@ def build_evoguard_reward_callable(
 
     #: ``"{safety_source}:{safety_label}"`` -> count, over the whole round.
     safety_tally: dict[str, int] = {}
+    #: ``progress_source`` -> count, over the whole round.
+    progress_tally: dict[str, int] = {}
     _tally_lock = threading.Lock()
 
     #: Accumulated seconds inside ``_evoguard_reward_func``. Mutated from the
@@ -1217,7 +1225,10 @@ def build_evoguard_reward_callable(
         # setup and, when the endpoint env var is unset, logs the "SAFETY term is
         # DEAD" warning that exists to catch accidents, which here would be noise.
         judge_cb_ref = None if disable_safety else _get_or_init_judge()
-        progress_cb_ref = _get_or_init_progress()
+        # Same reasoning for `grpo_disable_progress_term`: skipping construction
+        # also suppresses the "PROGRESS term runs in degraded mode" warning,
+        # which here would describe an intentional state.
+        progress_cb_ref = None if disable_progress else _get_or_init_progress()
         effective_jcb = judge_cb_ref if callable(judge_cb_ref) else None
         effective_pcb = progress_cb_ref if callable(progress_cb_ref) else None
         # prompts may be List[str] OR List[List[{role,content}]] depending on whether caller
@@ -1285,12 +1296,15 @@ def build_evoguard_reward_callable(
                 judge_call=effective_jcb,
                 progress_call=effective_pcb,
                 disable_safety=disable_safety,
+                disable_progress=disable_progress,
             )
             # Scoring is fanned out across threads, so the tally needs the lock;
             # it is contended for nanoseconds against an HTTP round-trip.
             key = f"{bd.safety_source or 'none'}:{bd.safety_label or 'none'}"
+            pkey = bd.progress_source or "none"
             with _tally_lock:
                 safety_tally[key] = safety_tally.get(key, 0) + 1
+                progress_tally[pkey] = progress_tally.get(pkey, 0) + 1
             return (
                 float(bd.total),
                 (float(bd.r_safety), float(bd.r_progress), -float(bd.p_drift)),
@@ -1328,6 +1342,7 @@ def build_evoguard_reward_callable(
 
     _evoguard_reward_func.__name__ = "evoguard_defense_rl_reward"
     _evoguard_reward_func.safety_tally = safety_tally     # type: ignore[attr-defined]
+    _evoguard_reward_func.progress_tally = progress_tally  # type: ignore[attr-defined]
     _evoguard_reward_func.reward_seconds = _reward_seconds  # type: ignore[attr-defined]
     return _evoguard_reward_func
 
@@ -1706,9 +1721,34 @@ def train_native_grpo(
                 "safety_source_tally == {'disabled:disabled': N}; a 'fallback:' "
                 "tally instead would mean the flag did not reach the reward."
             )
+        disable_progress_term = bool(
+            getattr(training_cfg, "grpo_disable_progress_term", False)
+        )
+        if disable_progress_term:
+            if disable_safety_term:
+                raise ValueError(
+                    "[native_grpo] grpo_disable_safety_term and "
+                    "grpo_disable_progress_term are both True: that leaves "
+                    "R = -p_drift, and the unknown-row -0.5 fallback has no live "
+                    "slot to charge without breaking the in-group unanimity GDPO's "
+                    "zero-std branch relies on. Run the two ablations separately."
+                )
+            logger.warning(
+                "[native_grpo] ABLATION grpo_disable_progress_term=True: r_progress "
+                "is pinned to 0.0 on BOTH arms and the progress judge is never "
+                "called, so the trained reward is R = r_safety - p_drift. Expect "
+                "progress_source_tally == {'disabled': N}; a tally containing "
+                "'structural'/'judge'/'fallback' would mean the flag did not reach "
+                "the reward. NOTE two intended consequences: the CLEAN arm now "
+                "trains on -p_drift alone (its r_safety is a per-prompt constant), "
+                "and 'do nothing' scores the structural held +2.00, i.e. the arm's "
+                "maximum -- so ASR is expected at 0.0 for the WRONG reason. Read "
+                "BU/UA and blocked_unfinished_rate, not ASR."
+            )
         reward_fn_closure=build_evoguard_reward_callable(
             metas_lookup_table, reward_trace_sink=reward_trace_sink,
             disable_safety=disable_safety_term,
+            disable_progress=disable_progress_term,
         )
 
         diag_state={"step_counter":0,"first_rewards":[],"last_rewards":[],"kl_trace":[],
@@ -2134,6 +2174,22 @@ def train_native_grpo(
                     n_fallback, n_scored, 100.0 * n_fallback / n_scored,
                 )
 
+        # Same observable for the progress term. `used_progress_fallback` cannot
+        # serve here: it is True for structurally-settled steps too.
+        progress_tally = dict(getattr(reward_fn_closure, "progress_tally", {}) or {})
+        n_prog_scored = sum(progress_tally.values())
+        n_prog_fallback = int(progress_tally.get("fallback", 0))
+        if n_prog_scored:
+            logger.info("[native_grpo] r_progress sources over %d completions: %s",
+                         n_prog_scored, sorted(progress_tally.items()))
+            if n_prog_fallback:
+                logger.warning(
+                    "[native_grpo] %d/%d completions (%.1f%%) scored r_progress from "
+                    "the NEUTRAL fallback -- advance/+1.20 was unreachable there.",
+                    n_prog_fallback, n_prog_scored,
+                    100.0 * n_prog_fallback / n_prog_scored,
+                )
+
         # -------------------------------------------------------------- #
         # B6 Save adapter artifacts                                       #
         # -------------------------------------------------------------- #
@@ -2167,6 +2223,8 @@ def train_native_grpo(
             "delta_shaping_applied_count":int(diag_state.get("delta_shaping_applied_count",0) or 0),
             "safety_source_tally":safety_tally,
             "n_safety_fallback":n_fallback,
+            "progress_source_tally":progress_tally,
+            "n_progress_fallback":n_prog_fallback,
             "nonfinite_grad_skips":int(diag_state.get("nonfinite_grad_skips",0) or 0),
         })
 

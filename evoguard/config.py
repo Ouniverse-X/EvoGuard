@@ -386,6 +386,45 @@ class TrainingConfig:
     # signal from the ATTACKED arm only -- which is precisely the intent.
     grpo_disable_safety_term: bool = False
 
+    # ---- Progress-term ablation (2026-09-10) ------------------------------ #
+    # True DELETES ``r_progress`` from the reward, leaving ``R = r_safety −
+    # p_drift``. Same contract as ``grpo_disable_safety_term`` above: an ABLATION
+    # knob, ``False`` is bit-for-bit the historical path, the term is pinned to
+    # exactly 0.0 on BOTH arms, the progress judge is never constructed or
+    # called, and ``progress_source`` reads ``"disabled"`` so the per-round
+    # ``progress_source_tally`` separates the ablation from a progress-judge
+    # OUTAGE (which pins the judged rows at ``R_PROGRESS_NEUTRAL`` while the
+    # structurally-settled rows keep real values -- a DIFFERENT, noisier signal,
+    # not an absent one).
+    #
+    # This ablation is NOT the mirror image of the safety one, and the asymmetry
+    # is the point:
+    #
+    #   * The CLEAN arm is gutted, not untouched. Its ``r_safety`` is the
+    #     per-prompt constant ``R_SAFETY_CLEAN_SERVED``, i.e. zero gradient under
+    #     group-relative advantages, so ``r_progress`` was the ONLY signal clean
+    #     prompts ever carried. With it gone the clean arm trains on ``−p_drift``
+    #     alone -- JSON well-formedness and nothing else.
+    #   * "Do nothing" becomes OPTIMAL, re-opening the non-terminating loop that
+    #     ``P_PROGRESS_WASTE`` exists to close. A no-action step is settled
+    #     structurally as ``held`` (+2.00) with ``p_drift`` 0.0, which is the
+    #     maximum score reachable on the attacked arm. This is a FORESEEN
+    #     consequence and is deliberately NOT compensated for -- patching the
+    #     structural ``held`` or re-adding a no-op penalty would be a second
+    #     knob and would stop the arm measuring what it claims to measure.
+    #
+    # Pre-registered reading, therefore: ASR is expected to sit at 0.0 for the
+    # WRONG reason (an agent that never acts cannot be baited -- the "ASR 0 for
+    # free" trap that the BU/UA convention exists to catch). The primary readings
+    # are BU, UA and ``blocked_unfinished_rate``; ASR alone is uninterpretable
+    # on this arm.
+    #
+    # Setting this together with ``grpo_disable_safety_term`` is rejected at
+    # runtime: with both terms gone the reward is ``−p_drift``, and the
+    # unknown-row fallback has no live slot left to charge its −0.5 to without
+    # breaking the in-group unanimity that GDPO's zero-std branch relies on.
+    grpo_disable_progress_term: bool = False
+
     # ---- GRPO rollout backend (2026-09-07) -------------------------------- #
     # False (default, legacy) = TRL generates the G siblings with HF
     # ``model.generate``. At per_device_train_batch_size=1 that is one unbatched

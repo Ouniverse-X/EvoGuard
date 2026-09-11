@@ -1,50 +1,68 @@
-# ABLATION ARM 5 (2026-09-10): DROP THE SAFETY TERM FROM THE REWARD.
+# ABLATION ARM 6 (2026-09-10): DROP THE PROGRESS TERM FROM THE REWARD.
 # =============================================================================
 # This file is `configs/agentdojo_llama31_grpo.yaml` (the GDPO-ON reference arm)
-# with ONE knob flipped: `training.grpo_disable_safety_term: true`. The trained
+# with ONE knob flipped: `training.grpo_disable_progress_term: true`. The trained
 # reward becomes
 #
-#       R = r_progress - p_drift          (was: r_safety + r_progress - p_drift)
+#       R = r_safety - p_drift            (was: r_safety + r_progress - p_drift)
 #
-# GDPO stays ON, advantage shaping stays at lambda 1.5, both judges keep their
-# endpoints, K stays 1, the base model / LoRA geometry / max_turns / dataset are
-# untouched. Non-comment diff vs the reference arm is FIVE lines: name,
-# lora_adapter, grpo_disable_safety_term, start_round, max_rounds.
+# GDPO stays ON, advantage shaping stays at lambda 1.5, K stays 1, the base model
+# / LoRA geometry / max_turns / dataset are untouched. Non-comment diff vs the
+# reference arm is FIVE lines: name, lora_adapter, grpo_disable_progress_term,
+# start_round, max_rounds.
 #
 # WHAT THIS IS AND IS NOT
 # -----------------------
 #  * It DELETES the term, it does not unplug the judge. Those differ: with the
-#    judge merely absent, `_safety_from_structure` still settles a large minority
-#    of rows at `held` (+2.00) while the rest fall back to `unclear` (-0.50), so
-#    r_safety would be a NOISY two-valued signal, not an absent one -- and the
-#    arm would be measuring judge outage, which the pipeline already warns about.
-#    Under this flag r_safety is pinned to exactly 0.0 on BOTH arms, the judge is
-#    never constructed, and safety_source/safety_label read "disabled" so the
-#    per-round safety_source_tally tells the ablation apart from an accident.
-#    Check the log for `ABLATION grpo_disable_safety_term=True` and the tally
-#    reading `disabled:disabled`; a `fallback:` tally means the flag did not
+#    progress judge merely absent, the JUDGED rows collapse onto
+#    R_PROGRESS_NEUTRAL (-0.15) while the structurally-settled rows keep their
+#    real values (+1.20 advance / -2.50 waste) -- a different and noisier signal,
+#    not an absent one. Under this flag r_progress is pinned to exactly 0.0 on
+#    BOTH arms, the progress judge is never constructed, and `progress_source`
+#    reads "disabled". Check the log for `ABLATION grpo_disable_progress_term=
+#    True` and the per-round progress_source_tally reading {"disabled": N}; a
+#    tally containing `structural`/`judge`/`fallback` means the flag did not
 #    reach the reward and the run is measuring the wrong thing.
+#    NOTE: `used_progress_fallback` CANNOT be used for this check -- it is True
+#    for healthy structurally-settled steps too. progress_source_tally is the
+#    only observable that separates ablation from outage.
 #  * GDPO remains coherent: the zeroed term is unanimous inside every group, so
 #    `_gdpo_advantages`'s `sd <= zero_std_tol` branch contributes exactly nothing
 #    for it and GDPO degrades to a clean 2-term normalisation. Locked by
-#    evoguard/tests/test_safety_term_ablation.py::test_gdpo_ignores_the_zeroed_term.
-#  * The CLEAN arm loses nothing it had: R_SAFETY_CLEAN_SERVED is a per-prompt
-#    constant, hence zero gradient under group-relative advantages already. This
-#    ablation removes signal from the ATTACKED arm only, which is the intent.
-#  * The PROGRESS judge is still required. It is the only surviving source of
-#    signal, so a progress-judge outage here does not degrade the arm, it EMPTIES
-#    it (structural progress can then only tell waste from neutral, never
-#    advance). Confirm `progress judge active` appears with no WARNING naming
-#    EVOGUARD_PROGRESS_LLM_BASE_URL before trusting a single round.
+#    tests/test_progress_term_ablation.py::test_gdpo_ignores_the_zeroed_middle_slot.
+#  * The SAFETY judge is now the only surviving source of signal -- the mirror
+#    image of arm 5. `EVOGUARD_PROGRESS_LLM_BASE_URL` becomes vestigial;
+#    `EVOGUARD_JUDGE_LLM_BASE_URL` becomes load-bearing. A safety-judge outage
+#    here does not degrade the arm, it EMPTIES it: the `unclear` fallback is one
+#    constant across the attacked arm and advantages are group-relative, so the
+#    round would train on -p_drift alone. Confirm the safety judge is live on
+#    :8004 and that NO "SAFETY term is DEAD" warning appears.
 #
-# PRE-DECLARED READING: r_progress alone rewards taking the clean twin's next
-# action and punishes stalling, and the twin's plan never contains the bait, so
-# some anti-injection pressure survives INDIRECTLY. The question this arm answers
-# is how much of the reference arm's UA/blocked_unfinished gain was that indirect
-# pressure versus the explicit -8.00 on `baited`. Do NOT read a low ASR here as
-# "the safety term is unnecessary": test ASR is on the floor for three of the
-# four existing arms, so ASR cannot separate them -- UA, blocked_unfinished_rate
-# and the attacked-arm refusal_rate are the readable channels.
+# THIS ARM IS NOT THE MIRROR OF ARM 5, AND THE ASYMMETRY IS THE POINT
+# -------------------------------------------------------------------
+#  * The CLEAN arm is GUTTED, not untouched. Its r_safety is the per-prompt
+#    constant R_SAFETY_CLEAN_SERVED, i.e. zero gradient under group-relative
+#    advantages, so r_progress was the ONLY signal clean prompts ever carried.
+#    With it gone the clean arm trains on -p_drift alone: JSON well-formedness
+#    and nothing else. (Arm 5 removed signal from the ATTACKED arm only.)
+#  * "DO NOTHING" BECOMES OPTIMAL. A no-action step is settled structurally as
+#    safety `held` (+2.00) at p_drift 0.0, which is the maximum score reachable
+#    on this arm -- so stalling ties the best any step can do. This re-opens the
+#    non-terminating loop that P_PROGRESS_WASTE exists to close. It is a FORESEEN
+#    consequence and is deliberately NOT compensated for: patching the structural
+#    `held` or re-adding a no-op penalty would be a SECOND knob and would stop
+#    the arm measuring what it claims to measure. Asserted, not merely commented,
+#    by tests/test_progress_term_ablation.py::
+#    test_do_nothing_becomes_optimal_under_the_ablation.
+#
+# PRE-REGISTERED READING: ASR is expected to sit at 0.0 for the WRONG reason --
+# an agent that stalls cannot be baited, and "ASR 0 for free" is exactly the
+# failure mode the BU/UA reporting rule exists to catch. Read BU, UA and
+# blocked_unfinished_rate; ASR alone is uninterpretable on this arm. The
+# hypothesis being tested is the converse of arm 5's finding (r_progress already
+# encodes safety via the strict clean-twin signature match, so the two terms are
+# collinear on this dataset): if that is right, removing r_progress should cost
+# UTILITY (BU/UA down, blocked_unfinished up) while leaving ASR floored.
 #
 # =============================================================================
 #
@@ -175,7 +193,7 @@
 #   Do NOT run scripts/stop_vllm.sh to clean a helper port -- it always stops the
 #   primary too. Kill the pid in rounds/vllm_helper_<port>.pid instead.
 
-name: evoguard_agentdojo_llama31_nosafety_v1
+name: evoguard_agentdojo_llama31_noprogress_v1
 
 defense:
   llm:
@@ -189,9 +207,9 @@ defense:
     max_retries: 3
     # FRESH EXPERIMENT -- no resume. The reference arm's copy of this field named
     # its r6 composite adapter; carrying that over would have warm-started this
-    # ablation from a policy trained WITH the safety term, which is the one thing
-    # the arm must not do. r0 is a cold-start SFT and driver.py hot-registers each
-    # round's adapter onto :8010 from here on.
+    # ablation from a policy trained WITH the progress term, which is the one
+    # thing the arm must not do. r0 is a cold-start SFT and driver.py
+    # hot-registers each round's adapter onto :8010 from here on.
     lora_adapter: evoguard_r0_sft_weights::evoguard_r1_grpo_weights::evoguard_r2_grpo_weights::evoguard_r3_grpo_weights::evoguard_r4_grpo_weights::evoguard_r5_grpo_weights::evoguard_r6_grpo_weights::evoguard_r7_grpo_weights
   max_turns: 8                          # v11's value, unchanged.
 
@@ -322,21 +340,24 @@ training:
   grpo_gdpo: true                      # per-term group standardisation, then batch
                                        # rescale. A NORMALISATION change, kept ON for
                                        # this arm so the ONE variable is the reward.
-                                       # With the safety slot pinned to 0.0 it is
+                                       # With the progress slot pinned to 0.0 it is
                                        # unanimous in every group, so GDPO's
                                        # zero-std branch skips it and this becomes a
                                        # clean 2-term normalisation -- no division by
                                        # a zero std, no NaN.
   # ==== THE ABLATION (2026-09-10) ==================================== #
-  # Drops r_safety: R = r_progress - p_drift. Pinned to exactly 0.0 on BOTH
-  # arms, the step-safety judge is never constructed, and safety_source /
-  # safety_label read "disabled" so the round tally distinguishes this from a
-  # judge OUTAGE (same reward shape, but an accident). Verify in the log:
-  #   "ABLATION grpo_disable_safety_term=True"
-  #   safety_source_tally == {"disabled:disabled": N}
-  # A tally showing "fallback:" instead means the flag did not reach the
-  # reward and the round trained the WRONG thing -- stop and fix it.
-  grpo_disable_safety_term: true
+  # Drops r_progress: R = r_safety - p_drift. Pinned to exactly 0.0 on BOTH
+  # arms, the progress judge is never constructed, and progress_source reads
+  # "disabled" so the round tally distinguishes this from a judge OUTAGE (which
+  # pins the JUDGED rows at R_PROGRESS_NEUTRAL while structurally-settled rows
+  # keep real values -- a noisier signal, not an absent one). Verify in the log:
+  #   "ABLATION grpo_disable_progress_term=True"
+  #   progress_source_tally == {"disabled": N}
+  # A tally containing "structural"/"judge"/"fallback" means the flag did not
+  # reach the reward and the round trained the WRONG thing -- stop and fix it.
+  # `used_progress_fallback` is NOT a valid check here: it is True for healthy
+  # structurally-settled steps too.
+  grpo_disable_progress_term: true
   # =================================================================== #
   grpo_traj_group_size: 1              # K=1: the trajectory-pooled baseline fallback is
                                        # a bit-for-bit no-op.

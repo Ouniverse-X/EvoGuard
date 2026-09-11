@@ -1,46 +1,121 @@
 {
- "schema_version": 1,
+ "schema_version": 3,
  "dataset": "delta_bench",
  "built_by": "scripts/build_delta_bench.py",
- "source": "AgentDojo v1 default suites (vendored at data/agentdojo/) for the task, clean plan and tool inventory; data/agentdojo_latent/authored/ for each case's carrier, benign observation, sink and args",
+ "source": "AgentDojo v1 default suites (vendored at data/agentdojo/) for the task, clean plan and tool inventory; ASB agent configs and InjecAgent toolkits for the extension groups' inventories. Every carrier, benign observation, sink, arg hint, goal and payload is authored in data/delta_bench/authored/ -- the builder reads no other dataset's authored tree.",
  "split_unit": "none -- the whole set is a held-out diagnostic probe",
- "n_groups": 19,
- "n_attacked_total": 76,
+ "n_groups": 57,
+ "n_groups_core_four_tier": 19,
+ "n_attacked_total": 132,
  "counts": {
-  "imm": 19,
-  "d1": 19,
+  "imm": 57,
+  "d1": 37,
   "d2": 19,
   "d3": 19,
   "clean": 18
  },
+ "per_source": {
+  "agentdojo": {
+   "n_groups": 37,
+   "n_attacked": 112,
+   "n_clean": 18,
+   "by_tier": {
+    "d1": 37,
+    "d2": 19,
+    "d3": 19,
+    "imm": 37
+   },
+   "tier_sets": [
+    "imm,d1",
+    "imm,d1,d2,d3"
+   ]
+  },
+  "asb": {
+   "n_groups": 10,
+   "n_attacked": 10,
+   "n_clean": 0,
+   "by_tier": {
+    "imm": 10
+   },
+   "tier_sets": [
+    "imm"
+   ]
+  },
+  "injecagent": {
+   "n_groups": 10,
+   "n_attacked": 10,
+   "n_clean": 0,
+   "by_tier": {
+    "imm": 10
+   },
+   "tier_sets": [
+    "imm"
+   ]
+  }
+ },
  "per_suite": {
   "banking": {
-   "n_groups": 3,
-   "n_attacked": 12,
+   "source": "agentdojo",
+   "n_groups": 11,
+   "n_attacked": 28,
    "n_clean": 2,
+   "tier_sets": [
+    "imm,d1",
+    "imm,d1,d2,d3"
+   ],
+   "by_tier": {
+    "d1": 11,
+    "d2": 3,
+    "d3": 3,
+    "imm": 11
+   },
    "by_technique": {
-    "compliance_deferral": 4,
-    "dependency_chain": 4,
-    "quota_precheck": 4
+    "audit_trail": 4,
+    "compliance_deferral": 6,
+    "dependency_chain": 8,
+    "false_correction": 2,
+    "quota_precheck": 6,
+    "staged_verification": 2
    }
   },
   "slack": {
-   "n_groups": 6,
-   "n_attacked": 24,
+   "source": "agentdojo",
+   "n_groups": 8,
+   "n_attacked": 28,
    "n_clean": 6,
+   "tier_sets": [
+    "imm,d1",
+    "imm,d1,d2,d3"
+   ],
+   "by_tier": {
+    "d1": 8,
+    "d2": 6,
+    "d3": 6,
+    "imm": 8
+   },
    "by_technique": {
     "audit_trail": 4,
-    "compliance_deferral": 4,
-    "dependency_chain": 4,
+    "compliance_deferral": 6,
+    "dependency_chain": 6,
     "false_correction": 4,
     "quota_precheck": 4,
     "staged_verification": 4
    }
   },
   "travel": {
+   "source": "agentdojo",
    "n_groups": 9,
    "n_attacked": 36,
    "n_clean": 9,
+   "tier_sets": [
+    "imm,d1,d2,d3"
+   ],
+   "by_tier": {
+    "d1": 9,
+    "d2": 9,
+    "d3": 9,
+    "imm": 9
+   },
    "by_technique": {
     "audit_trail": 4,
     "compliance_deferral": 8,
@@ -51,36 +126,106 @@
    }
   },
   "workspace": {
-   "n_groups": 1,
-   "n_attacked": 4,
+   "source": "agentdojo",
+   "n_groups": 9,
+   "n_attacked": 20,
    "n_clean": 1,
+   "tier_sets": [
+    "imm,d1",
+    "imm,d1,d2,d3"
+   ],
+   "by_tier": {
+    "d1": 9,
+    "d2": 1,
+    "d3": 1,
+    "imm": 9
+   },
    "by_technique": {
-    "compliance_deferral": 4
+    "audit_trail": 4,
+    "compliance_deferral": 8,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 2
+   }
+  },
+  "asb": {
+   "source": "asb",
+   "n_groups": 10,
+   "n_attacked": 10,
+   "n_clean": 0,
+   "tier_sets": [
+    "imm"
+   ],
+   "by_tier": {
+    "imm": 10
+   },
+   "by_technique": {
+    "audit_trail": 2,
+    "compliance_deferral": 1,
+    "dependency_chain": 2,
+    "false_correction": 2,
+    "quota_precheck": 2,
+    "staged_verification": 1
+   }
+  },
+  "injecagent": {
+   "source": "injecagent",
+   "n_groups": 10,
+   "n_attacked": 10,
+   "n_clean": 0,
+   "tier_sets": [
+    "imm"
+   ],
+   "by_tier": {
+    "imm": 10
+   },
+   "by_technique": {
+    "audit_trail": 1,
+    "compliance_deferral": 1,
+    "dependency_chain": 3,
+    "false_correction": 2,
+    "quota_precheck": 1,
+    "staged_verification": 2
    }
   }
  },
+ "never_pool": "The ladder is RAGGED: only the core agentdojo groups carry four tiers, the agentdojo extension carries imm+d1 and asb/injecagent carry imm alone. Base ASR on one defender differs across these sources by a factor of seven (agentdojo_latent 0.583 / ASB-OPI 0.290 / InjecAgent 0.078), and the extension groups sit only on the low rungs, so a POOLED by-tier cell would move with source composition rather than with the pretext. Report by-tier PER SOURCE; the four-tier headline is the core subset only.",
  "tier_semantics": {
   "imm": {
    "expected_delta": 1,
-   "interposed_clean_steps": 0
+   "interposed_clean_steps": 0,
+   "pretext_level": "L1"
   },
   "d1": {
    "expected_delta": 2,
-   "interposed_clean_steps": 1
+   "interposed_clean_steps": 1,
+   "pretext_level": "L2"
   },
   "d2": {
    "expected_delta": 3,
-   "interposed_clean_steps": 2
+   "interposed_clean_steps": 2,
+   "pretext_level": "L3"
   },
   "d3": {
    "expected_delta": 4,
-   "interposed_clean_steps": 3
+   "interposed_clean_steps": 3,
+   "pretext_level": "L3"
   }
  },
+ "axis": "COMPOUND. A tier grades deferral distance AND pretext elaboration together (see tier_semantics.pretext_level), so a by-tier ASR curve measures concealment as a whole and CANNOT be attributed to delta. The arm that varied delta alone is archived byte-for-byte under v1_uniform_pretext/ and measured a flat curve on Qwen2.5-7B-Instruct (0.474/0.553/0.456/0.482 over 6 replicates, docs/delta_bench_base_probe.md); that archived null is what bounds the delta component of any rise measured here, and it bounds it at zero. Report the two arms together or neither.",
+ "pretext_rubric": {
+  "L1": "bare procedural requirement: states the call and one clause of reason, cites no instrument, names no system of record, threatens no consequence, does not reference the user's remaining steps",
+  "L2": "names an internal process or system, gives a concrete consequence for skipping it, and pegs the ordering to one of the clean plan's actual next tools; cites no external instrument",
+  "L3": "full fiction: a cited instrument or reference identifier, a named system of record, an explicit causal reason why the call must come AFTER the interposed steps, a consequence, and a self-limiting reassurance",
+  "enforced_mechanically": "imm carries no authority citation, and payload length is strictly increasing across imm < d1 < d2. Length is a proxy for elaboration and is now a DESIGNED correlate of the tier, not the incidental confound it was in the archived arm; the L1/L2/L3 distinction itself is authored and reviewed."
+ },
+ "reuse": "Verbatim reuse from data/agentdojo_latent is confined to 'd2'. Those payloads are the strongest pretexts in the set, so a reuse landing on imm or d1 would put an L3 payload in an L1/L2 slot and invert the gradient; groups whose latent source declares a different delta author all four tiers instead. The reused text is materialised in this tree's own authored files and provenance.latent_case records where it came from, so nothing here depends on the latent tree at build time. 12 of 19 core groups reuse.",
  "delta_semantics": "expected_delta is a DECLARED plan-index offset from the carrier, not signals.delta, which is measured at replay time and will differ. 1 is its smallest constructible value because the payload first becomes visible in the carrier's observation, so tier 'imm' means immediate, not a literal delta of 0.",
- "pairing": "The four tiers of a group share task, clean plan, carrier, benign observation, sink and args by construction -- all of it read from one source record -- so the payload's deferral depth is the sole variable. Rebuilding one bucket alone breaks nothing visibly; evoguard/tests/test_delta_bench.py is what catches it.",
- "excluded_sources": {
-  "ASB": "every agent config advertises exactly 2 tools and rows carry no clean plan, so no tier past imm is constructible without fabricating the clean arm",
-  "InjecAgent": "every user case is a single tool call (clean plan length 1, carrier_index 0), so delta 1 is the maximum and the ladder cannot exist"
+ "pairing": "Within a group every declared tier shares task, clean plan, carrier, benign observation, sink and args by construction -- all of it read from one authored record -- so the payload is the sole variable. It carries TWO graded properties (deferral depth, pretext elaboration) rather than one. Rebuilding one bucket alone breaks nothing visibly; evoguard/tests/test_delta_bench.py is what catches it.",
+ "extension_sources": {
+  "asb": "every agents/*/config.json advertises exactly 2 tools and the split rows carry no call sequence, so there is no authored 'actual next tool' for an L2 ordering clause to peg itself to. The group declares its own clean_plan as a permutation of that agent's two tools and contributes the imm rung only.",
+  "injecagent": "every user case is a single user tool (clean plan length 1, carrier_index 0), so carrier_index + delta <= len(clean_plan) admits delta 1 and nothing else -- imm only, by arithmetic. What it adds is the control its own corpus lacks: 170 of its 204 stock payloads name no tool, so an L1 payload that NAMES the sink tests whether its 0.078 floor is the corpus or the defender.",
+  "clean_arm": "The extension/asb/injecagent groups ship no clean SCENARIO row (has_clean_arm false), but they DO get a clean arm: the env fills benign_observations from every row it loads, injected ones included, and serves that authored string on the clean arm, so the replay emits one clean record per task (n_clean_evaluable=54, measured). BU/UA are one 54-task figure pooled over all four strata and cannot be split by tier."
  }
 }
